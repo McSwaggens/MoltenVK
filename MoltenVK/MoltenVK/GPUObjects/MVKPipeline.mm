@@ -2784,6 +2784,61 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			}
 		}
 
+		// Extract SPIRV-Cross helper functions (spvSMod, spvFindLSB, etc.)
+		// defined before the entry point. These are template/inline functions
+		// that the shader body may reference.
+		{
+			// Helper functions start after "using namespace metal;" and end before
+			// the entry point function. Look for inline/template function definitions.
+			auto usingNS = msl.find("using namespace metal;");
+			size_t helperStart = (usingNS != std::string::npos) ? usingNS + strlen("using namespace metal;") : 0;
+			// funcPos points to the entry function name
+			auto entryLineStart = msl.rfind('\n', funcPos);
+			if (entryLineStart == std::string::npos) entryLineStart = 0;
+			std::string helperRegion = msl.substr(helperStart, entryLineStart - helperStart);
+			// Find inline/template function definitions
+			static const char* helperPatterns[] = {"inline ", "template<", nullptr};
+			for (auto** pat = helperPatterns; *pat; pat++) {
+				size_t pos = 0;
+				while ((pos = helperRegion.find(*pat, pos)) != std::string::npos) {
+					// Check this isn't already in the raygen MSL
+					auto lineS = helperRegion.rfind('\n', pos);
+					if (lineS == std::string::npos) lineS = 0; else lineS++;
+					// Find the end of this function (matching braces)
+					auto braceStart = helperRegion.find('{', pos);
+					if (braceStart == std::string::npos) { pos++; continue; }
+					int depth = 1;
+					size_t braceEnd = braceStart + 1;
+					while (braceEnd < helperRegion.size() && depth > 0) {
+						if (helperRegion[braceEnd] == '{') depth++;
+						else if (helperRegion[braceEnd] == '}') depth--;
+						braceEnd++;
+					}
+					std::string helperFunc = helperRegion.substr(lineS, braceEnd - lineS);
+					// Check if this function name is already present in raygen MSL
+					// by looking for the function name (first word after inline/template line)
+					auto funcNameStart = helperFunc.find("spv");
+					if (funcNameStart != std::string::npos) {
+						auto funcNameEnd = funcNameStart;
+						while (funcNameEnd < helperFunc.size() && (isalnum(helperFunc[funcNameEnd]) || helperFunc[funcNameEnd] == '_'))
+							funcNameEnd++;
+						std::string hfName = helperFunc.substr(funcNameStart, funcNameEnd - funcNameStart);
+						if (raygenMSL.find(hfName) == std::string::npos) {
+							auto insertPos = raygenMSL.find("struct _MVKRTBuiltins");
+							if (insertPos == std::string::npos)
+								insertPos = raygenMSL.find("static void");
+							if (insertPos == std::string::npos)
+								insertPos = raygenMSL.find("kernel void");
+							if (insertPos != std::string::npos) {
+								raygenMSL.insert(insertPos, helperFunc + "\n\n");
+							}
+						}
+					}
+					pos = braceEnd;
+				}
+			}
+		}
+
 		auto lineStart = msl.rfind('\n', funcPos);
 		if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
 		std::string funcCode = msl.substr(lineStart);
@@ -3128,6 +3183,15 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 	}
 
+	// For triangle-only pipelines (no intersection functions), add triangle_data
+	// to the intersector to enable triangle_front_facing access for HitKind.
+	if (!hasIntersection) {
+		auto iPos = raygenMSL.find("intersector<instancing>");
+		if (iPos != std::string::npos) {
+			raygenMSL.replace(iPos, strlen("intersector<instancing>"), "intersector<triangle_data, instancing>");
+		}
+	}
+
 	// Helper lambda to add a kernel parameter if it's not already present.
 	auto addKernelParam = [&](const char* param) {
 		auto kernelStart = raygenMSL.find("kernel void main0(");
@@ -3166,7 +3230,10 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			callCode += "  _mvk_rt.instanceId = _mtl_isect.instance_id;\n";
 			callCode += "  _mvk_rt.geometryId = _mtl_isect.geometry_id;\n";
 			callCode += "  _mvk_rt.instanceCustomIndex = _mtl_isect.user_instance_id;\n";
-			callCode += "  _mvk_rt.hitKind = (_mtl_isect.type == intersection_type::triangle) ? 0xFEu : 0u;\n";
+			if (!hasIntersection)
+				callCode += "  _mvk_rt.hitKind = (_mtl_isect.type == intersection_type::triangle) ? (_mtl_isect.triangle_front_facing ? 0xFEu : 0xFFu) : 0u;\n";
+			else
+				callCode += "  _mvk_rt.hitKind = 0u;\n";
 			callCode += "  _mvk_rt.objectRayOrigin = float3(0);\n";  // TODO: requires instance transform
 			callCode += "  _mvk_rt.objectRayDirection = float3(0);\n";  // TODO: requires instance transform
 			callCode += "  if (_mtl_isect.type != intersection_type::none) {\n";
