@@ -3166,35 +3166,47 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			isectFuncMSL = isectMSL;
 
 			// Merge struct members from intersection shader into raygen struct
+			// (same padding-aware logic as the main helper merge)
 			auto helperStructStart = msl.find("struct spvDescriptorSetBuffer0");
 			if (helperStructStart != std::string::npos) {
 				auto helperStructBodyStart = msl.find('{', helperStructStart);
 				auto helperStructEnd = msl.find("};", helperStructStart);
 				if (helperStructBodyStart != std::string::npos && helperStructEnd != std::string::npos) {
 					std::string helperMembers = msl.substr(helperStructBodyStart + 1, helperStructEnd - helperStructBodyStart - 1);
-					auto raygenStructEnd = raygenMSL.find("};");
+					auto raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
+					auto raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
 					if (raygenStructEnd != std::string::npos) {
 						std::istringstream ss(helperMembers);
 						std::string line;
 						while (std::getline(ss, line)) {
 							auto idPos = line.find("[[id(");
 							if (idPos == std::string::npos) continue;
+							auto idNumStart = idPos + 5;
+							auto idNumEnd = line.find(")]]", idNumStart);
+							if (idNumEnd == std::string::npos) continue;
+							std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
+
 							auto nameEnd = line.rfind(' ', idPos - 1);
 							if (nameEnd == std::string::npos) continue;
 							auto nameStart = line.rfind(' ', nameEnd - 1);
 							if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
 							std::string memberName = line.substr(nameStart, nameEnd - nameStart);
-							if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
-								auto firstMember = raygenMSL.find("    ", raygenMSL.find('{', raygenMSL.find("struct spvDescriptorSetBuffer0")));
-								if (firstMember != std::string::npos && firstMember < raygenStructEnd)
-									raygenMSL.insert(firstMember, line + "\n");
-								else
-									raygenMSL.insert(raygenStructEnd, line + "\n");
-								raygenStructEnd = raygenMSL.find("};");
+
+							auto existingId = raygenMSL.find(idStr, raygenStructPos);
+							if (existingId != std::string::npos && existingId < raygenStructEnd) {
+								auto existingLineStart = raygenMSL.rfind('\n', existingId);
+								if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
+								auto existingLineEnd = raygenMSL.find('\n', existingId);
+								std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
+								if (existingLine.find("_pad") != std::string::npos) {
+									raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
+									raygenStructEnd = raygenMSL.find("};", raygenStructPos);
+								}
+							} else if (raygenMSL.substr(raygenStructPos, raygenStructEnd - raygenStructPos).find(memberName) == std::string::npos) {
+								raygenMSL.insert(raygenStructEnd, line + "\n");
+								raygenStructEnd = raygenMSL.find("};", raygenStructPos);
 							}
 						}
-						// With pad_argument_buffer_resources=true, [[id(N)]] values already
-						// match Vulkan binding numbers and must not be renumbered.
 					}
 				}
 			}
