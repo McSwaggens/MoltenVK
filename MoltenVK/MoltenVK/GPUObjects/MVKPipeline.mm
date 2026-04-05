@@ -2605,6 +2605,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		"    uint geometryId;\n"
 		"    uint instanceCustomIndex;\n"
 		"    uint hitKind;\n"
+		"    uint incomingRayFlags;\n"
 		"};\n\n";
 
 	// Mapping from SPIRV-Cross parameter variable names to struct members.
@@ -2622,6 +2623,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		{"gl_InstanceCustomIndexEXT", "instanceCustomIndex"},
 		{"gl_HitKindEXT", "hitKind"},
 		{"gl_HitTEXT", "rayTmax"},
+		{"gl_IncomingRayFlagsEXT", "incomingRayFlags"},
 		// NV variants
 		{"gl_WorldRayOriginNV", "worldRayOrigin"},
 		{"gl_WorldRayDirectionNV", "worldRayDirection"},
@@ -2635,6 +2637,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		{"gl_InstanceCustomIndexNV", "instanceCustomIndex"},
 		{"gl_HitKindNV", "hitKind"},
 		{"gl_GeometryIndexNV", "geometryId"},
+		{"gl_IncomingRayFlagsNV", "incomingRayFlags"},
 		{nullptr, nullptr}
 	};
 
@@ -3236,6 +3239,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				callCode += "  _mvk_rt.hitKind = 0u;\n";
 			callCode += "  _mvk_rt.objectRayOrigin = float3(0);\n";  // TODO: requires instance transform
 			callCode += "  _mvk_rt.objectRayDirection = float3(0);\n";  // TODO: requires instance transform
+			callCode += "  _mvk_rt.incomingRayFlags = _mtl_ray_flags;\n";
 			callCode += "  if (_mtl_isect.type != intersection_type::none) {\n";
 
 			// Build hit group dispatch: map shader groups to hit shader functions.
