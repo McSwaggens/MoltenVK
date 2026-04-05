@@ -203,6 +203,7 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 				uint32_t instanceCount = rangeInfo.primitiveCount;
 				instDesc.instanceCount = instanceCount;
 				instDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeUserID;
+				instDesc.instanceDescriptorStride = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
 
 				if (instData.data.deviceAddress && instanceCount > 0) {
 					// Read the Vulkan instance descriptors from the source buffer

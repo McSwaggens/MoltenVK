@@ -3427,6 +3427,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 		}
 		instDesc.instanceCount = instanceCount;
 		instDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeUserID;
+		instDesc.instanceDescriptorStride = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
 		if (pBuildInfo->flags & VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) {
 			instDesc.usage |= MTLAccelerationStructureUsagePreferFastBuild;
 		}
