@@ -185,17 +185,15 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 			//   [48]    instanceCustomIndex:24 + mask:8
 			//   [52]    instanceShaderBindingTableRecordOffset:24 + flags:8
 			//   [56]    accelerationStructureReference (uint64_t device address)
-			// Metal: MTLAccelerationStructureInstanceDescriptor (64 bytes each)
-			//   [0-47]  transformationMatrix (4x3 column-major, same memory layout)
-			//   [48]    options (uint32_t)
-			//   [52]    mask (uint32_t)
-			//   [56]    intersectionFunctionTableOffset (uint32_t)
-			//   [60]    accelerationStructureIndex (uint32_t)
+			// Metal: MTLAccelerationStructureUserIDInstanceDescriptor (68 bytes each)
+			//   Same as MTLAccelerationStructureInstanceDescriptor but adds userID field
+			//   for VkAccelerationStructureInstanceKHR::instanceCustomIndex mapping.
 			if (geomCount > 0 && bi.geometries[0].geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
 				auto& instData = bi.geometries[0].geometry.instances;
 				auto& rangeInfo = bi.buildRangeInfos[0];
 				uint32_t instanceCount = rangeInfo.primitiveCount;
 				instDesc.instanceCount = instanceCount;
+				instDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeUserID;
 
 				if (instData.data.deviceAddress && instanceCount > 0) {
 					// Read the Vulkan instance descriptors from the source buffer
@@ -204,18 +202,16 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					const uint8_t* srcData = (const uint8_t*)[srcBuf contents] + srcOffset;
 
 					// Allocate a temporary Metal buffer for converted descriptors
-					NSUInteger mtlInstSize = sizeof(MTLAccelerationStructureInstanceDescriptor) * instanceCount;
+					NSUInteger mtlInstSize = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor) * instanceCount;
 					id<MTLBuffer> mtlInstBuf = [cmdEncoder->getDevice()->getPhysicalDevice()->getMTLDevice() newBufferWithLength: mtlInstSize
 					                                                                   options: MTLResourceStorageModeShared];
 
-					auto* mtlInsts = (MTLAccelerationStructureInstanceDescriptor*)[mtlInstBuf contents];
+					auto* mtlInsts = (MTLAccelerationStructureUserIDInstanceDescriptor*)[mtlInstBuf contents];
 					for (uint32_t j = 0; j < instanceCount; j++) {
 						const VkAccelerationStructureInstanceKHR* vkInst =
 							(const VkAccelerationStructureInstanceKHR*)(srcData + j * sizeof(VkAccelerationStructureInstanceKHR));
 
 						// Convert VkTransformMatrixKHR (3x4 row-major) to MTLPackedFloat4x3 (4x3 column-major).
-						// VkTransformMatrixKHR: matrix[row][col], 3 rows x 4 cols
-						// MTLPackedFloat4x3: columns[col][row], 4 cols x 3 rows
 						for (int col = 0; col < 4; col++) {
 							for (int row = 0; row < 3; row++) {
 								mtlInsts[j].transformationMatrix.columns[col][row] = vkInst->transform.matrix[row][col];
@@ -236,6 +232,9 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 
 						mtlInsts[j].mask = vkInst->mask;
 						mtlInsts[j].intersectionFunctionTableOffset = 0;
+
+						// Map instanceCustomIndex to Metal's userID
+						mtlInsts[j].userID = vkInst->instanceCustomIndex;
 
 						// Map BLAS device address to index in instancedAccelerationStructures
 						auto it = blasAddressToIndex.find(vkInst->accelerationStructureReference);
