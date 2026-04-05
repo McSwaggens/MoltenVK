@@ -2629,10 +2629,9 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				targetFunc = &missFunc;
 				break;
 			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR:
-				execModel = spv::ExecutionModelIntersectionKHR;
-				funcName = "_mvk_isect";
-				targetFunc = &intersectionFunc;
-				break;
+				// Intersection shaders are handled separately below as proper
+				// Metal intersection functions, not as inline helpers.
+				continue;
 			default: continue;
 		}
 
@@ -2771,35 +2770,242 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 	}
 
+	// Handle intersection shaders: compile as proper Metal [[intersection()]] functions.
+	// For AABB geometry, Metal requires intersection functions via MTLIntersectionFunctionTable.
+	std::string isectFuncMSL;
+	if (hasIntersection) {
+		for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
+			auto& stage = pCreateInfo->pStages[i];
+			if (stage.stage != VK_SHADER_STAGE_INTERSECTION_BIT_KHR) continue;
+
+			std::string msl = getMSLSource(&stage, spv::ExecutionModelIntersectionKHR, "_mvk_isect");
+			if (msl.empty()) continue;
+			intersectionFunc = "_mvk_isect";
+
+			// Extract the function body and transform it into a proper Metal intersection function.
+			// The SPIRV-Cross output is a [[intersection(bounding_box, instancing)]] void function.
+			// We need to:
+			// 1. Change return type from void to a struct with accept/distance
+			// 2. Replace gl_LaunchIDNV parameter with payload access
+			// 3. Add payload and descriptor set parameters
+			// 4. Replace the body's reportIntersectionEXT (already emitted as `true`) with a return
+
+			auto funcPos = msl.find("_mvk_isect(");
+			if (funcPos == std::string::npos) continue;
+			auto lineStart = msl.rfind('\n', funcPos);
+			if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
+			std::string funcBody = msl.substr(lineStart);
+
+			// Remove [[attribute]] qualifiers from parameters
+			size_t attrStart;
+			while ((attrStart = funcBody.find(" [[")) != std::string::npos) {
+				auto attrEnd = funcBody.find("]]", attrStart);
+				if (attrEnd != std::string::npos)
+					funcBody.erase(attrStart, attrEnd + 2 - attrStart);
+				else break;
+			}
+
+			// Build the proper intersection function
+			std::string isectMSL;
+			isectMSL += "struct _MVKIsectPayload { uint3 launchID; uint3 launchSize; };\n\n";
+			isectMSL += "struct _MVKBBoxResult {\n";
+			isectMSL += "    bool accept [[accept_intersection]];\n";
+			isectMSL += "    float distance [[distance]];\n";
+			isectMSL += "};\n\n";
+
+			// Replace the function signature
+			auto oldSigEnd = funcBody.find(')');
+			auto oldSigStart = funcBody.find('(');
+			if (oldSigStart != std::string::npos && oldSigEnd != std::string::npos) {
+				// New signature with payload and descriptor set
+				std::string newSig = "[[intersection(bounding_box, instancing)]]\n"
+					"_MVKBBoxResult _mvk_isect(\n"
+					"    const ray_data _MVKIsectPayload &_mvk_payload [[payload]],\n"
+					"    constant spvDescriptorSetBuffer0 &spvDescriptorSet0 [[buffer(0)]])";
+
+				// Remove everything before the function body
+				auto bodyStart = funcBody.find('{', oldSigEnd);
+				if (bodyStart != std::string::npos) {
+					funcBody = newSig + " " + funcBody.substr(bodyStart);
+				}
+			}
+
+			// Replace gl_LaunchIDNV with payload.launchID
+			{
+				std::string oldName = "gl_LaunchIDNV";
+				std::string newName = "_mvk_payload.launchID";
+				size_t pos = 0;
+				while ((pos = funcBody.find(oldName, pos)) != std::string::npos) {
+					funcBody.replace(pos, oldName.length(), newName);
+					pos += newName.length();
+				}
+			}
+
+			// Add local declarations for hit attribute variables (float3 _NN)
+			{
+				auto bodyStart = funcBody.find('{');
+				if (bodyStart != std::string::npos) {
+					std::string localDecls;
+					size_t pos = bodyStart;
+					while ((pos = funcBody.find(" = float3(", pos)) != std::string::npos) {
+						auto nameEnd = pos;
+						auto ns = funcBody.rfind('\n', nameEnd);
+						if (ns == std::string::npos) ns = 0; else ns++;
+						while (ns < nameEnd && funcBody[ns] == ' ') ns++;
+						std::string varName = funcBody.substr(ns, nameEnd - ns);
+						if (varName.size() > 0 && varName[0] == '_')
+							localDecls += "\n    float3 " + varName + ";";
+						pos += 10;
+					}
+					if (!localDecls.empty())
+						funcBody.insert(bodyStart + 1, localDecls);
+				}
+			}
+
+			// Replace `bool _NN = true;` (reportIntersectionEXT) with return statement
+			{
+				size_t pos = funcBody.rfind("bool ");
+				if (pos != std::string::npos) {
+					auto lineEnd = funcBody.find(';', pos);
+					if (lineEnd != std::string::npos) {
+						// Replace `bool _NN = true;` with `return {true, 1.0f};`
+						funcBody.replace(pos, lineEnd - pos + 1, "return {true, 1.0f};");
+					}
+				}
+			}
+
+			// Remove the final empty return if present
+			{
+				auto lastReturn = funcBody.rfind("return;");
+				if (lastReturn != std::string::npos)
+					funcBody.replace(lastReturn, 7, "return {false, 0.0f};");
+			}
+
+			isectMSL += funcBody;
+			isectFuncMSL = isectMSL;
+
+			// Merge struct members from intersection shader into raygen struct
+			auto helperStructStart = msl.find("struct spvDescriptorSetBuffer0");
+			if (helperStructStart != std::string::npos) {
+				auto helperStructBodyStart = msl.find('{', helperStructStart);
+				auto helperStructEnd = msl.find("};", helperStructStart);
+				if (helperStructBodyStart != std::string::npos && helperStructEnd != std::string::npos) {
+					std::string helperMembers = msl.substr(helperStructBodyStart + 1, helperStructEnd - helperStructBodyStart - 1);
+					auto raygenStructEnd = raygenMSL.find("};");
+					if (raygenStructEnd != std::string::npos) {
+						std::istringstream ss(helperMembers);
+						std::string line;
+						while (std::getline(ss, line)) {
+							auto idPos = line.find("[[id(");
+							if (idPos == std::string::npos) continue;
+							auto nameEnd = line.rfind(' ', idPos - 1);
+							if (nameEnd == std::string::npos) continue;
+							auto nameStart = line.rfind(' ', nameEnd - 1);
+							if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
+							std::string memberName = line.substr(nameStart, nameEnd - nameStart);
+							if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
+								auto firstMember = raygenMSL.find("    ", raygenMSL.find('{', raygenMSL.find("struct spvDescriptorSetBuffer0")));
+								if (firstMember != std::string::npos && firstMember < raygenStructEnd)
+									raygenMSL.insert(firstMember, line + "\n");
+								else
+									raygenMSL.insert(raygenStructEnd, line + "\n");
+								raygenStructEnd = raygenMSL.find("};");
+							}
+						}
+						// Renumber [[id(N)]]
+						auto structStart = raygenMSL.find("struct spvDescriptorSetBuffer0");
+						auto structBodyStart = raygenMSL.find('{', structStart);
+						raygenStructEnd = raygenMSL.find("};", structStart);
+						uint32_t nextId = 0;
+						size_t pos = structBodyStart;
+						while ((pos = raygenMSL.find("[[id(", pos)) != std::string::npos) {
+							if (pos > raygenStructEnd) break;
+							auto numStart = pos + 5;
+							auto numEnd = raygenMSL.find(")]]", numStart);
+							raygenMSL.replace(numStart, numEnd - numStart, std::to_string(nextId++));
+							pos = numStart + 1;
+							raygenStructEnd = raygenMSL.find("};", structStart);
+						}
+					}
+				}
+			}
+			break; // Only one intersection shader
+		}
+	}
+
+	// Add the payload struct and modify OpTraceRayKHR to pass it when intersection functions are used.
+	if (hasIntersection && !isectFuncMSL.empty()) {
+		// Add payload struct before the kernel
+		auto kernelPos = raygenMSL.find("kernel void");
+		if (kernelPos != std::string::npos) {
+			raygenMSL.insert(kernelPos,
+				"struct _MVKIsectPayload { uint3 launchID; uint3 launchSize; };\n\n");
+		}
+
+		// Modify the OpTraceRayKHR intersect() call to pass an intersection_function_table
+		// and a payload with the launch ID.
+		// The current emission is:
+		//   intersector<instancing> _mtl_i;
+		//   auto _mtl_isect = _mtl_i.intersect(_mtl_r, AS, mask);
+		// We need:
+		//   _MVKIsectPayload _mtl_payload = { gl_LaunchIDNV, gl_LaunchSizeNV };
+		//   auto _mtl_isect = _mtl_i.intersect(_mtl_r, AS, mask, _mvk_ift, _mtl_payload);
+		{
+			auto iPos = raygenMSL.find("intersector<instancing>");
+			if (iPos != std::string::npos) {
+				// Add payload before the ray declaration
+				auto rayPos = raygenMSL.find("ray _mtl_r(", iPos);
+				if (rayPos != std::string::npos) {
+					raygenMSL.insert(rayPos,
+						"_MVKIsectPayload _mtl_payload = { gl_LaunchIDNV, gl_LaunchSizeNV };\n      ");
+				}
+
+				// Find the intersect() call and add the function table + payload parameters
+				auto isectCall = raygenMSL.find(".intersect(_mtl_r,", iPos);
+				if (isectCall != std::string::npos) {
+					// Find the closing ");""
+					auto callEnd = raygenMSL.find(");", isectCall);
+					if (callEnd != std::string::npos) {
+						raygenMSL.insert(callEnd, ", _mvk_ift, _mtl_payload");
+					}
+				}
+			}
+
+			// Add the intersection function table as a kernel parameter.
+			// Find the closing ')' of the parameter list by matching parentheses.
+			auto mainSig = raygenMSL.find("kernel void main0(");
+			if (mainSig != std::string::npos) {
+				auto parenStart = raygenMSL.find('(', mainSig);
+				int depth = 1;
+				size_t sigEnd = parenStart + 1;
+				while (sigEnd < raygenMSL.size() && depth > 0) {
+					if (raygenMSL[sigEnd] == '(') depth++;
+					else if (raygenMSL[sigEnd] == ')') depth--;
+					if (depth > 0) sigEnd++;
+				}
+				if (depth == 0) {
+					raygenMSL.insert(sigEnd,
+						", intersection_function_table<instancing> _mvk_ift [[buffer(30)]]");
+				}
+			}
+		}
+	}
+
 	// Now modify the raygen kernel's OpTraceRayKHR site to call the helper functions.
 	// The SPIRV-Cross emission left a marker: "(void)_mtl_isect;"
 	// Replace it with calls to the closest-hit or miss function based on intersection result.
 	{
 		std::string callCode;
-		if (!closestHitFunc.empty() || !missFunc.empty() || !intersectionFunc.empty()) {
-			// When an intersection shader is present (AABB geometry), Metal's basic
-			// intersector doesn't report AABB hits without a custom intersection function.
-			// Since the intersection shader determines the hit, always invoke it.
-			bool alwaysHit = !intersectionFunc.empty();
-			if (alwaysHit) {
-				callCode = "  {\n";
-				callCode += "    " + intersectionFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-				if (!anyHitFunc.empty())
-					callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-				if (!closestHitFunc.empty())
-					callCode += "    " + closestHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-				callCode += "  }\n";
-			} else {
-				callCode = "  if (_mtl_isect.type != intersection_type::none) {\n";
-				if (!anyHitFunc.empty())
-					callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-				if (!closestHitFunc.empty())
-					callCode += "    " + closestHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-				callCode += "  } else {\n";
-				if (!missFunc.empty())
-					callCode += "    " + missFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-				callCode += "  }\n";
-			}
+		if (!closestHitFunc.empty() || !missFunc.empty() || hasIntersection) {
+			callCode = "  if (_mtl_isect.type != intersection_type::none) {\n";
+			if (!anyHitFunc.empty())
+				callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			if (!closestHitFunc.empty())
+				callCode += "    " + closestHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			callCode += "  } else {\n";
+			if (!missFunc.empty())
+				callCode += "    " + missFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			callCode += "  }\n";
 		}
 
 		auto markerPos = raygenMSL.find("(void)_mtl_isect;");
@@ -2839,8 +3045,43 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		return;
 	}
 
+	// Compile the intersection function if present
+	id<MTLFunction> mtlIsectFunc = nil;
+	id<MTLLibrary> mtlIsectLib = nil;
+	if (hasIntersection && !isectFuncMSL.empty()) {
+		// The intersection function MSL needs the descriptor set struct definition.
+		// Prepend the same headers and struct from the raygen MSL.
+		std::string fullIsectMSL;
+		auto structEnd = raygenMSL.find("};");
+		if (structEnd != std::string::npos) {
+			fullIsectMSL = raygenMSL.substr(0, structEnd + 2) + "\n\n" + isectFuncMSL;
+		} else {
+			fullIsectMSL = isectFuncMSL;
+		}
+
+		NSError* isectErr = nil;
+		MTLCompileOptions* isectOpts = _device->getMTLCompileOptions();
+		mtlIsectLib = [mtlDev newLibraryWithSource: @(fullIsectMSL.c_str())
+										   options: isectOpts
+											 error: &isectErr];
+		if (isectErr && !mtlIsectLib) {
+			reportError(VK_ERROR_INITIALIZATION_FAILED,
+				"RT intersection function compile failed: %s", isectErr.localizedDescription.UTF8String);
+		} else {
+			mtlIsectFunc = [mtlIsectLib newFunctionWithName: @"_mvk_isect"];
+		}
+	}
+
+	// Create the compute pipeline, linking the intersection function if present
 	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];
 	plDesc.computeFunction = mtlFunc;
+
+	if (mtlIsectFunc) {
+		MTLLinkedFunctions* linked = [[MTLLinkedFunctions alloc] init];
+		linked.functions = @[mtlIsectFunc];
+		plDesc.linkedFunctions = linked;
+		[linked release];
+	}
 
 	MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
 	_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);
@@ -2849,7 +3090,30 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	[mtlFunc release];
 	[mtlLib release];
 
-	if (!_mtlPipelineState) { _hasValidMTLPipelineStates = false; }
+	if (!_mtlPipelineState) {
+		_hasValidMTLPipelineStates = false;
+		[mtlIsectFunc release];
+		[mtlIsectLib release];
+		return;
+	}
+
+	// Create the intersection function table
+	if (mtlIsectFunc) {
+		MTLIntersectionFunctionTableDescriptor* iftDesc = [MTLIntersectionFunctionTableDescriptor new];
+		iftDesc.functionCount = 1;
+		_mtlIntersectionFunctionTable = [_mtlPipelineState newIntersectionFunctionTableWithDescriptor: iftDesc];
+		[iftDesc release];
+
+		if (_mtlIntersectionFunctionTable) {
+			id<MTLFunctionHandle> handle = [_mtlPipelineState functionHandleWithFunction: mtlIsectFunc];
+			if (handle) {
+				[_mtlIntersectionFunctionTable setFunction: handle atIndex: 0];
+			}
+		}
+
+		[mtlIsectFunc release];
+		[mtlIsectLib release];
+	}
 }
 
 std::string MVKRayTracingPipeline::getMSLSource(const VkPipelineShaderStageCreateInfo* pStage,

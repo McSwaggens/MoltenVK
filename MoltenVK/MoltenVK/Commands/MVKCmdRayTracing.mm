@@ -54,6 +54,27 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 
 	[mtlEncoder setComputePipelineState: rtPipeline->getMTLComputePipelineState()];
 
+	// Bind the intersection function table if present (for AABB geometry).
+	if (rtPipeline->getMTLIntersectionFunctionTable()) {
+		[mtlEncoder setIntersectionFunctionTable: rtPipeline->getMTLIntersectionFunctionTable()
+									 atBufferIndex: 30];  // matches [[buffer(30)]] in the kernel
+
+		// Bind descriptor set resources to the intersection function table
+		// so the intersection function can access images/buffers.
+		auto& vk = cmdEncoder->getState().vkCompute();
+		if (vk._layout) {
+			for (uint32_t s = 0; s < vk._layout->getDescriptorSetCount(); s++) {
+				MVKDescriptorSet* set = vk._descriptorSets[s];
+				if (set && set->gpuBufferObject) {
+					[rtPipeline->getMTLIntersectionFunctionTable()
+						setBuffer: set->gpuBufferObject
+						   offset: set->gpuBufferOffset
+						  atIndex: s];
+				}
+			}
+		}
+	}
+
 	// Make acceleration structures resident. Skip if none exist.
 	auto& allAS = cmdEncoder->getDevice()->getAccelerationStructures();
 	if (!allAS.empty()) {

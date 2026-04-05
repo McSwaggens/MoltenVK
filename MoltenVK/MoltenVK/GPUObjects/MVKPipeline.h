@@ -472,6 +472,9 @@ public:
 	/** Returns the compiled Metal compute pipeline state for the ray generation shader. */
 	id<MTLComputePipelineState> getMTLComputePipelineState() { return _mtlPipelineState; }
 
+	/** Returns the intersection function table, or nil if no intersection shader. */
+	id<MTLIntersectionFunctionTable> getMTLIntersectionFunctionTable() { return _mtlIntersectionFunctionTable; }
+
 	/** Returns the threadgroup size for dispatch. */
 	const MTLSize& getThreadgroupSize() const { return _mtlThreadgroupSize; }
 
