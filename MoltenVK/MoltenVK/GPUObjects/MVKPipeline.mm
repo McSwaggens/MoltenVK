@@ -2578,14 +2578,14 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 	// Check if there are any non-raygen shader stages.
 	bool hasNonRaygenStages = false;
-	bool hasClosestHit = false, hasAnyHit = false, hasMiss = false;
+	bool hasClosestHit = false, hasAnyHit = false, hasMiss = false, hasIntersection = false;
 	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
 		auto& stage = pCreateInfo->pStages[i];
 		switch (stage.stage) {
 			case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR: hasClosestHit = hasNonRaygenStages = true; break;
 			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:     hasAnyHit = hasNonRaygenStages = true; break;
 			case VK_SHADER_STAGE_MISS_BIT_KHR:        hasMiss = hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR:
+			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR: hasIntersection = hasNonRaygenStages = true; break;
 			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:    hasNonRaygenStages = true; break;
 			default: break;
 		}
@@ -2597,7 +2597,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		_hasValidMTLPipelineStates = false;
 		return;
 	}
-	std::string closestHitFunc, anyHitFunc, missFunc;
+	std::string closestHitFunc, anyHitFunc, missFunc, intersectionFunc;
 
 	// For hit/miss stages that write gl_LaunchIDEXT to the result image,
 	// generate inline helper functions that share the raygen kernel's
@@ -2627,6 +2627,11 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				execModel = spv::ExecutionModelMissKHR;
 				funcName = "_mvk_miss";
 				targetFunc = &missFunc;
+				break;
+			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR:
+				execModel = spv::ExecutionModelIntersectionKHR;
+				funcName = "_mvk_isect";
+				targetFunc = &intersectionFunc;
 				break;
 			default: continue;
 		}
@@ -2726,10 +2731,37 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		auto sigEnd = funcCode.find(')');
 		auto sigStart = funcCode.find('(');
 		if (sigStart != std::string::npos && sigEnd != std::string::npos) {
-			std::string params = funcCode.substr(sigStart + 1, sigEnd - sigStart - 1);
-			// Replace the parameter list with the canonical 3 parameters
 			std::string newParams = "constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV, uint3 gl_LaunchSizeNV";
 			funcCode.replace(sigStart + 1, sigEnd - sigStart - 1, newParams);
+		}
+
+		// For intersection shaders, add local declarations for hit attribute variables
+		// that SPIRV-Cross emits as globals (StorageClassHitAttributeKHR).
+		if (stage.stage == VK_SHADER_STAGE_INTERSECTION_BIT_KHR) {
+			auto bodyStart = funcCode.find('{');
+			if (bodyStart != std::string::npos) {
+				// The hit attribute variable is typically a float3 named _NN.
+				// Scan the function body for assignments to undeclared _NN variables.
+				std::string localDecls;
+				std::string body = funcCode.substr(bodyStart + 1);
+				// Find patterns like "_NN = float3(...)" that need declarations
+				size_t pos = 0;
+				while ((pos = body.find(" = float3(", pos)) != std::string::npos) {
+					// Find the variable name before " = float3("
+					auto nameEnd = pos;
+					auto nameStart = body.rfind('\n', nameEnd);
+					if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
+					while (nameStart < nameEnd && body[nameStart] == ' ') nameStart++;
+					std::string varName = body.substr(nameStart, nameEnd - nameStart);
+					if (varName.size() > 0 && varName[0] == '_') {
+						localDecls += "\n    float3 " + varName + ";\n";
+					}
+					pos += 10;
+				}
+				if (!localDecls.empty()) {
+					funcCode.insert(bodyStart + 1, localDecls);
+				}
+			}
 		}
 
 		// Insert as static helper before the kernel
@@ -2744,19 +2776,30 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	// Replace it with calls to the closest-hit or miss function based on intersection result.
 	{
 		std::string callCode;
-		if (!closestHitFunc.empty() || !missFunc.empty()) {
-			callCode = "  if (_mtl_isect.type != intersection_type::none) {\n";
-			if (!anyHitFunc.empty()) {
-				callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+		if (!closestHitFunc.empty() || !missFunc.empty() || !intersectionFunc.empty()) {
+			// When an intersection shader is present (AABB geometry), Metal's basic
+			// intersector doesn't report AABB hits without a custom intersection function.
+			// Since the intersection shader determines the hit, always invoke it.
+			bool alwaysHit = !intersectionFunc.empty();
+			if (alwaysHit) {
+				callCode = "  {\n";
+				callCode += "    " + intersectionFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				if (!anyHitFunc.empty())
+					callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				if (!closestHitFunc.empty())
+					callCode += "    " + closestHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				callCode += "  }\n";
+			} else {
+				callCode = "  if (_mtl_isect.type != intersection_type::none) {\n";
+				if (!anyHitFunc.empty())
+					callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				if (!closestHitFunc.empty())
+					callCode += "    " + closestHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				callCode += "  } else {\n";
+				if (!missFunc.empty())
+					callCode += "    " + missFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				callCode += "  }\n";
 			}
-			if (!closestHitFunc.empty()) {
-				callCode += "    " + closestHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-			}
-			callCode += "  } else {\n";
-			if (!missFunc.empty()) {
-				callCode += "    " + missFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-			}
-			callCode += "  }\n";
 		}
 
 		auto markerPos = raygenMSL.find("(void)_mtl_isect;");
@@ -2769,7 +2812,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	_mtlPipelineState = nil;
 	_mtlThreadgroupSize = {4, 4, 4};
 
-	// Debug: reportError(VK_SUCCESS, "RT combined MSL (%zu bytes)", raygenMSL.size());
+	// fprintf(stderr, "[MVK-RT-DBG] Combined MSL:\n%s\n", raygenMSL.c_str());
 
 	NSError* err = nil;
 	id<MTLDevice> mtlDev = getPhysicalDevice()->getMTLDevice();
