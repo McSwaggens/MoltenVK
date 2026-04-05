@@ -87,7 +87,6 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					if (triData.vertexData.deviceAddress) {
 						triDesc.vertexBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(triData.vertexData.deviceAddress, &vtxOffset);
 						triDesc.vertexBufferOffset = (NSUInteger)vtxOffset;
-						// Vertex buffer should be resolved from device address.
 					}
 					triDesc.vertexStride = triData.vertexStride;
 					triDesc.triangleCount = rangeInfo.primitiveCount;

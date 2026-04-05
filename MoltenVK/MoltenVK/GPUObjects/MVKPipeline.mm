@@ -2644,7 +2644,6 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		if (msl.empty() || !targetFunc) continue;
 		*targetFunc = funcName;
 
-		// Debug: reportError(VK_SUCCESS, "RT helper MSL for %s:\n%s", funcName.c_str(), msl.c_str());
 		// Merge descriptor set struct members from the helper shader into the raygen's struct.
 		// The raygen and hit shaders may reference different bindings in the same set.
 		// Each shader has its own [[id(N)]] assignments, so we match by member name.
@@ -3108,7 +3107,6 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	_mtlPipelineState = nil;
 	_mtlThreadgroupSize = {4, 4, 4};
 
-	// debug log removed
 
 	NSError* err = nil;
 	id<MTLDevice> mtlDev = getPhysicalDevice()->getMTLDevice();
@@ -3117,7 +3115,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	id<MTLLibrary> mtlLib = [mtlDev newLibraryWithSource: @(raygenMSL.c_str())
 												 options: compileOptions
 												   error: &err];
-	// compileOptions intentionally not released — getMTLCompileOptions returns autoreleased in some paths.
+	// compileOptions not released — Metal may reference it asynchronously during compilation.
 
 	if (err && !mtlLib) {
 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
@@ -3255,90 +3253,6 @@ std::string MVKRayTracingPipeline::getMSLSource(const VkPipelineShaderStageCreat
 	return conversionResult.msl;
 }
 
-MVKMTLFunction MVKRayTracingPipeline::compileShaderStage(const VkPipelineShaderStageCreateInfo* pStage,
-                                                          spv::ExecutionModel execModel) {
-	MVKShaderModule* shaderModule = (MVKShaderModule*)pStage->module;
-
-	auto& mtlFeats = getMetalFeatures();
-	auto& mvkCfg = getMVKConfig();
-	SPIRVToMSLConversionConfiguration shaderConfig;
-	shaderConfig.options.entryPointName = pStage->pName;
-	shaderConfig.options.entryPointStage = execModel;
-
-	// Note: compileShaderStage is only used for raygen compilation now.
-	// Non-raygen shaders go through getMSLSource().
-	shaderConfig.options.mslOptions.msl_version = mtlFeats.mslVersion;
-	shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
-	shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
-	shaderConfig.options.mslOptions.texture_buffer_native = true;
-	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
-	shaderConfig.options.mslOptions.replace_recursive_inputs = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0);
-
-	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
-	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
-	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
-	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
-	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)mtlFeats.argumentBuffersTier;
-
-#if MVK_MACOS
-	shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.simdPermute;
-#else
-	shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.quadPermute;
-	shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
-#endif
-
-	MVKPipelineLayout* layout = _layout;
-	layout->populateShaderConversionConfig(shaderConfig);
-
-	// Fix up resource bindings for ray tracing:
-	// 1. Set AccelerationStructure base type for AS descriptors (needed for padding)
-	// 2. Duplicate GLCompute bindings for the RT execution model (SPIRVToMSLConverter
-	//    filters bindings by entry point stage)
-	{
-		using SPIRV_CROSS_NAMESPACE::SPIRType;
-		// Find AS bindings in the layout and set their base type
-		for (uint32_t dslIdx = 0; dslIdx < layout->getDescriptorSetCount(); dslIdx++) {
-			auto* dsl = layout->getDescriptorSetLayout(dslIdx);
-			for (auto& desc : dsl->bindings()) {
-				if (desc.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR ||
-				    desc.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV) {
-					// Update the base type for this binding in all resource bindings
-					for (auto& rb : shaderConfig.resourceBindings) {
-						if (rb.resourceBinding.desc_set == dslIdx &&
-						    rb.resourceBinding.binding == desc.binding &&
-						    rb.resourceBinding.basetype == SPIRType::Void) {
-							rb.resourceBinding.basetype = SPIRType::AccelerationStructure;
-						}
-					}
-				}
-			}
-		}
-
-		// Duplicate compute-stage bindings for the RT execution model
-		if (execModel != spv::ExecutionModelGLCompute) {
-			size_t origCount = shaderConfig.resourceBindings.size();
-			for (size_t i = 0; i < origCount; i++) {
-				auto rb = shaderConfig.resourceBindings[i];
-				if (rb.resourceBinding.stage == spv::ExecutionModelGLCompute) {
-					rb.resourceBinding.stage = execModel;
-					shaderConfig.resourceBindings.push_back(rb);
-				}
-			}
-		}
-	}
-
-	MVKMTLFunction func = shaderModule->getMTLFunction(&shaderConfig, pStage->pSpecializationInfo, this, nullptr);
-	if (!func.getMTLFunction()) {
-		if (shouldFailOnPipelineCompileRequired()) {
-			setConfigurationResult(VK_PIPELINE_COMPILE_REQUIRED);
-		} else {
-			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
-				"Ray tracing shader function could not be compiled into pipeline. See previous logged error."));
-		}
-	}
-	return func;
-}
-
 VkResult MVKRayTracingPipeline::getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount,
                                                        size_t dataSize, void* pData) {
 	const uint32_t handleSize = 32;
@@ -3368,11 +3282,7 @@ VkDeviceSize MVKRayTracingPipeline::getShaderGroupStackSize(uint32_t group,
 MVKRayTracingPipeline::~MVKRayTracingPipeline() {
 	@synchronized (getMTLDevice()) {
 		[_mtlPipelineState release];
-		[_mtlVisibleFunctionTable release];
 		[_mtlIntersectionFunctionTable release];
-		for (auto& f : _mtlFunctions) {
-			[f release];
-		}
 	}
 }
 

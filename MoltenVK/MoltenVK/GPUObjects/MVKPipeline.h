@@ -495,18 +495,14 @@ public:
 
 protected:
 	void propagateDebugName() override {}
-	MVKMTLFunction compileShaderStage(const VkPipelineShaderStageCreateInfo* pStage,
-									  spv::ExecutionModel execModel);
 	std::string getMSLSource(const VkPipelineShaderStageCreateInfo* pStage,
 							 spv::ExecutionModel execModel,
 							 const std::string& funcName);
 
 	id<MTLComputePipelineState> _mtlPipelineState = nil;
-	id<MTLVisibleFunctionTable> _mtlVisibleFunctionTable = nil;
 	id<MTLIntersectionFunctionTable> _mtlIntersectionFunctionTable = nil;
 	MTLSize _mtlThreadgroupSize = {1, 1, 1};
 	MVKSmallVector<VkRayTracingShaderGroupCreateInfoKHR> _shaderGroups;
-	MVKSmallVector<id<MTLFunction>> _mtlFunctions;
 	uint32_t _shaderGroupCount = 0;
 	uint32_t _maxRecursionDepth = 1;
 };
