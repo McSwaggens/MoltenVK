@@ -2704,7 +2704,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			auto helperStructEnd = msl.find("};", helperStructStart);
 			if (helperStructBodyStart != std::string::npos && helperStructEnd != std::string::npos) {
 				std::string helperMembers = msl.substr(helperStructBodyStart + 1, helperStructEnd - helperStructBodyStart - 1);
-				auto raygenStructEnd = raygenMSL.find("};");
+				auto raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
+				auto raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
 				if (raygenStructEnd == std::string::npos) {
 					// Raygen MSL has no descriptor set struct. Insert the full struct from the helper.
 					std::string fullStruct = msl.substr(helperStructStart, helperStructEnd - helperStructStart + 2);
@@ -2713,7 +2714,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 					if (insertPos != std::string::npos) {
 						raygenMSL.insert(insertPos, fullStruct + "\n\n");
 					}
-					raygenStructEnd = raygenMSL.find("};");
+					raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
+					raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
 				}
 				if (raygenStructEnd != std::string::npos) {
 					// Merge members: add helper struct members that aren't in the raygen struct.
@@ -2787,57 +2789,139 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			}
 		}
 
-		// Extract SPIRV-Cross helper functions (spvSMod, spvFindLSB, etc.)
-		// defined before the entry point. These are template/inline functions
-		// that the shader body may reference.
+		// Extract SPIRV-Cross helper definitions from the helper stage MSL:
+		// struct types (e.g., struct _7 { ... }), template/inline functions
+		// (spvSMod, etc.), and constant arrays. These appear between
+		// "using namespace metal;" and the entry point function.
 		{
-			// Helper functions start after "using namespace metal;" and end before
-			// the entry point function. Look for inline/template function definitions.
 			auto usingNS = msl.find("using namespace metal;");
 			size_t helperStart = (usingNS != std::string::npos) ? usingNS + strlen("using namespace metal;") : 0;
-			// funcPos points to the entry function name
 			auto entryLineStart = msl.rfind('\n', funcPos);
 			if (entryLineStart == std::string::npos) entryLineStart = 0;
+			if (helperStart >= entryLineStart) helperStart = 0;
 			std::string helperRegion = msl.substr(helperStart, entryLineStart - helperStart);
-			// Find inline/template function definitions
-			static const char* helperPatterns[] = {"inline ", "template<", nullptr};
-			for (auto** pat = helperPatterns; *pat; pat++) {
+
+			// Find insertion point for struct types: before spvDescriptorSetBuffer0 since
+			// descriptor set members may reference these types. For helpers/constants,
+			// insert before _MVKRTBuiltins or static/kernel functions.
+			auto findStructInsertPos = [&]() -> size_t {
+				auto p = raygenMSL.find("struct spvDescriptorSetBuffer0");
+				if (p == std::string::npos) p = raygenMSL.find("struct _MVKRTBuiltins");
+				if (p == std::string::npos) p = raygenMSL.find("static void");
+				if (p == std::string::npos) p = raygenMSL.find("kernel void");
+				return p;
+			};
+			auto findInsertPos = [&]() -> size_t {
+				auto p = raygenMSL.find("struct _MVKRTBuiltins");
+				if (p == std::string::npos) p = raygenMSL.find("static void");
+				if (p == std::string::npos) p = raygenMSL.find("kernel void");
+				return p;
+			};
+
+			// Extract struct definitions (struct _NN { ... };)
+			{
 				size_t pos = 0;
-				while ((pos = helperRegion.find(*pat, pos)) != std::string::npos) {
-					// Check this isn't already in the raygen MSL
+				while ((pos = helperRegion.find("struct ", pos)) != std::string::npos) {
+					// Skip the spvDescriptorSetBuffer0 struct (handled separately)
+					if (helperRegion.compare(pos, strlen("struct spvDescriptorSetBuffer"), "struct spvDescriptorSetBuffer") == 0) {
+						pos += 7; continue;
+					}
 					auto lineS = helperRegion.rfind('\n', pos);
 					if (lineS == std::string::npos) lineS = 0; else lineS++;
-					// Find the end of this function (matching braces)
 					auto braceStart = helperRegion.find('{', pos);
-					if (braceStart == std::string::npos) { pos++; continue; }
-					int depth = 1;
-					size_t braceEnd = braceStart + 1;
-					while (braceEnd < helperRegion.size() && depth > 0) {
-						if (helperRegion[braceEnd] == '{') depth++;
-						else if (helperRegion[braceEnd] == '}') depth--;
-						braceEnd++;
+					auto semicolonEnd = helperRegion.find("};", pos);
+					if (braceStart == std::string::npos || semicolonEnd == std::string::npos) { pos += 7; continue; }
+					std::string structDef = helperRegion.substr(lineS, semicolonEnd + 2 - lineS);
+					// Extract struct name
+					auto nameStart = pos + 7; // after "struct "
+					auto nameEnd = nameStart;
+					while (nameEnd < helperRegion.size() && (isalnum(helperRegion[nameEnd]) || helperRegion[nameEnd] == '_'))
+						nameEnd++;
+					std::string structName = helperRegion.substr(nameStart, nameEnd - nameStart);
+						// Only add if not already in raygen MSL
+					if (!structName.empty() && raygenMSL.find("struct " + structName) == std::string::npos) {
+						auto insertPos = findStructInsertPos();
+						if (insertPos != std::string::npos) {
+							raygenMSL.insert(insertPos, structDef + "\n\n");
+						}
 					}
-					std::string helperFunc = helperRegion.substr(lineS, braceEnd - lineS);
-					// Check if this function name is already present in raygen MSL
-					// by looking for the function name (first word after inline/template line)
-					auto funcNameStart = helperFunc.find("spv");
-					if (funcNameStart != std::string::npos) {
-						auto funcNameEnd = funcNameStart;
-						while (funcNameEnd < helperFunc.size() && (isalnum(helperFunc[funcNameEnd]) || helperFunc[funcNameEnd] == '_'))
-							funcNameEnd++;
-						std::string hfName = helperFunc.substr(funcNameStart, funcNameEnd - funcNameStart);
-						if (raygenMSL.find(hfName) == std::string::npos) {
-							auto insertPos = raygenMSL.find("struct _MVKRTBuiltins");
-							if (insertPos == std::string::npos)
-								insertPos = raygenMSL.find("static void");
-							if (insertPos == std::string::npos)
-								insertPos = raygenMSL.find("kernel void");
-							if (insertPos != std::string::npos) {
-								raygenMSL.insert(insertPos, helperFunc + "\n\n");
+					pos = semicolonEnd + 2;
+				}
+			}
+
+			// Extract inline/template helper functions
+			{
+				static const char* helperPatterns[] = {"inline ", "template<", nullptr};
+				for (auto** pat = helperPatterns; *pat; pat++) {
+					size_t pos = 0;
+					while ((pos = helperRegion.find(*pat, pos)) != std::string::npos) {
+						auto lineS = helperRegion.rfind('\n', pos);
+						if (lineS == std::string::npos) lineS = 0; else lineS++;
+						auto braceStart = helperRegion.find('{', pos);
+						if (braceStart == std::string::npos) { pos++; continue; }
+						int depth = 1;
+						size_t braceEnd = braceStart + 1;
+						while (braceEnd < helperRegion.size() && depth > 0) {
+							if (helperRegion[braceEnd] == '{') depth++;
+							else if (helperRegion[braceEnd] == '}') depth--;
+							braceEnd++;
+						}
+						std::string helperFunc = helperRegion.substr(lineS, braceEnd - lineS);
+						auto fnStart = helperFunc.find("spv");
+						if (fnStart != std::string::npos) {
+							auto fnEnd = fnStart;
+							while (fnEnd < helperFunc.size() && (isalnum(helperFunc[fnEnd]) || helperFunc[fnEnd] == '_'))
+								fnEnd++;
+							std::string hfName = helperFunc.substr(fnStart, fnEnd - fnStart);
+							if (raygenMSL.find(hfName) == std::string::npos) {
+								auto insertPos = findInsertPos();
+								if (insertPos != std::string::npos)
+									raygenMSL.insert(insertPos, helperFunc + "\n\n");
+							}
+						}
+						pos = braceEnd;
+					}
+				}
+			}
+
+			// Extract constant buffer definitions (constant _NN _NN_val = { ... };)
+			{
+				size_t pos = 0;
+				while ((pos = helperRegion.find("constant ", pos)) != std::string::npos) {
+					auto lineS = helperRegion.rfind('\n', pos);
+					if (lineS == std::string::npos) lineS = 0; else lineS++;
+					auto lineEnd = helperRegion.find(';', pos);
+					if (lineEnd == std::string::npos) { pos += 9; continue; }
+					// Check if it spans multiple lines (has braces for array init)
+					auto braceStart = helperRegion.find('{', pos);
+					if (braceStart != std::string::npos && braceStart < lineEnd) {
+						// Multi-line constant array: find matching }
+						int depth = 1;
+						size_t braceEnd = braceStart + 1;
+						while (braceEnd < helperRegion.size() && depth > 0) {
+							if (helperRegion[braceEnd] == '{') depth++;
+							else if (helperRegion[braceEnd] == '}') depth--;
+							braceEnd++;
+						}
+						lineEnd = helperRegion.find(';', braceEnd);
+						if (lineEnd == std::string::npos) { pos += 9; continue; }
+					}
+					std::string constDef = helperRegion.substr(lineS, lineEnd + 1 - lineS);
+					// Extract the constant name (second word after "constant type")
+					auto nameEnd = constDef.find(" =");
+					if (nameEnd == std::string::npos) nameEnd = constDef.find("[");
+					if (nameEnd != std::string::npos) {
+						auto nameStart = constDef.rfind(' ', nameEnd - 1);
+						if (nameStart != std::string::npos) {
+							std::string cName = constDef.substr(nameStart + 1, nameEnd - nameStart - 1);
+							if (!cName.empty() && raygenMSL.find(cName) == std::string::npos) {
+								auto insertPos = findInsertPos();
+								if (insertPos != std::string::npos)
+									raygenMSL.insert(insertPos, constDef + "\n\n");
 							}
 						}
 					}
-					pos = braceEnd;
+					pos = lineEnd + 1;
 				}
 			}
 		}
@@ -3318,7 +3402,26 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			raygenMSL.replace(markerPos, strlen("(void)_mtl_isect;"), callCode);
 		}
 
-		// Ensure gl_LaunchSizeNV is available for helpers that need it.
+		// Ensure kernel has all parameters that helpers need.
+		// The raygen shader might not reference descriptors or launch builtins directly.
+		{
+			auto ks = raygenMSL.find("kernel void main0(");
+			auto kb = raygenMSL.find('{', ks);
+			if (ks != std::string::npos && raygenMSL.find("spvDescriptorSet0", ks) > kb) {
+				auto firstParam = raygenMSL.find('(', ks) + 1;
+				auto closeP = raygenMSL.find(')', firstParam);
+				bool hasParams = false;
+				for (size_t p = firstParam; p < closeP; p++) {
+					if (raygenMSL[p] != ' ' && raygenMSL[p] != '\n' && raygenMSL[p] != '\t') {
+						hasParams = true; break;
+					}
+				}
+				std::string suffix = hasParams ? ", " : "";
+				raygenMSL.insert(firstParam,
+					"constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]]" + suffix);
+			}
+		}
+		addKernelParam("uint3 gl_LaunchIDNV [[thread_position_in_grid]]");
 		addKernelParam("uint3 gl_LaunchSizeNV [[threads_per_grid]]");
 	}
 
