@@ -3370,7 +3370,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 					callCode += "    switch (_mtl_isect.instance_id) {\n";
 					for (auto& [gIdx, fn] : ahitGroupDispatch)
 						callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
-					callCode += "      default: break;\n    }\n";
+					callCode += "      default: " + ahitGroupDispatch[0].second + "(" + helperArgs + "); break;\n    }\n";
 				}
 			}
 
@@ -3381,7 +3381,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				callCode += "    switch (_mtl_isect.instance_id) {\n";
 				for (auto& [gIdx, fn] : hitGroupDispatch)
 					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
-				callCode += "      default: break;\n    }\n";
+				callCode += "      default: " + hitGroupDispatch[0].second + "(" + helperArgs + "); break;\n    }\n";
 			}
 
 			callCode += "  } else {\n";
@@ -3400,6 +3400,98 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		auto markerPos = raygenMSL.find("(void)_mtl_isect;");
 		if (markerPos != std::string::npos) {
 			raygenMSL.replace(markerPos, strlen("(void)_mtl_isect;"), callCode);
+		}
+
+		// Find the raygen payload variable and pass it to chit/miss/ahit helpers by reference.
+		// The payload variable is the first _NN identifier used after the tracing block's closing '}'.
+		{
+			auto blockEnd = raygenMSL.find("}", markerPos);
+			std::string payloadVar;
+			if (blockEnd != std::string::npos) {
+				for (size_t s = blockEnd + 1; s < raygenMSL.size(); s++) {
+					if (raygenMSL[s] == '_' && s + 1 < raygenMSL.size() && isdigit(raygenMSL[s + 1])) {
+						if (s > 0 && (isalnum(raygenMSL[s - 1]) || raygenMSL[s - 1] == '_')) continue;
+						size_t nameStart = s;
+						s++;
+						while (s < raygenMSL.size() && isdigit(raygenMSL[s])) s++;
+						if (s < raygenMSL.size() && (isalnum(raygenMSL[s]) || raygenMSL[s] == '_')) continue;
+						payloadVar = raygenMSL.substr(nameStart, s - nameStart);
+						break;
+					}
+				}
+			}
+
+			if (!payloadVar.empty()) {
+				// Add payload as argument to all chit/miss/ahit helper calls in the dispatch code.
+				// The dispatch calls are in the format: helperFunc(helperArgs)
+				// We need to append ", payloadVar" before the closing )
+				auto allHelpers = closestHitFuncs;
+				allHelpers.insert(allHelpers.end(), anyHitFuncs.begin(), anyHitFuncs.end());
+				allHelpers.insert(allHelpers.end(), missFuncs.begin(), missFuncs.end());
+
+				for (auto& fn : allHelpers) {
+					// Find the call site in the dispatch code (already inserted into raygenMSL)
+					size_t searchStart = markerPos;
+					size_t callPos;
+					while ((callPos = raygenMSL.find(fn + "(", searchStart)) != std::string::npos) {
+						auto callClose = raygenMSL.find(");", callPos);
+						if (callClose != std::string::npos) {
+							raygenMSL.insert(callClose, ", " + payloadVar);
+							searchStart = callClose + payloadVar.size() + 5;
+						} else break;
+					}
+
+					// Add reference parameter to the helper function definition.
+					// Find the function definition (starts with "static void funcName(")
+					auto defPos = raygenMSL.find("static void " + fn + "(");
+					if (defPos != std::string::npos) {
+						auto defBody = raygenMSL.find('{', defPos);
+						if (defBody != std::string::npos) {
+							// Find the payload variable in the helper body (first _NN assigned)
+							int depth = 1;
+							size_t defEnd = defBody + 1;
+							while (defEnd < raygenMSL.size() && depth > 0) {
+								if (raygenMSL[defEnd] == '{') depth++;
+								else if (raygenMSL[defEnd] == '}') depth--;
+								defEnd++;
+							}
+							std::string body = raygenMSL.substr(defBody + 1, defEnd - defBody - 2);
+
+							// Find the helper's payload variable and its type
+							std::string helperPayload, payloadType;
+							static const char* payloadTypes[] = {
+								"int4", "int3", "int2", "int",
+								"uint4", "uint3", "uint2", "uint",
+								"float4", "float3", "float2", "float", nullptr
+							};
+							for (auto** tp = payloadTypes; *tp; tp++) {
+								std::string pat = std::string(" = ") + *tp + "(";
+								auto assignPos = body.find(pat);
+								if (assignPos == std::string::npos) continue;
+								auto nameEnd = assignPos;
+								auto ns = body.rfind('\n', nameEnd);
+								if (ns == std::string::npos) ns = 0; else ns++;
+								while (ns < nameEnd && (body[ns] == ' ' || body[ns] == '\t')) ns++;
+								std::string varName = body.substr(ns, nameEnd - ns);
+								if (varName.size() > 1 && varName[0] == '_' &&
+									std::all_of(varName.begin() + 1, varName.end(), ::isdigit)) {
+									helperPayload = varName;
+									payloadType = *tp;
+									break;
+								}
+							}
+
+							if (!helperPayload.empty() && !payloadType.empty()) {
+								// Add reference parameter to function signature
+								auto sigClose = raygenMSL.find(')', defPos);
+								if (sigClose != std::string::npos && sigClose < defBody) {
+									raygenMSL.insert(sigClose, ", thread " + payloadType + "& " + helperPayload);
+								}
+							}
+						}
+					}
+				}
+			}
 		}
 
 		// Ensure kernel has all parameters that helpers need.
