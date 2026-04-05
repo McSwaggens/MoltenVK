@@ -2591,6 +2591,51 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 	}
 
+	// RT builtin struct definition — passed from raygen to chit/miss/ahit helpers.
+	static const char* kMVKRTBuiltinsStruct =
+		"struct _MVKRTBuiltins {\n"
+		"    float3 worldRayOrigin;\n"
+		"    float3 worldRayDirection;\n"
+		"    float3 objectRayOrigin;\n"
+		"    float3 objectRayDirection;\n"
+		"    float rayTmin;\n"
+		"    float rayTmax;\n"
+		"    uint primitiveId;\n"
+		"    uint instanceId;\n"
+		"    uint geometryId;\n"
+		"    uint instanceCustomIndex;\n"
+		"    uint hitKind;\n"
+		"};\n\n";
+
+	// Mapping from SPIRV-Cross parameter variable names to struct members.
+	// SPIRV-Cross emits these as function parameter names for visible functions.
+	static const std::pair<const char*, const char*> rtBuiltinMap[] = {
+		{"gl_WorldRayOriginEXT", "worldRayOrigin"},
+		{"gl_WorldRayDirectionEXT", "worldRayDirection"},
+		{"gl_ObjectRayOriginEXT", "objectRayOrigin"},
+		{"gl_ObjectRayDirectionEXT", "objectRayDirection"},
+		{"gl_RayTminEXT", "rayTmin"},
+		{"gl_RayTmaxEXT", "rayTmax"},
+		{"gl_PrimitiveID", "primitiveId"},
+		{"gl_InstanceID", "instanceId"},
+		{"gl_GeometryIndexEXT", "geometryId"},
+		{"gl_InstanceCustomIndexEXT", "instanceCustomIndex"},
+		{"gl_HitKindEXT", "hitKind"},
+		// NV variants
+		{"gl_WorldRayOriginNV", "worldRayOrigin"},
+		{"gl_WorldRayDirectionNV", "worldRayDirection"},
+		{"gl_ObjectRayOriginNV", "objectRayOrigin"},
+		{"gl_ObjectRayDirectionNV", "objectRayDirection"},
+		{"gl_RayTminNV", "rayTmin"},
+		{"gl_RayTmaxNV", "rayTmax"},
+		{"gl_HitTNV", "rayTmax"},
+		{"gl_PrimitiveIDNV", "primitiveId"},
+		{"gl_InstanceIDNV", "instanceId"},
+		{"gl_InstanceCustomIndexNV", "instanceCustomIndex"},
+		{"gl_HitKindNV", "hitKind"},
+		{nullptr, nullptr}
+	};
+
 	// All RT pipelines use the combined MSL approach.
 	std::string raygenMSL = getMSLSource(pRaygenStage, spv::ExecutionModelRayGenerationKHR, "");
 	if (raygenMSL.empty()) {
@@ -2779,6 +2824,12 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 					if (param.find("gl_LaunchSizeNV") != std::string::npos) continue;
 					if (param.find("gl_LaunchID") != std::string::npos) continue;
 					if (param.find("gl_LaunchSize") != std::string::npos) continue;
+					// Skip RT builtin parameters — they are handled via _mvk_rt struct
+					bool isRTBuiltin = false;
+					for (auto* m = rtBuiltinMap; m->first; m++) {
+						if (param.find(m->first) != std::string::npos) { isRTBuiltin = true; break; }
+					}
+					if (isRTBuiltin) continue;
 					// Extract variable name (last token) and base type
 					// Remove qualifiers: ray_data, device, constant, thread, &
 					std::string cleaned = param;
@@ -2802,8 +2853,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 						extraLocalDecls += "\n    " + cleaned + ";\n";
 					}
 				}
-				// Replace signature with standard parameters
-				std::string newParams = "constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV, uint3 gl_LaunchSizeNV";
+				// Replace signature with standard parameters plus RT builtins struct
+				std::string newParams = "constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV, uint3 gl_LaunchSizeNV, const thread _MVKRTBuiltins& _mvk_rt";
 				funcCode.replace(sigStart + 1, sigEnd - sigStart - 1, newParams);
 			}
 		}
@@ -2816,10 +2867,40 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			}
 		}
 
+		// Replace RT builtin variable references with struct member access.
+		for (auto* m = rtBuiltinMap; m->first; m++) {
+			std::string oldName = m->first;
+			std::string newName = std::string("_mvk_rt.") + m->second;
+			size_t pos = 0;
+			while ((pos = funcCode.find(oldName, pos)) != std::string::npos) {
+				// Check word boundaries
+				if (pos > 0 && (isalnum(funcCode[pos - 1]) || funcCode[pos - 1] == '_')) {
+					pos += oldName.size(); continue;
+				}
+				size_t endPos = pos + oldName.size();
+				if (endPos < funcCode.size() && (isalnum(funcCode[endPos]) || funcCode[endPos] == '_')) {
+					pos += oldName.size(); continue;
+				}
+				funcCode.replace(pos, oldName.size(), newName);
+				pos += newName.size();
+			}
+		}
+
 		// Insert as static helper before the kernel
 		auto kernelPos = raygenMSL.find("kernel void");
 		if (kernelPos != std::string::npos) {
 			raygenMSL.insert(kernelPos, "\nstatic " + funcCode + "\n\n");
+		}
+	}
+
+	// Insert the RT builtins struct before helpers if any non-raygen stages exist.
+	if (hasNonRaygenStages) {
+		auto kernelPos = raygenMSL.find("kernel void");
+		auto firstStaticPos = raygenMSL.find("static void");
+		size_t insertPos = (firstStaticPos != std::string::npos && firstStaticPos < kernelPos)
+			? firstStaticPos : kernelPos;
+		if (insertPos != std::string::npos) {
+			raygenMSL.insert(insertPos, kMVKRTBuiltinsStruct);
 		}
 	}
 
@@ -3071,8 +3152,22 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	// Replace it with calls to the closest-hit or miss function based on intersection result.
 	{
 		std::string callCode;
+		std::string helperArgs = "spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
 		if (!closestHitFuncs.empty() || !anyHitFuncs.empty() || !missFuncs.empty() || hasIntersection) {
-			callCode = "  if (_mtl_isect.type != intersection_type::none) {\n";
+			// Populate RT builtins struct from intersection result and ray data.
+			callCode =  "  _MVKRTBuiltins _mvk_rt;\n";
+			callCode += "  _mvk_rt.worldRayOrigin = _mtl_r.origin;\n";
+			callCode += "  _mvk_rt.worldRayDirection = _mtl_r.direction;\n";
+			callCode += "  _mvk_rt.rayTmin = _mtl_r.min_distance;\n";
+			callCode += "  _mvk_rt.rayTmax = _mtl_isect.distance;\n";
+			callCode += "  _mvk_rt.primitiveId = _mtl_isect.primitive_id;\n";
+			callCode += "  _mvk_rt.instanceId = _mtl_isect.instance_id;\n";
+			callCode += "  _mvk_rt.geometryId = _mtl_isect.geometry_id;\n";
+			callCode += "  _mvk_rt.instanceCustomIndex = _mtl_isect.user_instance_id;\n";
+			callCode += "  _mvk_rt.hitKind = (_mtl_isect.type == intersection_type::triangle) ? 0xFEu : 0u;\n";
+			callCode += "  _mvk_rt.objectRayOrigin = float3(0);\n";  // TODO: requires instance transform
+			callCode += "  _mvk_rt.objectRayDirection = float3(0);\n";  // TODO: requires instance transform
+			callCode += "  if (_mtl_isect.type != intersection_type::none) {\n";
 
 			// Build hit group dispatch: map shader groups to hit shader functions.
 			// Multiple hit groups use a switch on instance_id to dispatch to the right shader.
@@ -3113,22 +3208,22 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			// Emit any-hit dispatch
 			if (!ahitGroupDispatch.empty()) {
 				if (ahitGroupDispatch.size() == 1) {
-					callCode += "    " + ahitGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+					callCode += "    " + ahitGroupDispatch[0].second + "(" + helperArgs + ");\n";
 				} else {
 					callCode += "    switch (_mtl_isect.instance_id) {\n";
 					for (auto& [gIdx, fn] : ahitGroupDispatch)
-						callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV); break;\n";
+						callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
 					callCode += "      default: break;\n    }\n";
 				}
 			}
 
 			// Emit closest-hit dispatch
 			if (hitGroupDispatch.size() == 1) {
-				callCode += "    " + hitGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				callCode += "    " + hitGroupDispatch[0].second + "(" + helperArgs + ");\n";
 			} else if (hitGroupDispatch.size() > 1) {
 				callCode += "    switch (_mtl_isect.instance_id) {\n";
 				for (auto& [gIdx, fn] : hitGroupDispatch)
-					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV); break;\n";
+					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
 				callCode += "      default: break;\n    }\n";
 			}
 
@@ -3136,11 +3231,11 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 			// Emit miss dispatch
 			if (missGroupDispatch.size() == 1) {
-				callCode += "    " + missGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				callCode += "    " + missGroupDispatch[0].second + "(" + helperArgs + ");\n";
 			} else if (missGroupDispatch.size() > 1) {
 				// Multiple miss shaders: dispatch based on missIndex from traceRayEXT
 				// For now, call the first one (missIndex selection requires SPIRV-Cross support)
-				callCode += "    " + missGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				callCode += "    " + missGroupDispatch[0].second + "(" + helperArgs + ");\n";
 			}
 			callCode += "  }\n";
 		}
@@ -3205,9 +3300,10 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 						break;
 					}
 				}
-				std::string callableCall = callableFuncs[0] + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV";
+				std::string callableCall = "{ _MVKRTBuiltins _mvk_rt = {}; " +
+					callableFuncs[0] + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
 				if (!payloadVar.empty()) callableCall += ", " + payloadVar;
-				callableCall += ");\n";
+				callableCall += "); }\n";
 				raygenMSL.replace(pos, strlen("/* MVK_EXECUTE_CALLABLE */"), callableCall);
 			}
 
