@@ -117,7 +117,8 @@ static void addResourceBindingToShaderConfig(SPIRVToMSLConversionConfiguration& 
                                              uint32_t bindingIndex,
                                              uint32_t count,
                                              MVKDescriptorGPULayout layout,
-                                             MVKSampler* immutableSampler = nullptr)
+                                             MVKSampler* immutableSampler = nullptr,
+                                             VkDescriptorType descriptorType = VK_DESCRIPTOR_TYPE_MAX_ENUM)
 {
 	using SPIRV_CROSS_NAMESPACE::SPIRType;
 	if (count == 0) { return; }
@@ -131,8 +132,12 @@ static void addResourceBindingToShaderConfig(SPIRVToMSLConversionConfiguration& 
 			break;
 		case MVKDescriptorGPULayout::Buffer:
 		case MVKDescriptorGPULayout::BufferAuxSize:
-			shaderConfig.resourceBindings.push_back(makeResourceBinding(binding, stage, descriptorSetIndex, bindingIndex, count, SPIRType::Void, immutableSampler));
+		{
+			SPIRType::BaseType baseType = (descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR)
+				? SPIRType::AccelerationStructure : SPIRType::Void;
+			shaderConfig.resourceBindings.push_back(makeResourceBinding(binding, stage, descriptorSetIndex, bindingIndex, count, baseType, immutableSampler));
 			break;
+		}
 		case MVKDescriptorGPULayout::OutlinedData:
 			shaderConfig.resourceBindings.push_back(makeResourceBinding(binding, stage, descriptorSetIndex, bindingIndex, 1, SPIRType::Void, immutableSampler));
 			break;
@@ -199,7 +204,7 @@ void MVKPipelineLayout::populateShaderConversionConfig(SPIRVToMSLConversionConfi
 
 				MVKSampler*const* immSamp = layout->getImmutableSampler(desc);
 				MVKDescriptorGPULayout gpuLayout = argbuf ? desc.gpuLayout : getBindingLayout(desc);
-				addResourceBindingToShaderConfig(shaderConfig, binding.stages[stage], stage, dslIdx, desc.binding, desc.descriptorCount, gpuLayout, immSamp ? *immSamp : nullptr);
+				addResourceBindingToShaderConfig(shaderConfig, binding.stages[stage], stage, dslIdx, desc.binding, desc.descriptorCount, gpuLayout, immSamp ? *immSamp : nullptr, desc.descriptorType);
 				if (desc.perDescriptorResourceCount.dynamicOffset != 0 && used) {
 					shaderConfig.dynamicBufferDescriptors.push_back(makeDescriptorBinding(stage, dslIdx, desc.binding, binding.stages[stage].dynamicOffsetBufferIndex));
 				}
@@ -2719,52 +2724,49 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				}
 				if (raygenStructEnd != std::string::npos) {
 					// Merge members: add helper struct members that aren't in the raygen struct.
-					// To maintain correct argument buffer layout, new members are inserted
-					// BEFORE existing ones (lower binding numbers first) and all [[id(N)]]
-					// values are reassigned sequentially after merging.
+					// With pad_argument_buffer_resources=true, match by [[id(N)]] value:
+					// if the raygen has a padding placeholder at the same id, replace it.
 					std::istringstream ss(helperMembers);
 					std::string line;
 					while (std::getline(ss, line)) {
 						auto idPos = line.find("[[id(");
 						if (idPos == std::string::npos) continue;
+						// Extract the id value
+						auto idNumStart = idPos + 5;
+						auto idNumEnd = line.find(")]]", idNumStart);
+						if (idNumEnd == std::string::npos) continue;
+						std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
 
-						// Find the member variable name
+						// Find the member name
 						auto nameEnd = line.rfind(' ', idPos - 1);
 						if (nameEnd == std::string::npos) continue;
 						auto nameStart = line.rfind(' ', nameEnd - 1);
 						if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
 						std::string memberName = line.substr(nameStart, nameEnd - nameStart);
 
-						// Check if this member name already exists
-						if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
-							// Insert BEFORE existing members (lower bindings come first)
-							auto firstMember = raygenMSL.find("    ", raygenMSL.find('{', raygenMSL.find("struct spvDescriptorSetBuffer0")));
-							if (firstMember != std::string::npos && firstMember < raygenStructEnd) {
-								raygenMSL.insert(firstMember, line + "\n");
-							} else {
-								raygenMSL.insert(raygenStructEnd, line + "\n");
+						// Check if a member with the same id already exists in the raygen struct
+						auto existingId = raygenMSL.find(idStr);
+						if (existingId != std::string::npos && existingId < raygenStructEnd) {
+							// Check if existing member is a padding placeholder (_mN_pad)
+							auto existingLineStart = raygenMSL.rfind('\n', existingId);
+							if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
+							auto existingLineEnd = raygenMSL.find('\n', existingId);
+							std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
+							if (existingLine.find("_pad") != std::string::npos) {
+								// Replace padding placeholder with actual member
+								raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
+								raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
 							}
-							raygenStructEnd = raygenMSL.find("};");
+							// If it's a real member (not padding), skip — it's already there
+						} else if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
+							// Member doesn't exist at all — add it
+							raygenMSL.insert(raygenStructEnd, line + "\n");
+							raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
 						}
 					}
 
-					// Renumber all [[id(N)]] in the struct sequentially
-					{
-						auto structStart = raygenMSL.find("struct spvDescriptorSetBuffer0");
-						auto structBodyStart = raygenMSL.find('{', structStart);
-						raygenStructEnd = raygenMSL.find("};", structStart);
-						uint32_t nextId = 0;
-						size_t pos = structBodyStart;
-						while ((pos = raygenMSL.find("[[id(", pos)) != std::string::npos) {
-							if (pos > raygenStructEnd) break;
-							auto numStart = pos + 5;
-							auto numEnd = raygenMSL.find(")]]", numStart);
-							raygenMSL.replace(numStart, numEnd - numStart, std::to_string(nextId));
-							nextId++;
-							pos = numStart + 1;
-							raygenStructEnd = raygenMSL.find("};", structStart);
-						}
-					}
+					// With pad_argument_buffer_resources=true, [[id(N)]] values already
+					// match Vulkan binding numbers and must not be renumbered.
 				}
 			}
 		}
@@ -3191,20 +3193,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 								raygenStructEnd = raygenMSL.find("};");
 							}
 						}
-						// Renumber [[id(N)]]
-						auto structStart = raygenMSL.find("struct spvDescriptorSetBuffer0");
-						auto structBodyStart = raygenMSL.find('{', structStart);
-						raygenStructEnd = raygenMSL.find("};", structStart);
-						uint32_t nextId = 0;
-						size_t pos = structBodyStart;
-						while ((pos = raygenMSL.find("[[id(", pos)) != std::string::npos) {
-							if (pos > raygenStructEnd) break;
-							auto numStart = pos + 5;
-							auto numEnd = raygenMSL.find(")]]", numStart);
-							raygenMSL.replace(numStart, numEnd - numStart, std::to_string(nextId++));
-							pos = numStart + 1;
-							raygenStructEnd = raygenMSL.find("};", structStart);
-						}
+						// With pad_argument_buffer_resources=true, [[id(N)]] values already
+						// match Vulkan binding numbers and must not be renumbered.
 					}
 				}
 			}
@@ -3870,7 +3860,7 @@ std::string MVKRayTracingPipeline::getMSLSource(const VkPipelineShaderStageCreat
 	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
 	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
 	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
-	shaderConfig.options.mslOptions.pad_argument_buffer_resources = false;
+	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
 	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)mtlFeats.argumentBuffersTier;
 
 #if MVK_MACOS
@@ -3881,6 +3871,21 @@ std::string MVKRayTracingPipeline::getMSLSource(const VkPipelineShaderStageCreat
 #endif
 
 	_layout->populateShaderConversionConfig(shaderConfig);
+
+	// Duplicate compute-stage resource bindings with the RT execution model.
+	// populateShaderConversionConfig provides bindings for GLCompute (stage 5),
+	// but SPIRV-Cross filters by the actual entry point stage (e.g., RayGenerationKHR).
+	{
+		std::vector<mvk::MSLResourceBinding> rtBindings;
+		for (auto& rb : shaderConfig.resourceBindings) {
+			if (rb.resourceBinding.stage == spv::ExecutionModelGLCompute) {
+				auto rtRb = rb;
+				rtRb.resourceBinding.stage = execModel;
+				rtBindings.push_back(rtRb);
+			}
+		}
+		shaderConfig.resourceBindings.insert(shaderConfig.resourceBindings.end(), rtBindings.begin(), rtBindings.end());
+	}
 
 	mvk::SPIRVToMSLConversionResult conversionResult;
 	if (!shaderModule->convert(&shaderConfig, conversionResult)) {
