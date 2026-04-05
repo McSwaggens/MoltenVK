@@ -1538,6 +1538,46 @@ void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
   const MVKVulkanComputeCommandEncoderState& vk,
   const MVKVulkanSharedCommandEncoderState& vkShared) {
 	MVKComputePipeline* pipeline = vk._pipeline;
+	if (!pipeline) {
+		// No compute pipeline bound (e.g. ray tracing dispatch).
+		// Bind descriptor set argument buffers directly so the RT compute kernel has its resources.
+		if (_vkStage != kMVKShaderStageCompute) {
+			if (_vkStage != kMVKShaderStageCount) {
+				invalidateDescriptorSetImplicitBuffers(*this);
+				_exists.descriptorSetData.reset();
+			}
+			_vkStage = kMVKShaderStageCompute;
+		}
+		// Bind each descriptor set's GPU argument buffer to the compute encoder
+		// and make resources resident via useResource.
+		if (vk._layout) {
+			for (uint32_t i = 0; i < vk._layout->getDescriptorSetCount(); i++) {
+				MVKDescriptorSet* set = vk._descriptorSets[i];
+				if (set && set->gpuBufferObject) {
+					[encoder setBuffer: set->gpuBufferObject
+								offset: set->gpuBufferOffset
+							   atIndex: i];
+					// Make resources referenced by the descriptor set resident.
+					// Required for argument buffer resources to be accessible on GPU.
+					auto* dsl = vk._layout->getDescriptorSetLayout(i);
+					for (auto& desc : dsl->bindings()) {
+						if (desc.cpuLayout == MVKDescriptorCPULayout::None) continue;
+						// Read the CPU-side descriptor data to get the actual Metal resource
+						const char* cpuData = set->cpuBuffer + desc.cpuOffset;
+						for (uint32_t d = 0; d < desc.descriptorCount; d++) {
+							id resource = *(const id*)(cpuData + d * descriptorCPUSize(desc.cpuLayout));
+							if (resource) {
+								[encoder useResource: resource usage: MTLResourceUsageRead | MTLResourceUsageWrite];
+							}
+						}
+					}
+				}
+			}
+		}
+		mvkEncoder.getState().mtlShared()._useResource.bindAndResetCompute(encoder);
+		return;
+	}
+
 	id<MTLComputePipelineState> mtlPipeline = pipeline->getPipelineState();
 	if (!mtlPipeline) // Abort if pipeline could not be created.
 		return;
@@ -1694,6 +1734,16 @@ void MVKCommandEncoderState::bindComputePipeline(MVKComputePipeline* pipeline) {
 	}
 }
 
+void MVKCommandEncoderState::setComputeLayout(MVKPipelineLayout* layout) {
+	if (_vkCompute._layout != layout) {
+		if (!_vkCompute._layout || _vkCompute._layout->getPushConstantsLength() < layout->getPushConstantsLength()) {
+			mvkEnsureSize(_vkShared._pushConstants, layout->getPushConstantsLength());
+			invalidateImplicitBuffer(*this, VK_PIPELINE_BIND_POINT_COMPUTE, MVKNonVolatileImplicitBuffer::PushConstant);
+		}
+		_vkCompute.setLayout(layout);
+	}
+}
+
 void MVKCommandEncoderState::pushConstants(uint32_t offset, uint32_t size, const void* data) {
 	mvkEnsureSize(_vkShared._pushConstants, offset + size);
 	memcpy(_vkShared._pushConstants.data() + offset, data, size);
@@ -1717,7 +1767,8 @@ void MVKCommandEncoderState::bindDescriptorSets(
 	});
 	if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
 		_vkGraphics.bindDescriptorSets(layout, firstSet, setCount, sets, dynamicOffsetCount, dynamicOffsets);
-	} else if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+	} else if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ||
+			   bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
 		_vkCompute.bindDescriptorSets(layout, firstSet, setCount, sets, dynamicOffsetCount, dynamicOffsets);
 	}
 }
@@ -1726,6 +1777,7 @@ MVKVulkanCommonEncoderState* MVKCommandEncoderState::getVkEncoderState(VkPipelin
 	switch (bindPoint) {
 		case VK_PIPELINE_BIND_POINT_GRAPHICS: return &_vkGraphics;
 		case VK_PIPELINE_BIND_POINT_COMPUTE:  return &_vkCompute;
+		case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR: return &_vkCompute;
 		default: return nullptr;
 	}
 }
@@ -1796,11 +1848,14 @@ template <typename Fn>
 void MVKCommandEncoderState::applyToActiveMTLState(VkPipelineBindPoint bindPoint, Fn&& fn) {
 	switch (_mtlActiveEncoder) {
 		case CommandEncoderClass::Graphics:
-			if (bindPoint != VK_PIPELINE_BIND_POINT_COMPUTE)
+			if (bindPoint != VK_PIPELINE_BIND_POINT_COMPUTE &&
+				bindPoint != VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR)
 				std::forward<Fn>(fn)(_mtlGraphics);
 			break;
 		case CommandEncoderClass::Compute:
-			if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE && _mtlCompute._vkStage != kMVKShaderStageCompute)
+			if ((bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE ||
+				 bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) &&
+				_mtlCompute._vkStage != kMVKShaderStageCompute)
 				break;
 			if (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && !isGraphicsStage(_mtlCompute._vkStage))
 				break;

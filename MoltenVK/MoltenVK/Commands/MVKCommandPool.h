@@ -28,6 +28,8 @@
 #include "MVKCmdDraw.h"
 #include "MVKCmdTransfer.h"
 #include "MVKCmdQueries.h"
+#include "MVKCmdAccelerationStructure.h"
+#include "MVKCmdRayTracing.h"
 #include "MVKCmdDebug.h"
 #include "MVKMTLBufferAllocation.h"
 #include <unordered_set>

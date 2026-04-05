@@ -20,6 +20,7 @@
 #include "MVKDevice.h"
 #include "MVKQueue.h"
 #include "MVKSurface.h"
+#include "MVKAccelerationStructure.h"
 #include "MVKBuffer.h"
 #include "MVKImage.h"
 #include "MVKSwapchain.h"
@@ -114,6 +115,9 @@ MVKMTLDeviceCapabilities::MVKMTLDeviceCapabilities(id<MTLDevice> mtlDev) {
 
 	isAppleGPU = supportsApple1;
 
+	if ([mtlDev respondsToSelector: @selector(supportsRaytracing)]) {
+		supportsRayTracing = mtlDev.supportsRaytracing;
+	}
 	if ([mtlDev respondsToSelector: @selector(supportsBCTextureCompression)]) {
 		supportsBCTextureCompression = mtlDev.supportsBCTextureCompression;
 	}
@@ -565,6 +569,15 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 				zeroInitWorkgroupMemFeatures->shaderZeroInitializeWorkgroupMemory = supportedFeats13.shaderZeroInitializeWorkgroupMemory;
 				break;
 			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR: {
+				auto* asFeatures = (VkPhysicalDeviceAccelerationStructureFeaturesKHR*)next;
+				asFeatures->accelerationStructure = _gpuCapabilities.supportsRayTracing;
+				asFeatures->accelerationStructureCaptureReplay = false;
+				asFeatures->accelerationStructureIndirectBuild = false;
+				asFeatures->accelerationStructureHostCommands = false;
+				asFeatures->descriptorBindingAccelerationStructureUpdateAfterBind = false;
+				break;
+			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
 				auto* barycentricFeatures = (VkPhysicalDeviceFragmentShaderBarycentricFeaturesKHR*)next;
 				barycentricFeatures->fragmentShaderBarycentric = true;
@@ -602,6 +615,20 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 				portabilityFeatures->tessellationPointMode = false;
 				portabilityFeatures->triangleFans = true;
 				portabilityFeatures->vertexAttributeAccessBeyondStride = true;	// Costs additional buffers. Should make configuration switch.
+				break;
+			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR: {
+				auto* rqFeatures = (VkPhysicalDeviceRayQueryFeaturesKHR*)next;
+				rqFeatures->rayQuery = _gpuCapabilities.supportsRayTracing;
+				break;
+			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR: {
+				auto* rtpFeatures = (VkPhysicalDeviceRayTracingPipelineFeaturesKHR*)next;
+				rtpFeatures->rayTracingPipeline = _gpuCapabilities.supportsRayTracing;
+				rtpFeatures->rayTracingPipelineShaderGroupHandleCaptureReplay = false;
+				rtpFeatures->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false;
+				rtpFeatures->rayTracingPipelineTraceRaysIndirect = false;
+				rtpFeatures->rayTraversalPrimitiveCulling = false;
 				break;
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR: {
@@ -1069,6 +1096,18 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 				pushDescProps->maxPushDescriptors = supportedProps14.maxPushDescriptors;
 				break;
 			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR: {
+				auto* rtpProps = (VkPhysicalDeviceRayTracingPipelinePropertiesKHR*)next;
+				rtpProps->shaderGroupHandleSize = 32;
+				rtpProps->maxRayRecursionDepth = 1;
+				rtpProps->maxShaderGroupStride = 4096;
+				rtpProps->shaderGroupBaseAlignment = 64;
+				rtpProps->shaderGroupHandleCaptureReplaySize = 0;
+				rtpProps->maxRayDispatchInvocationCount = 1073741824;
+				rtpProps->shaderGroupHandleAlignment = 32;
+				rtpProps->maxRayHitAttributeSize = 32;
+				break;
+			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES: {
 				auto* depthStencilResolveProps = (VkPhysicalDeviceDepthStencilResolveProperties*)next;
 				depthStencilResolveProps->supportedDepthResolveModes = supportedProps12.supportedDepthResolveModes;
@@ -1173,6 +1212,18 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 				floatControlsProperties->shaderRoundingModeRTZFloat16 = supportedProps12.shaderRoundingModeRTZFloat16;
 				floatControlsProperties->shaderRoundingModeRTZFloat32 = supportedProps12.shaderRoundingModeRTZFloat32;
 				floatControlsProperties->shaderRoundingModeRTZFloat64 = supportedProps12.shaderRoundingModeRTZFloat64;
+				break;
+			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_PROPERTIES_KHR: {
+				auto* asProps = (VkPhysicalDeviceAccelerationStructurePropertiesKHR*)next;
+				asProps->maxGeometryCount = (1ull << 24) - 1;
+				asProps->maxInstanceCount = (1ull << 24) - 1;
+				asProps->maxPrimitiveCount = (1ull << 29) - 1;
+				asProps->maxPerStageDescriptorAccelerationStructures = 16;
+				asProps->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = 16;
+				asProps->maxDescriptorSetAccelerationStructures = 16;
+				asProps->maxDescriptorSetUpdateAfterBindAccelerationStructures = 16;
+				asProps->minAccelerationStructureScratchOffsetAlignment = 256;
 				break;
 			}
             case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_PROPERTIES_KHR: {
@@ -4214,6 +4265,31 @@ void MVKDevice::destroyDeferredOperation(MVKDeferredOperation* mvkDeferredOperat
     if(mvkDeferredOperation) { mvkDeferredOperation->destroy(); }
 }
 
+MVKAccelerationStructure* MVKDevice::createAccelerationStructure(const VkAccelerationStructureCreateInfoKHR* pCreateInfo,
+																 const VkAllocationCallbacks* pAllocator) {
+	auto* mvkAS = new MVKAccelerationStructure(this, pCreateInfo);
+	addAccelerationStructure(mvkAS);
+	return mvkAS;
+}
+
+void MVKDevice::destroyAccelerationStructure(MVKAccelerationStructure* mvkAccStruct,
+											 const VkAllocationCallbacks* pAllocator) {
+	if (mvkAccStruct) {
+		removeAccelerationStructure(mvkAccStruct);
+		mvkAccStruct->destroy();
+	}
+}
+
+void MVKDevice::addAccelerationStructure(MVKAccelerationStructure* mvkAS) {
+	lock_guard<mutex> lock(_rezLock);
+	_accelerationStructures.push_back(mvkAS);
+}
+
+void MVKDevice::removeAccelerationStructure(MVKAccelerationStructure* mvkAS) {
+	lock_guard<mutex> lock(_rezLock);
+	mvkRemoveFirstOccurance(_accelerationStructures, mvkAS);
+}
+
 MVKEvent* MVKDevice::createEvent(const VkEventCreateInfo* pCreateInfo,
 								 const VkAllocationCallbacks* pAllocator) {
 	const VkExportMetalObjectCreateInfoEXT* pExportInfo = nullptr;
@@ -4354,6 +4430,12 @@ template VkResult MVKDevice::createPipelines<MVKComputePipeline, VkComputePipeli
                                                                                               const VkComputePipelineCreateInfo* pCreateInfos,
                                                                                               const VkAllocationCallbacks* pAllocator,
                                                                                               VkPipeline* pPipelines);
+
+template VkResult MVKDevice::createPipelines<MVKRayTracingPipeline, VkRayTracingPipelineCreateInfoKHR>(VkPipelineCache pipelineCache,
+                                                                                                       uint32_t count,
+                                                                                                       const VkRayTracingPipelineCreateInfoKHR* pCreateInfos,
+                                                                                                       const VkAllocationCallbacks* pAllocator,
+                                                                                                       VkPipeline* pPipelines);
 
 void MVKDevice::destroyPipeline(MVKPipeline* mvkPL,
                                 const VkAllocationCallbacks* pAllocator) {
@@ -4533,6 +4615,21 @@ MVKBuffer* MVKDevice::removeBuffer(MVKBuffer* mvkBuff) {
 		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
 	}
 	return mvkBuff;
+}
+
+id<MTLBuffer> MVKDevice::getMTLBufferForDeviceAddress(VkDeviceAddress address, VkDeviceSize* pOffset) {
+	lock_guard<mutex> lock(_rezLock);
+	for (auto* buff : _gpuAddressableBuffers) {
+		id<MTLBuffer> mtlBuf = buff->getMTLBuffer();
+		uint64_t bufStart = mtlBuf.gpuAddress + buff->getMTLBufferOffset();
+		uint64_t bufEnd = bufStart + buff->getByteCount();
+		if (address >= bufStart && address < bufEnd) {
+			if (pOffset) { *pOffset = address - mtlBuf.gpuAddress; }
+			return mtlBuf;
+		}
+	}
+	if (pOffset) { *pOffset = 0; }
+	return nil;
 }
 
 void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {

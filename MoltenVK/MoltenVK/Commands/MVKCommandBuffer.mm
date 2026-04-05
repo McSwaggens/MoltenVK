@@ -893,6 +893,10 @@ void MVKCommandEncoder::bindPipeline(VkPipelineBindPoint pipelineBindPoint, MVKP
             _state.bindComputePipeline(static_cast<MVKComputePipeline*>(pipeline));
             break;
 
+        case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
+            setRayTracingPipeline(static_cast<MVKRayTracingPipeline*>(pipeline));
+            break;
+
         default:
             break;
     }

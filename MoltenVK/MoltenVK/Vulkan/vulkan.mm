@@ -26,6 +26,9 @@
 #include "MVKCmdDraw.h"
 #include "MVKCmdTransfer.h"
 #include "MVKCmdQueries.h"
+#include "MVKCmdAccelerationStructure.h"
+#include "MVKCmdRayTracing.h"
+#include "MVKAccelerationStructure.h"
 #include "MVKImage.h"
 #include "MVKBuffer.h"
 #include "MVKDeviceMemory.h"
@@ -1437,6 +1440,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBindPipeline(
 		}
 		case VK_PIPELINE_BIND_POINT_COMPUTE: {
 			MVKAddCmd(BindComputePipeline, commandBuffer, pipeline);
+			break;
+		}
+		case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR: {
+			MVKAddCmd(BindRayTracingPipeline, commandBuffer, pipeline);
 			break;
 		}
 		default:
@@ -3281,6 +3288,376 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkDestroyDeferredOperationKHR(
     mvkDev->destroyDeferredOperation(mvkDeferredOperation, pAllocator);
     MVKTraceVulkanCallEnd();
 }
+
+#pragma mark -
+#pragma mark VK_KHR_acceleration_structure extension
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateAccelerationStructureKHR(
+	VkDevice                                    device,
+	const VkAccelerationStructureCreateInfoKHR* pCreateInfo,
+	const VkAllocationCallbacks*                pAllocator,
+	VkAccelerationStructureKHR*                 pAccelerationStructure) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	MVKAccelerationStructure* mvkAS = mvkDev->createAccelerationStructure(pCreateInfo, pAllocator);
+	*pAccelerationStructure = (VkAccelerationStructureKHR)mvkAS;
+	VkResult rslt = mvkAS->getConfigurationResult();
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkDestroyAccelerationStructureKHR(
+	VkDevice                                    device,
+	VkAccelerationStructureKHR                  accelerationStructure,
+	const VkAllocationCallbacks*                pAllocator) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	mvkDev->destroyAccelerationStructure((MVKAccelerationStructure*)accelerationStructure, pAllocator);
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBuildAccelerationStructuresKHR(
+	VkCommandBuffer                             commandBuffer,
+	uint32_t                                    infoCount,
+	const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
+	const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos) {
+
+	MVKTraceVulkanCallStart();
+	MVKAddCmd(BuildAccelerationStructures, commandBuffer, infoCount, pInfos, ppBuildRangeInfos);
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdCopyAccelerationStructureKHR(
+	VkCommandBuffer                             commandBuffer,
+	const VkCopyAccelerationStructureInfoKHR*   pInfo) {
+
+	MVKTraceVulkanCallStart();
+	MVKAddCmd(CopyAccelerationStructure, commandBuffer, pInfo);
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdWriteAccelerationStructuresPropertiesKHR(
+	VkCommandBuffer                             commandBuffer,
+	uint32_t                                    accelerationStructureCount,
+	const VkAccelerationStructureKHR*           pAccelerationStructures,
+	VkQueryType                                 queryType,
+	VkQueryPool                                 queryPool,
+	uint32_t                                    firstQuery) {
+
+	MVKTraceVulkanCallStart();
+	MVKAddCmd(WriteAccelerationStructuresProperties, commandBuffer,
+			  accelerationStructureCount, pAccelerationStructures, queryType, queryPool, firstQuery);
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkDeviceAddress vkGetAccelerationStructureDeviceAddressKHR(
+	VkDevice                                    device,
+	const VkAccelerationStructureDeviceAddressInfoKHR* pInfo) {
+
+	MVKTraceVulkanCallStart();
+	MVKAccelerationStructure* mvkAS = (MVKAccelerationStructure*)pInfo->accelerationStructure;
+	VkDeviceAddress addr = mvkAS->getDeviceAddress();
+	MVKTraceVulkanCallEnd();
+	return addr;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
+	VkDevice                                    device,
+	VkAccelerationStructureBuildTypeKHR         buildType,
+	const VkAccelerationStructureBuildGeometryInfoKHR* pBuildInfo,
+	const uint32_t*                             pMaxPrimitiveCounts,
+	VkAccelerationStructureBuildSizesInfoKHR*   pSizeInfo) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	id<MTLDevice> mtlDev = mvkDev->getPhysicalDevice()->getMTLDevice();
+
+	// Build a Metal descriptor to get size information.
+	uint32_t geomCount = pBuildInfo->geometryCount;
+	const VkAccelerationStructureGeometryKHR* pGeometries = pBuildInfo->pGeometries;
+
+	if (pBuildInfo->type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
+		MTLPrimitiveAccelerationStructureDescriptor* primDesc =
+			[MTLPrimitiveAccelerationStructureDescriptor descriptor];
+
+		NSMutableArray* geomDescs = [NSMutableArray arrayWithCapacity: geomCount];
+		for (uint32_t g = 0; g < geomCount; g++) {
+			const VkAccelerationStructureGeometryKHR* geom =
+				pGeometries ? &pGeometries[g] : pBuildInfo->ppGeometries[g];
+			uint32_t primCount = pMaxPrimitiveCounts[g];
+
+			if (geom->geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
+				MTLAccelerationStructureTriangleGeometryDescriptor* triDesc =
+					[MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+				triDesc.triangleCount = primCount;
+				triDesc.vertexStride = geom->geometry.triangles.vertexStride;
+				triDesc.opaque = (geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
+				[geomDescs addObject: triDesc];
+			} else if (geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
+				MTLAccelerationStructureBoundingBoxGeometryDescriptor* aabbDesc =
+					[MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
+				aabbDesc.boundingBoxCount = primCount;
+				aabbDesc.boundingBoxStride = geom->geometry.aabbs.stride;
+				aabbDesc.opaque = (geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
+				[geomDescs addObject: aabbDesc];
+			}
+		}
+		primDesc.geometryDescriptors = geomDescs;
+		if (pBuildInfo->flags & VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) {
+			primDesc.usage |= MTLAccelerationStructureUsagePreferFastBuild;
+		}
+		if (pBuildInfo->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
+			primDesc.usage |= MTLAccelerationStructureUsageRefit;
+		}
+
+		MTLAccelerationStructureSizes sizes = [mtlDev accelerationStructureSizesWithDescriptor: primDesc];
+		pSizeInfo->accelerationStructureSize = sizes.accelerationStructureSize;
+		pSizeInfo->buildScratchSize = sizes.buildScratchBufferSize;
+		pSizeInfo->updateScratchSize = sizes.refitScratchBufferSize;
+	} else {
+		// Top-level (instance) acceleration structure
+		MTLInstanceAccelerationStructureDescriptor* instDesc =
+			[MTLInstanceAccelerationStructureDescriptor descriptor];
+
+		uint32_t instanceCount = 0;
+		if (geomCount > 0 && pMaxPrimitiveCounts) {
+			instanceCount = pMaxPrimitiveCounts[0];
+		}
+		instDesc.instanceCount = instanceCount;
+		if (pBuildInfo->flags & VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) {
+			instDesc.usage |= MTLAccelerationStructureUsagePreferFastBuild;
+		}
+		if (pBuildInfo->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
+			instDesc.usage |= MTLAccelerationStructureUsageRefit;
+		}
+
+		MTLAccelerationStructureSizes sizes = [mtlDev accelerationStructureSizesWithDescriptor: instDesc];
+		pSizeInfo->accelerationStructureSize = sizes.accelerationStructureSize;
+		pSizeInfo->buildScratchSize = sizes.buildScratchBufferSize;
+		pSizeInfo->updateScratchSize = sizes.refitScratchBufferSize;
+	}
+
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkGetDeviceAccelerationStructureCompatibilityKHR(
+	VkDevice                                    device,
+	const VkAccelerationStructureVersionInfoKHR* pVersionInfo,
+	VkAccelerationStructureCompatibilityKHR*    pCompatibility) {
+
+	MVKTraceVulkanCallStart();
+	*pCompatibility = VK_ACCELERATION_STRUCTURE_COMPATIBILITY_COMPATIBLE_KHR;
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdBuildAccelerationStructuresIndirectKHR(
+	VkCommandBuffer                             commandBuffer,
+	uint32_t                                    infoCount,
+	const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
+	const VkDeviceAddress*                      pIndirectDeviceAddresses,
+	const uint32_t*                             pIndirectStrides,
+	const uint32_t* const*                      ppMaxPrimitiveCounts) {
+
+	MVKTraceVulkanCallStart();
+	MVKCommandBuffer* cmdBuff = MVKCommandBuffer::getMVKCommandBuffer(commandBuffer);
+	cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdBuildAccelerationStructuresIndirectKHR is not supported.");
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCopyAccelerationStructureKHR(
+	VkDevice                                    device,
+	VkDeferredOperationKHR                      deferredOperation,
+	const VkCopyAccelerationStructureInfoKHR*   pInfo) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	VkResult rslt = mvkDev->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCopyAccelerationStructureKHR: Host-side acceleration structure copy is not supported.");
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCopyAccelerationStructureToMemoryKHR(
+	VkDevice                                    device,
+	VkDeferredOperationKHR                      deferredOperation,
+	const VkCopyAccelerationStructureToMemoryInfoKHR* pInfo) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	VkResult rslt = mvkDev->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCopyAccelerationStructureToMemoryKHR: Host-side acceleration structure serialization is not supported.");
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCopyMemoryToAccelerationStructureKHR(
+	VkDevice                                    device,
+	VkDeferredOperationKHR                      deferredOperation,
+	const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	VkResult rslt = mvkDev->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCopyMemoryToAccelerationStructureKHR: Host-side acceleration structure deserialization is not supported.");
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkWriteAccelerationStructuresPropertiesKHR(
+	VkDevice                                    device,
+	uint32_t                                    accelerationStructureCount,
+	const VkAccelerationStructureKHR*           pAccelerationStructures,
+	VkQueryType                                 queryType,
+	size_t                                      dataSize,
+	void*                                       pData,
+	size_t                                      stride) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	VkResult rslt = mvkDev->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkWriteAccelerationStructuresPropertiesKHR: Host-side acceleration structure property query is not supported.");
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkBuildAccelerationStructuresKHR(
+	VkDevice                                    device,
+	VkDeferredOperationKHR                      deferredOperation,
+	uint32_t                                    infoCount,
+	const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
+	const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	VkResult rslt = mvkDev->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkBuildAccelerationStructuresKHR: Host-side acceleration structure build is not supported.");
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdCopyAccelerationStructureToMemoryKHR(
+	VkCommandBuffer                             commandBuffer,
+	const VkCopyAccelerationStructureToMemoryInfoKHR* pInfo) {
+
+	MVKTraceVulkanCallStart();
+	MVKCommandBuffer* cmdBuff = MVKCommandBuffer::getMVKCommandBuffer(commandBuffer);
+	cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdCopyAccelerationStructureToMemoryKHR: Acceleration structure serialization is not supported.");
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdCopyMemoryToAccelerationStructureKHR(
+	VkCommandBuffer                             commandBuffer,
+	const VkCopyMemoryToAccelerationStructureInfoKHR* pInfo) {
+
+	MVKTraceVulkanCallStart();
+	MVKCommandBuffer* cmdBuff = MVKCommandBuffer::getMVKCommandBuffer(commandBuffer);
+	cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdCopyMemoryToAccelerationStructureKHR: Acceleration structure deserialization is not supported.");
+	MVKTraceVulkanCallEnd();
+}
+
+
+#pragma mark -
+#pragma mark VK_KHR_ray_tracing_pipeline extension
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkCreateRayTracingPipelinesKHR(
+	VkDevice                                    device,
+	VkDeferredOperationKHR                      deferredOperation,
+	VkPipelineCache                             pipelineCache,
+	uint32_t                                    createInfoCount,
+	const VkRayTracingPipelineCreateInfoKHR*    pCreateInfos,
+	const VkAllocationCallbacks*                pAllocator,
+	VkPipeline*                                 pPipelines) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	VkResult rslt = mvkDev->createPipelines<MVKRayTracingPipeline, VkRayTracingPipelineCreateInfoKHR>(pipelineCache, createInfoCount, pCreateInfos, pAllocator, pPipelines);
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetRayTracingShaderGroupHandlesKHR(
+	VkDevice                                    device,
+	VkPipeline                                  pipeline,
+	uint32_t                                    firstGroup,
+	uint32_t                                    groupCount,
+	size_t                                      dataSize,
+	void*                                       pData) {
+
+	MVKTraceVulkanCallStart();
+	MVKRayTracingPipeline* mvkPipeline = (MVKRayTracingPipeline*)pipeline;
+	VkResult rslt = mvkPipeline->getShaderGroupHandles(firstGroup, groupCount, dataSize, pData);
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(
+	VkDevice                                    device,
+	VkPipeline                                  pipeline,
+	uint32_t                                    firstGroup,
+	uint32_t                                    groupCount,
+	size_t                                      dataSize,
+	void*                                       pData) {
+
+	MVKTraceVulkanCallStart();
+	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
+	VkResult rslt = mvkDev->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkGetRayTracingCaptureReplayShaderGroupHandlesKHR: Capture replay is not supported.");
+	MVKTraceVulkanCallEnd();
+	return rslt;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdTraceRaysKHR(
+	VkCommandBuffer                             commandBuffer,
+	const VkStridedDeviceAddressRegionKHR*      pRaygenShaderBindingTable,
+	const VkStridedDeviceAddressRegionKHR*      pMissShaderBindingTable,
+	const VkStridedDeviceAddressRegionKHR*      pHitShaderBindingTable,
+	const VkStridedDeviceAddressRegionKHR*      pCallableShaderBindingTable,
+	uint32_t                                    width,
+	uint32_t                                    height,
+	uint32_t                                    depth) {
+
+	MVKTraceVulkanCallStart();
+	MVKAddCmd(TraceRays, commandBuffer,
+			  pRaygenShaderBindingTable, pMissShaderBindingTable,
+			  pHitShaderBindingTable, pCallableShaderBindingTable,
+			  width, height, depth);
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdTraceRaysIndirectKHR(
+	VkCommandBuffer                             commandBuffer,
+	const VkStridedDeviceAddressRegionKHR*      pRaygenShaderBindingTable,
+	const VkStridedDeviceAddressRegionKHR*      pMissShaderBindingTable,
+	const VkStridedDeviceAddressRegionKHR*      pHitShaderBindingTable,
+	const VkStridedDeviceAddressRegionKHR*      pCallableShaderBindingTable,
+	VkDeviceAddress                             indirectDeviceAddress) {
+
+	MVKTraceVulkanCallStart();
+	// For indirect trace rays, we don't have the dimensions at record time.
+	// For now, report as unsupported — the feature flag should be disabled.
+	MVKCommandBuffer* cmdBuff = MVKCommandBuffer::getMVKCommandBuffer(commandBuffer);
+	cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdTraceRaysIndirectKHR is not yet implemented.");
+	MVKTraceVulkanCallEnd();
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL VkDeviceSize vkGetRayTracingShaderGroupStackSizeKHR(
+	VkDevice                                    device,
+	VkPipeline                                  pipeline,
+	uint32_t                                    group,
+	VkShaderGroupShaderKHR                      groupShader) {
+
+	MVKTraceVulkanCallStart();
+	MVKRayTracingPipeline* mvkPipeline = (MVKRayTracingPipeline*)pipeline;
+	VkDeviceSize size = mvkPipeline->getShaderGroupStackSize(group, groupShader);
+	MVKTraceVulkanCallEnd();
+	return size;
+}
+
+MVK_PUBLIC_VULKAN_SYMBOL void vkCmdSetRayTracingPipelineStackSizeKHR(
+	VkCommandBuffer                             commandBuffer,
+	uint32_t                                    pipelineStackSize) {
+
+	MVKTraceVulkanCallStart();
+	// Metal manages stack sizes internally; this is a no-op.
+	MVKTraceVulkanCallEnd();
+}
+
 
 #pragma mark -
 #pragma mark VK_KHR_descriptor_update_template extension

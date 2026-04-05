@@ -27,6 +27,7 @@
 #include "mvk_datatypes.hpp"
 #include <sys/stat.h>
 #include <sstream>
+#include <sstream>
 
 #ifndef MVK_USE_CEREAL
 #define MVK_USE_CEREAL (1)
@@ -2522,6 +2523,459 @@ MVKComputePipeline::~MVKComputePipeline() {
 	@synchronized (getMTLDevice()) {
 		[_mtlPipelineState release];
 		if (_ownsModule) delete _module;
+	}
+}
+
+
+#pragma mark -
+#pragma mark MVKRayTracingPipeline
+
+MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
+                                             MVKPipelineCache* pipelineCache,
+                                             MVKPipeline* parent,
+                                             const VkRayTracingPipelineCreateInfoKHR* pCreateInfo)
+	: MVKPipeline(device, pipelineCache,
+				  (MVKPipelineLayout*)pCreateInfo->layout,
+				  (VkPipelineCreateFlags2)pCreateInfo->flags, parent) {
+
+	_shaderGroupCount = pCreateInfo->groupCount;
+	_maxRecursionDepth = pCreateInfo->maxPipelineRayRecursionDepth;
+
+	// Copy shader group definitions for later SBT handle queries.
+	_shaderGroups.resize(_shaderGroupCount);
+	for (uint32_t i = 0; i < _shaderGroupCount; i++) {
+		_shaderGroups[i] = pCreateInfo->pGroups[i];
+	}
+
+	if (pCreateInfo->stageCount == 0) {
+		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
+			"Ray tracing pipeline requires at least one shader stage."));
+		return;
+	}
+
+	// Find the ray generation shader stage. In Vulkan, it's the stage referenced
+	// by a VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR group.
+	// The raygen shader is compiled as a Metal compute kernel via ExecutionModelGLCompute,
+	// but the SPIR-V entry point uses ExecutionModelRayGenerationKHR.
+	const VkPipelineShaderStageCreateInfo* pRaygenStage = nullptr;
+	for (uint32_t g = 0; g < _shaderGroupCount; g++) {
+		auto& group = pCreateInfo->pGroups[g];
+		if (group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR &&
+			group.generalShader != VK_SHADER_UNUSED_KHR) {
+			auto& stage = pCreateInfo->pStages[group.generalShader];
+			if (stage.stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR) {
+				pRaygenStage = &stage;
+				break;
+			}
+		}
+	}
+
+	if (!pRaygenStage) {
+		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
+			"Ray tracing pipeline has no ray generation shader stage."));
+		return;
+	}
+
+	// Check if there are any non-raygen shader stages.
+	bool hasNonRaygenStages = false;
+	bool hasClosestHit = false, hasAnyHit = false, hasMiss = false;
+	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
+		auto& stage = pCreateInfo->pStages[i];
+		switch (stage.stage) {
+			case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR: hasClosestHit = hasNonRaygenStages = true; break;
+			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:     hasAnyHit = hasNonRaygenStages = true; break;
+			case VK_SHADER_STAGE_MISS_BIT_KHR:        hasMiss = hasNonRaygenStages = true; break;
+			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR:
+			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:    hasNonRaygenStages = true; break;
+			default: break;
+		}
+	}
+
+	// All RT pipelines use the combined MSL approach.
+	std::string raygenMSL = getMSLSource(pRaygenStage, spv::ExecutionModelRayGenerationKHR, "");
+	if (raygenMSL.empty()) {
+		_hasValidMTLPipelineStates = false;
+		return;
+	}
+	std::string closestHitFunc, anyHitFunc, missFunc;
+
+	// For hit/miss stages that write gl_LaunchIDEXT to the result image,
+	// generate inline helper functions that share the raygen kernel's
+	// descriptor set and launch ID. These helpers replicate what the
+	// hit/miss shader would do.
+	std::string helperFuncs;
+	// Compile non-raygen shaders to MSL and transform them into helper functions.
+	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
+		auto& stage = pCreateInfo->pStages[i];
+		if (stage.stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR) continue;
+
+		spv::ExecutionModel execModel;
+		std::string* targetFunc = nullptr;
+		std::string funcName;
+		switch (stage.stage) {
+			case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR:
+				execModel = spv::ExecutionModelClosestHitKHR;
+				funcName = "_mvk_chit";
+				targetFunc = &closestHitFunc;
+				break;
+			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:
+				execModel = spv::ExecutionModelAnyHitKHR;
+				funcName = "_mvk_ahit";
+				targetFunc = &anyHitFunc;
+				break;
+			case VK_SHADER_STAGE_MISS_BIT_KHR:
+				execModel = spv::ExecutionModelMissKHR;
+				funcName = "_mvk_miss";
+				targetFunc = &missFunc;
+				break;
+			default: continue;
+		}
+
+		std::string msl = getMSLSource(&stage, execModel, funcName);
+		if (msl.empty() || !targetFunc) continue;
+		*targetFunc = funcName;
+
+		// Debug: reportError(VK_SUCCESS, "RT helper MSL for %s:\n%s", funcName.c_str(), msl.c_str());
+		// Merge descriptor set struct members from the helper shader into the raygen's struct.
+		// The raygen and hit shaders may reference different bindings in the same set.
+		// Each shader has its own [[id(N)]] assignments, so we match by member name.
+		auto helperStructStart = msl.find("struct spvDescriptorSetBuffer0");
+		if (helperStructStart != std::string::npos) {
+			auto helperStructBodyStart = msl.find('{', helperStructStart);
+			auto helperStructEnd = msl.find("};", helperStructStart);
+			if (helperStructBodyStart != std::string::npos && helperStructEnd != std::string::npos) {
+				std::string helperMembers = msl.substr(helperStructBodyStart + 1, helperStructEnd - helperStructBodyStart - 1);
+				auto raygenStructEnd = raygenMSL.find("};");
+				if (raygenStructEnd != std::string::npos) {
+					// Merge members: add helper struct members that aren't in the raygen struct.
+					// To maintain correct argument buffer layout, new members are inserted
+					// BEFORE existing ones (lower binding numbers first) and all [[id(N)]]
+					// values are reassigned sequentially after merging.
+					std::istringstream ss(helperMembers);
+					std::string line;
+					while (std::getline(ss, line)) {
+						auto idPos = line.find("[[id(");
+						if (idPos == std::string::npos) continue;
+
+						// Find the member variable name
+						auto nameEnd = line.rfind(' ', idPos - 1);
+						if (nameEnd == std::string::npos) continue;
+						auto nameStart = line.rfind(' ', nameEnd - 1);
+						if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
+						std::string memberName = line.substr(nameStart, nameEnd - nameStart);
+
+						// Check if this member name already exists
+						if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
+							// Insert BEFORE existing members (lower bindings come first)
+							auto firstMember = raygenMSL.find("    ", raygenMSL.find('{', raygenMSL.find("struct spvDescriptorSetBuffer0")));
+							if (firstMember != std::string::npos && firstMember < raygenStructEnd) {
+								raygenMSL.insert(firstMember, line + "\n");
+							} else {
+								raygenMSL.insert(raygenStructEnd, line + "\n");
+							}
+							raygenStructEnd = raygenMSL.find("};");
+						}
+					}
+
+					// Renumber all [[id(N)]] in the struct sequentially
+					{
+						auto structStart = raygenMSL.find("struct spvDescriptorSetBuffer0");
+						auto structBodyStart = raygenMSL.find('{', structStart);
+						raygenStructEnd = raygenMSL.find("};", structStart);
+						uint32_t nextId = 0;
+						size_t pos = structBodyStart;
+						while ((pos = raygenMSL.find("[[id(", pos)) != std::string::npos) {
+							if (pos > raygenStructEnd) break;
+							auto numStart = pos + 5;
+							auto numEnd = raygenMSL.find(")]]", numStart);
+							raygenMSL.replace(numStart, numEnd - numStart, std::to_string(nextId));
+							nextId++;
+							pos = numStart + 1;
+							raygenStructEnd = raygenMSL.find("};", structStart);
+						}
+					}
+				}
+			}
+		}
+
+		// Extract just the function code (remove headers, structs, namespaces)
+		auto funcPos = msl.find(funcName + "(");
+		if (funcPos == std::string::npos) continue;
+
+		auto lineStart = msl.rfind('\n', funcPos);
+		if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
+		std::string funcCode = msl.substr(lineStart);
+
+		// Remove [[visible]], kernel, [[intersection(...)]] qualifiers
+		for (auto& qual : {"[[visible]] ", "kernel ", "[[intersection(triangle, instancing)]] "}) {
+			size_t qp = funcCode.find(qual);
+			if (qp != std::string::npos) funcCode.erase(qp, strlen(qual));
+		}
+
+		// Remove [[ ]] attributes from parameters
+		size_t attrStart;
+		while ((attrStart = funcCode.find(" [[")) != std::string::npos) {
+			auto attrEnd = funcCode.find("]]", attrStart);
+			if (attrEnd != std::string::npos) {
+				funcCode.erase(attrStart, attrEnd + 2 - attrStart);
+			} else break;
+		}
+
+		// Ensure the function signature has all 3 expected parameters:
+		// (constant spvDescriptorSetBuffer0& ds, uint3 lid, uint3 lsz)
+		auto sigEnd = funcCode.find(')');
+		auto sigStart = funcCode.find('(');
+		if (sigStart != std::string::npos && sigEnd != std::string::npos) {
+			std::string params = funcCode.substr(sigStart + 1, sigEnd - sigStart - 1);
+			// Replace the parameter list with the canonical 3 parameters
+			std::string newParams = "constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV, uint3 gl_LaunchSizeNV";
+			funcCode.replace(sigStart + 1, sigEnd - sigStart - 1, newParams);
+		}
+
+		// Insert as static helper before the kernel
+		auto kernelPos = raygenMSL.find("kernel void");
+		if (kernelPos != std::string::npos) {
+			raygenMSL.insert(kernelPos, "\nstatic " + funcCode + "\n\n");
+		}
+	}
+
+	// Now modify the raygen kernel's OpTraceRayKHR site to call the helper functions.
+	// The SPIRV-Cross emission left a marker: "(void)_mtl_isect;"
+	// Replace it with calls to the closest-hit or miss function based on intersection result.
+	{
+		std::string callCode;
+		if (!closestHitFunc.empty() || !missFunc.empty()) {
+			callCode = "  if (_mtl_isect.type != intersection_type::none) {\n";
+			if (!anyHitFunc.empty()) {
+				callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			}
+			if (!closestHitFunc.empty()) {
+				callCode += "    " + closestHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			}
+			callCode += "  } else {\n";
+			if (!missFunc.empty()) {
+				callCode += "    " + missFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			}
+			callCode += "  }\n";
+		}
+
+		auto markerPos = raygenMSL.find("(void)_mtl_isect;");
+		if (markerPos != std::string::npos) {
+			raygenMSL.replace(markerPos, strlen("(void)_mtl_isect;"), callCode);
+		}
+	}
+
+	// Compile the combined MSL source.
+	_mtlPipelineState = nil;
+	_mtlThreadgroupSize = {4, 4, 4};
+
+	// Debug: reportError(VK_SUCCESS, "RT combined MSL (%zu bytes)", raygenMSL.size());
+
+	NSError* err = nil;
+	id<MTLDevice> mtlDev = getPhysicalDevice()->getMTLDevice();
+	MTLCompileOptions* compileOptions = _device->getMTLCompileOptions();
+
+	id<MTLLibrary> mtlLib = [mtlDev newLibraryWithSource: @(raygenMSL.c_str())
+												 options: compileOptions
+												   error: &err];
+	// compileOptions intentionally not released — getMTLCompileOptions returns autoreleased in some paths.
+
+	if (err && !mtlLib) {
+		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
+			"RT pipeline MSL compile failed: %s", err.localizedDescription.UTF8String));
+		_hasValidMTLPipelineStates = false;
+		return;
+	}
+
+	id<MTLFunction> mtlFunc = [mtlLib newFunctionWithName: @"main0"];
+	if (!mtlFunc) {
+		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
+			"RT pipeline: raygen function 'main0' not found in compiled library."));
+		[mtlLib release];
+		_hasValidMTLPipelineStates = false;
+		return;
+	}
+
+	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];
+	plDesc.computeFunction = mtlFunc;
+
+	MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
+	_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);
+	plc->destroy();
+	[plDesc release];
+	[mtlFunc release];
+	[mtlLib release];
+
+	if (!_mtlPipelineState) { _hasValidMTLPipelineStates = false; }
+}
+
+std::string MVKRayTracingPipeline::getMSLSource(const VkPipelineShaderStageCreateInfo* pStage,
+                                                spv::ExecutionModel execModel,
+                                                const std::string& funcName) {
+	MVKShaderModule* shaderModule = (MVKShaderModule*)pStage->module;
+
+	auto& mtlFeats = getMetalFeatures();
+	auto& mvkCfg = getMVKConfig();
+	SPIRVToMSLConversionConfiguration shaderConfig;
+	shaderConfig.options.entryPointName = pStage->pName;
+	shaderConfig.options.entryPointStage = execModel;
+	shaderConfig.options.mslOptions.msl_version = mtlFeats.mslVersion;
+	shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
+	shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
+	shaderConfig.options.mslOptions.texture_buffer_native = true;
+	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
+	shaderConfig.options.mslOptions.replace_recursive_inputs = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0);
+	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
+	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
+	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
+	shaderConfig.options.mslOptions.pad_argument_buffer_resources = false;
+	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)mtlFeats.argumentBuffersTier;
+
+#if MVK_MACOS
+	shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.simdPermute;
+#else
+	shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.quadPermute;
+	shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
+#endif
+
+	_layout->populateShaderConversionConfig(shaderConfig);
+
+	mvk::SPIRVToMSLConversionResult conversionResult;
+	if (!shaderModule->convert(&shaderConfig, conversionResult)) {
+		reportError(VK_ERROR_INITIALIZATION_FAILED,
+			"RT shader MSL conversion failed: %s", conversionResult.resultLog.c_str());
+		return "";
+	}
+	// Rename entry point if requested (for non-raygen shaders to avoid symbol conflicts)
+	if (!funcName.empty() && funcName != "main0") {
+		std::string oldName = "main0";
+		size_t pos = 0;
+		while ((pos = conversionResult.msl.find(oldName, pos)) != std::string::npos) {
+			conversionResult.msl.replace(pos, oldName.length(), funcName);
+			pos += funcName.length();
+		}
+	}
+	return conversionResult.msl;
+}
+
+MVKMTLFunction MVKRayTracingPipeline::compileShaderStage(const VkPipelineShaderStageCreateInfo* pStage,
+                                                          spv::ExecutionModel execModel) {
+	MVKShaderModule* shaderModule = (MVKShaderModule*)pStage->module;
+
+	auto& mtlFeats = getMetalFeatures();
+	auto& mvkCfg = getMVKConfig();
+	SPIRVToMSLConversionConfiguration shaderConfig;
+	shaderConfig.options.entryPointName = pStage->pName;
+	shaderConfig.options.entryPointStage = execModel;
+
+	// Note: compileShaderStage is only used for raygen compilation now.
+	// Non-raygen shaders go through getMSLSource().
+	shaderConfig.options.mslOptions.msl_version = mtlFeats.mslVersion;
+	shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
+	shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
+	shaderConfig.options.mslOptions.texture_buffer_native = true;
+	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
+	shaderConfig.options.mslOptions.replace_recursive_inputs = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0);
+
+	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
+	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
+	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
+	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
+	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)mtlFeats.argumentBuffersTier;
+
+#if MVK_MACOS
+	shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.simdPermute;
+#else
+	shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.quadPermute;
+	shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
+#endif
+
+	MVKPipelineLayout* layout = _layout;
+	layout->populateShaderConversionConfig(shaderConfig);
+
+	// Fix up resource bindings for ray tracing:
+	// 1. Set AccelerationStructure base type for AS descriptors (needed for padding)
+	// 2. Duplicate GLCompute bindings for the RT execution model (SPIRVToMSLConverter
+	//    filters bindings by entry point stage)
+	{
+		using SPIRV_CROSS_NAMESPACE::SPIRType;
+		// Find AS bindings in the layout and set their base type
+		for (uint32_t dslIdx = 0; dslIdx < layout->getDescriptorSetCount(); dslIdx++) {
+			auto* dsl = layout->getDescriptorSetLayout(dslIdx);
+			for (auto& desc : dsl->bindings()) {
+				if (desc.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR ||
+				    desc.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_NV) {
+					// Update the base type for this binding in all resource bindings
+					for (auto& rb : shaderConfig.resourceBindings) {
+						if (rb.resourceBinding.desc_set == dslIdx &&
+						    rb.resourceBinding.binding == desc.binding &&
+						    rb.resourceBinding.basetype == SPIRType::Void) {
+							rb.resourceBinding.basetype = SPIRType::AccelerationStructure;
+						}
+					}
+				}
+			}
+		}
+
+		// Duplicate compute-stage bindings for the RT execution model
+		if (execModel != spv::ExecutionModelGLCompute) {
+			size_t origCount = shaderConfig.resourceBindings.size();
+			for (size_t i = 0; i < origCount; i++) {
+				auto rb = shaderConfig.resourceBindings[i];
+				if (rb.resourceBinding.stage == spv::ExecutionModelGLCompute) {
+					rb.resourceBinding.stage = execModel;
+					shaderConfig.resourceBindings.push_back(rb);
+				}
+			}
+		}
+	}
+
+	MVKMTLFunction func = shaderModule->getMTLFunction(&shaderConfig, pStage->pSpecializationInfo, this, nullptr);
+	if (!func.getMTLFunction()) {
+		if (shouldFailOnPipelineCompileRequired()) {
+			setConfigurationResult(VK_PIPELINE_COMPILE_REQUIRED);
+		} else {
+			setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
+				"Ray tracing shader function could not be compiled into pipeline. See previous logged error."));
+		}
+	}
+	return func;
+}
+
+VkResult MVKRayTracingPipeline::getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount,
+                                                       size_t dataSize, void* pData) {
+	const uint32_t handleSize = 32;
+	if (dataSize < groupCount * handleSize) {
+		return reportError(VK_ERROR_OUT_OF_HOST_MEMORY,
+			"vkGetRayTracingShaderGroupHandlesKHR: dataSize is too small.");
+	}
+	if (firstGroup + groupCount > _shaderGroupCount) {
+		return reportError(VK_ERROR_OUT_OF_HOST_MEMORY,
+			"vkGetRayTracingShaderGroupHandlesKHR: group range exceeds pipeline group count.");
+	}
+	uint8_t* dst = (uint8_t*)pData;
+	for (uint32_t i = 0; i < groupCount; i++) {
+		memset(dst, 0, handleSize);
+		uint32_t groupIndex = firstGroup + i;
+		memcpy(dst, &groupIndex, sizeof(groupIndex));
+		dst += handleSize;
+	}
+	return VK_SUCCESS;
+}
+
+VkDeviceSize MVKRayTracingPipeline::getShaderGroupStackSize(uint32_t group,
+                                                             VkShaderGroupShaderKHR groupShader) {
+	return 0; // Metal manages stack sizes internally
+}
+
+MVKRayTracingPipeline::~MVKRayTracingPipeline() {
+	@synchronized (getMTLDevice()) {
+		[_mtlPipelineState release];
+		[_mtlVisibleFunctionTable release];
+		[_mtlIntersectionFunctionTable release];
+		for (auto& f : _mtlFunctions) {
+			[f release];
+		}
 	}
 }
 

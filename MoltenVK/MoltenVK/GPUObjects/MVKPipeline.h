@@ -462,6 +462,54 @@ protected:
 
 
 #pragma mark -
+#pragma mark MVKRayTracingPipeline
+
+/** Represents a Vulkan ray tracing pipeline. */
+class MVKRayTracingPipeline : public MVKPipeline {
+
+public:
+
+	/** Returns the compiled Metal compute pipeline state for the ray generation shader. */
+	id<MTLComputePipelineState> getMTLComputePipelineState() { return _mtlPipelineState; }
+
+	/** Returns the threadgroup size for dispatch. */
+	const MTLSize& getThreadgroupSize() const { return _mtlThreadgroupSize; }
+
+	/** Returns the shader group handles for this pipeline. */
+	VkResult getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount,
+								   size_t dataSize, void* pData);
+
+	/** Returns the stack size for the given shader group. */
+	VkDeviceSize getShaderGroupStackSize(uint32_t group, VkShaderGroupShaderKHR groupShader);
+
+	/** Constructs an instance for the device and parent (which may be NULL). */
+	MVKRayTracingPipeline(MVKDevice* device,
+						  MVKPipelineCache* pipelineCache,
+						  MVKPipeline* parent,
+						  const VkRayTracingPipelineCreateInfoKHR* pCreateInfo);
+
+	~MVKRayTracingPipeline() override;
+
+protected:
+	void propagateDebugName() override {}
+	MVKMTLFunction compileShaderStage(const VkPipelineShaderStageCreateInfo* pStage,
+									  spv::ExecutionModel execModel);
+	std::string getMSLSource(const VkPipelineShaderStageCreateInfo* pStage,
+							 spv::ExecutionModel execModel,
+							 const std::string& funcName);
+
+	id<MTLComputePipelineState> _mtlPipelineState = nil;
+	id<MTLVisibleFunctionTable> _mtlVisibleFunctionTable = nil;
+	id<MTLIntersectionFunctionTable> _mtlIntersectionFunctionTable = nil;
+	MTLSize _mtlThreadgroupSize = {1, 1, 1};
+	MVKSmallVector<VkRayTracingShaderGroupCreateInfoKHR> _shaderGroups;
+	MVKSmallVector<id<MTLFunction>> _mtlFunctions;
+	uint32_t _shaderGroupCount = 0;
+	uint32_t _maxRecursionDepth = 1;
+};
+
+
+#pragma mark -
 #pragma mark MVKPipelineCache
 
 /** Represents a Vulkan pipeline cache. */

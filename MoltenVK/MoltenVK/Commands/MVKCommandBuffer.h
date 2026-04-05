@@ -36,6 +36,7 @@ class MVKRenderPass;
 class MVKFramebuffer;
 class MVKRenderSubpass;
 class MVKQueryPool;
+class MVKRayTracingPipeline;
 class MVKPipeline;
 class MVKGraphicsPipeline;
 class MVKComputePipeline;
@@ -411,6 +412,12 @@ public:
 	/** Returns the compute pipeline. */
 	MVKComputePipeline* getComputePipeline() { return getVkCompute()._pipeline; }
 
+	/** Returns the currently bound ray tracing pipeline. */
+	MVKRayTracingPipeline* getRayTracingPipeline() { return _rtPipeline; }
+
+	/** Sets the bound ray tracing pipeline. */
+	void setRayTracingPipeline(MVKRayTracingPipeline* pipeline) { _rtPipeline = pipeline; }
+
     /**
 	 * Copy bytes into the Metal encoder at a Metal vertex buffer index, and optionally indicate
 	 * that this binding might override a desriptor binding. If so, the descriptor binding will
@@ -545,6 +552,7 @@ protected:
 	id<MTLComputeCommandEncoder> _mtlComputeEncoder;
 	id<MTLBlitCommandEncoder> _mtlBlitEncoder;
 	id<MTLFence> _stageCountersMTLFence;
+	MVKRayTracingPipeline* _rtPipeline = nullptr;
 	MVKPrefillMetalCommandBuffersStyle _prefillStyle;
 	VkSubpassContents _subpassContents;
 	uint32_t _renderSubpassIndex;

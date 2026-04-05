@@ -42,6 +42,7 @@ class MVKQueueFamily;
 class MVKSurface;
 class MVKSemaphoreImpl;
 class MVKResource;
+class MVKAccelerationStructure;
 class MVKBuffer;
 class MVKBufferView;
 class MVKImage;
@@ -117,6 +118,7 @@ typedef struct MVKMTLDeviceCapabilities {
 	bool supportsMetal4;
 
 	bool isAppleGPU;
+	bool supportsRayTracing;
 	bool supportsBCTextureCompression;
 	bool supportsDepth24Stencil8;
 	bool supports32BitFloatFiltering;
@@ -752,6 +754,11 @@ public:
     void destroyDeferredOperation(MVKDeferredOperation* mvkDeferredOperation,
                                   const VkAllocationCallbacks* pAllocator);
 
+	MVKAccelerationStructure* createAccelerationStructure(const VkAccelerationStructureCreateInfoKHR* pCreateInfo,
+														  const VkAllocationCallbacks* pAllocator);
+	void destroyAccelerationStructure(MVKAccelerationStructure* mvkAccStruct,
+									  const VkAllocationCallbacks* pAllocator);
+
 	MVKEvent* createEvent(const VkEventCreateInfo* pCreateInfo,
 						  const VkAllocationCallbacks* pAllocator);
 	void destroyEvent(MVKEvent* mvkEvent,
@@ -854,6 +861,15 @@ public:
 
 	/** Tell the GPU to be ready to use any of the GPU-addressable buffers. */
 	void encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage);
+
+	/**
+	 * Returns the MTLBuffer containing the specified device address, along with the
+	 * offset within that buffer via the pOffset output parameter. Returns nil if not found.
+	 */
+	id<MTLBuffer> getMTLBufferForDeviceAddress(VkDeviceAddress address, VkDeviceSize* pOffset);
+
+	/** Returns all tracked acceleration structures (for TLAS instance lookups). */
+	MVKSmallVector<MVKAccelerationStructure*>& getAccelerationStructures() { return _accelerationStructures; }
 
 	/** Adds the specified host semaphore to be woken upon device loss. */
 	void addSemaphore(MVKSemaphoreImpl* sem4);
@@ -1041,6 +1057,8 @@ protected:
 	void propagateDebugName() override  {}
 	MVKBuffer* addBuffer(MVKBuffer* mvkBuff);
 	MVKBuffer* removeBuffer(MVKBuffer* mvkBuff);
+	void addAccelerationStructure(MVKAccelerationStructure* mvkAS);
+	void removeAccelerationStructure(MVKAccelerationStructure* mvkAS);
 	MVKImage* addImage(MVKImage* mvkImg);
 	MVKImage* removeImage(MVKImage* mvkImg);
     void initPerformanceTracking();
@@ -1083,6 +1101,7 @@ protected:
 	MVKSmallVector<MVKSmallVector<MVKQueue*, kMVKQueueCountPerQueueFamily>, kMVKQueueFamilyCount> _queuesByQueueFamilyIndex;
 	MVKSmallVector<MVKResource*> _resources;
 	MVKSmallVector<MVKBuffer*> _gpuAddressableBuffers;
+	MVKSmallVector<MVKAccelerationStructure*> _accelerationStructures;
 	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
 	MVKSmallVector<bool> _privateDataSlotsAvailability;
 	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;

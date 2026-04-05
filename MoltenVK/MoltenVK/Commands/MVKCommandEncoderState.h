@@ -477,6 +477,8 @@ public:
 	void bindGraphicsPipeline(MVKGraphicsPipeline* pipeline);
 	/** Binds the given compute pipeline to the Vulkan graphics state, invalidating any necessary resources. */
 	void bindComputePipeline(MVKComputePipeline* pipeline);
+	/** Sets the compute pipeline layout for ray tracing descriptor set compatibility. */
+	void setComputeLayout(MVKPipelineLayout* layout);
 	/** Binds the given push constants to the Vulkan state, invalidating any necessary resources. */
 	void pushConstants(uint32_t offset, uint32_t size, const void* data);
 	/** Binds the given descriptor sets to the Vulkan state, invalidating any necessary resources. */
