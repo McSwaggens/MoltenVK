@@ -2578,7 +2578,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 	// Check if there are any non-raygen shader stages.
 	bool hasNonRaygenStages = false;
-	bool hasClosestHit = false, hasAnyHit = false, hasMiss = false, hasIntersection = false;
+	bool hasClosestHit = false, hasAnyHit = false, hasMiss = false, hasIntersection = false, hasCallable = false;
 	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
 		auto& stage = pCreateInfo->pStages[i];
 		switch (stage.stage) {
@@ -2586,7 +2586,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:     hasAnyHit = hasNonRaygenStages = true; break;
 			case VK_SHADER_STAGE_MISS_BIT_KHR:        hasMiss = hasNonRaygenStages = true; break;
 			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR: hasIntersection = hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:    hasNonRaygenStages = true; break;
+			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:    hasCallable = hasNonRaygenStages = true; break;
 			default: break;
 		}
 	}
@@ -2597,7 +2597,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		_hasValidMTLPipelineStates = false;
 		return;
 	}
-	std::string closestHitFunc, anyHitFunc, missFunc, intersectionFunc;
+	std::string closestHitFunc, anyHitFunc, missFunc, intersectionFunc, callableFunc;
 
 	// For hit/miss stages that write gl_LaunchIDEXT to the result image,
 	// generate inline helper functions that share the raygen kernel's
@@ -2632,6 +2632,11 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				// Intersection shaders are handled separately below as proper
 				// Metal intersection functions, not as inline helpers.
 				continue;
+			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:
+				execModel = spv::ExecutionModelCallableKHR;
+				funcName = "_mvk_callable";
+				targetFunc = &callableFunc;
+				break;
 			default: continue;
 		}
 
@@ -2650,6 +2655,16 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			if (helperStructBodyStart != std::string::npos && helperStructEnd != std::string::npos) {
 				std::string helperMembers = msl.substr(helperStructBodyStart + 1, helperStructEnd - helperStructBodyStart - 1);
 				auto raygenStructEnd = raygenMSL.find("};");
+				if (raygenStructEnd == std::string::npos) {
+					// Raygen MSL has no descriptor set struct. Insert the full struct from the helper.
+					std::string fullStruct = msl.substr(helperStructStart, helperStructEnd - helperStructStart + 2);
+					auto insertPos = raygenMSL.find("kernel void");
+					if (insertPos == std::string::npos) insertPos = raygenMSL.find("static void");
+					if (insertPos != std::string::npos) {
+						raygenMSL.insert(insertPos, fullStruct + "\n\n");
+					}
+					raygenStructEnd = raygenMSL.find("};");
+				}
 				if (raygenStructEnd != std::string::npos) {
 					// Merge members: add helper struct members that aren't in the raygen struct.
 					// To maintain correct argument buffer layout, new members are inserted
@@ -2705,6 +2720,21 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		// Extract just the function code (remove headers, structs, namespaces)
 		auto funcPos = msl.find(funcName + "(");
 		if (funcPos == std::string::npos) continue;
+
+		// Check if the function body is empty (passthrough shader).
+		// Skip empty helpers — they do nothing and avoid needing descriptor set types.
+		auto bodyStart = msl.find('{', funcPos);
+		auto bodyEnd = msl.find('}', bodyStart + 1);
+		if (bodyStart != std::string::npos && bodyEnd != std::string::npos) {
+			std::string body = msl.substr(bodyStart + 1, bodyEnd - bodyStart - 1);
+			// Trim whitespace
+			body.erase(0, body.find_first_not_of(" \t\n\r"));
+			body.erase(body.find_last_not_of(" \t\n\r") + 1);
+			if (body.empty()) {
+				*targetFunc = "";  // Clear — don't generate empty helper
+				continue;
+			}
+		}
 
 		auto lineStart = msl.rfind('\n', funcPos);
 		if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
@@ -2996,7 +3026,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	// Replace it with calls to the closest-hit or miss function based on intersection result.
 	{
 		std::string callCode;
-		if (!closestHitFunc.empty() || !missFunc.empty() || hasIntersection) {
+		if (!closestHitFunc.empty() || !anyHitFunc.empty() || !missFunc.empty() || hasIntersection) {
 			callCode = "  if (_mtl_isect.type != intersection_type::none) {\n";
 			if (!anyHitFunc.empty())
 				callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
@@ -3014,11 +3044,71 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 	}
 
+	// Replace executeCallableEXT markers with calls to the callable helper.
+	if (!callableFunc.empty()) {
+		// Ensure the kernel has the descriptor set parameter (the raygen shader
+		// might not reference any descriptors, but the callable shader does).
+		auto kernelStart = raygenMSL.find("kernel void main0(");
+		auto descInKernel = raygenMSL.find("spvDescriptorSet0", kernelStart);
+		auto kernelBody = raygenMSL.find('{', kernelStart);
+		if (kernelStart != std::string::npos &&
+		    (descInKernel == std::string::npos || descInKernel > kernelBody)) {
+			auto mainSig2 = raygenMSL.find("kernel void main0(");
+			if (mainSig2 != std::string::npos) {
+				auto firstParam = raygenMSL.find('(', mainSig2) + 1;
+				// Check if there are existing parameters
+				auto closeP = raygenMSL.find(')', firstParam);
+				bool hasParams = false;
+				for (size_t p = firstParam; p < closeP; p++) {
+					if (raygenMSL[p] != ' ' && raygenMSL[p] != '\n' && raygenMSL[p] != '\t') {
+						hasParams = true; break;
+					}
+				}
+				std::string suffix = hasParams ? ", " : "";
+				raygenMSL.insert(firstParam,
+					"constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]]" + suffix);
+				kernelStart = raygenMSL.find("kernel void main0(");
+				kernelBody = raygenMSL.find('{', kernelStart);
+			}
+		}
+
+		// Ensure gl_LaunchIDNV and gl_LaunchSizeNV parameters exist in the kernel.
+		// The callable test's raygen might not use these builtins directly.
+		kernelStart = raygenMSL.find("kernel void main0(");
+		kernelBody = raygenMSL.find('{', kernelStart);
+		auto addKernelParam = [&](const char* param) {
+			auto found = raygenMSL.find(param, kernelStart);
+			if (found == std::string::npos || found > kernelBody) {
+				auto parenStart = raygenMSL.find('(', kernelStart);
+				int depth = 1;
+				size_t sigEnd = parenStart + 1;
+				while (sigEnd < raygenMSL.size() && depth > 0) {
+					if (raygenMSL[sigEnd] == '(') depth++;
+					else if (raygenMSL[sigEnd] == ')') depth--;
+					if (depth > 0) sigEnd++;
+				}
+				if (depth == 0) {
+					std::string prefix = (sigEnd > parenStart + 1) ? ", " : "";
+					raygenMSL.insert(sigEnd, prefix + param);
+					kernelBody = raygenMSL.find('{', kernelStart); // update
+				}
+			}
+		};
+		addKernelParam("uint3 gl_LaunchIDNV [[thread_position_in_grid]]");
+		addKernelParam("uint3 gl_LaunchSizeNV [[threads_per_grid]]");
+
+		std::string callableCall = callableFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+		size_t pos;
+		while ((pos = raygenMSL.find("/* MVK_EXECUTE_CALLABLE */")) != std::string::npos) {
+			raygenMSL.replace(pos, strlen("/* MVK_EXECUTE_CALLABLE */"), callableCall);
+		}
+	}
+
 	// Compile the combined MSL source.
 	_mtlPipelineState = nil;
 	_mtlThreadgroupSize = {4, 4, 4};
 
-	// fprintf(stderr, "[MVK-RT-DBG] Combined MSL:\n%s\n", raygenMSL.c_str());
+	// debug log removed
 
 	NSError* err = nil;
 	id<MTLDevice> mtlDev = getPhysicalDevice()->getMTLDevice();
