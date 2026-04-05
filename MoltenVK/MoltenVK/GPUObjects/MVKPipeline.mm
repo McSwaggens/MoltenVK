@@ -2621,6 +2621,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		{"gl_GeometryIndexEXT", "geometryId"},
 		{"gl_InstanceCustomIndexEXT", "instanceCustomIndex"},
 		{"gl_HitKindEXT", "hitKind"},
+		{"gl_HitTEXT", "rayTmax"},
 		// NV variants
 		{"gl_WorldRayOriginNV", "worldRayOrigin"},
 		{"gl_WorldRayDirectionNV", "worldRayDirection"},
@@ -2633,6 +2634,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		{"gl_InstanceIDNV", "instanceId"},
 		{"gl_InstanceCustomIndexNV", "instanceCustomIndex"},
 		{"gl_HitKindNV", "hitKind"},
+		{"gl_GeometryIndexNV", "geometryId"},
 		{nullptr, nullptr}
 	};
 
