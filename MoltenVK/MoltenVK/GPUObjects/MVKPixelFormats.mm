@@ -1617,5 +1617,11 @@ void MVKPixelFormats::setFormatProperties(MVKVkFormatDesc& vkDesc, const MVKMTLD
 		enableFormatFeatures(Write, Buf, mtlPixFmtCaps, vkProps.bufferFeatures);
 		enableFormatFeatures(Atomic, Buf, mtlPixFmtCaps, vkProps.bufferFeatures);
 		enableFormatFeatures(Vertex, Buf, getMTLVertexFormatDesc(vkDesc.mtlVertexFormat).mtlFmtCaps, vkProps.bufferFeatures);
+
+		// Acceleration structure vertex buffer support for ray tracing
+		if (gpuCaps.supportsRayTracing &&
+			mvkAreAllFlagsEnabled(vkProps.bufferFeatures, VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT)) {
+			mvkEnableFlags(vkProps.bufferFeatures, (VkFormatFeatureFlags)VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR);
+		}
 	}
 }

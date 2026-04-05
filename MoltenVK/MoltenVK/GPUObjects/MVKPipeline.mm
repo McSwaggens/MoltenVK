@@ -2597,36 +2597,35 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		_hasValidMTLPipelineStates = false;
 		return;
 	}
-	std::string closestHitFunc, anyHitFunc, missFunc, intersectionFunc, callableFunc;
+	std::vector<std::string> closestHitFuncs, anyHitFuncs, missFuncs, callableFuncs;
+	std::string intersectionFunc;
+	// Maps stage index -> helper function name for SBT group dispatch.
+	std::unordered_map<uint32_t, std::string> stageToFuncName;
 
-	// For hit/miss stages that write gl_LaunchIDEXT to the result image,
-	// generate inline helper functions that share the raygen kernel's
-	// descriptor set and launch ID. These helpers replicate what the
-	// hit/miss shader would do.
-	std::string helperFuncs;
 	// Compile non-raygen shaders to MSL and transform them into helper functions.
+	// Each shader gets a unique name based on its stage index.
 	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
 		auto& stage = pCreateInfo->pStages[i];
 		if (stage.stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR) continue;
 
 		spv::ExecutionModel execModel;
-		std::string* targetFunc = nullptr;
-		std::string funcName;
+		std::vector<std::string>* targetVec = nullptr;
+		std::string baseName;
 		switch (stage.stage) {
 			case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR:
 				execModel = spv::ExecutionModelClosestHitKHR;
-				funcName = "_mvk_chit";
-				targetFunc = &closestHitFunc;
+				baseName = "_mvk_chit";
+				targetVec = &closestHitFuncs;
 				break;
 			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:
 				execModel = spv::ExecutionModelAnyHitKHR;
-				funcName = "_mvk_ahit";
-				targetFunc = &anyHitFunc;
+				baseName = "_mvk_ahit";
+				targetVec = &anyHitFuncs;
 				break;
 			case VK_SHADER_STAGE_MISS_BIT_KHR:
 				execModel = spv::ExecutionModelMissKHR;
-				funcName = "_mvk_miss";
-				targetFunc = &missFunc;
+				baseName = "_mvk_miss";
+				targetVec = &missFuncs;
 				break;
 			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR:
 				// Intersection shaders are handled separately below as proper
@@ -2634,15 +2633,17 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				continue;
 			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:
 				execModel = spv::ExecutionModelCallableKHR;
-				funcName = "_mvk_callable";
-				targetFunc = &callableFunc;
+				baseName = "_mvk_callable";
+				targetVec = &callableFuncs;
 				break;
 			default: continue;
 		}
+		std::string funcName = baseName + "_" + std::to_string(i);
 
 		std::string msl = getMSLSource(&stage, execModel, funcName);
-		if (msl.empty() || !targetFunc) continue;
-		*targetFunc = funcName;
+		if (msl.empty() || !targetVec) continue;
+		targetVec->push_back(funcName);
+		stageToFuncName[i] = funcName;
 
 		// Merge descriptor set struct members from the helper shader into the raygen's struct.
 		// The raygen and hit shaders may reference different bindings in the same set.
@@ -2730,7 +2731,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			body.erase(0, body.find_first_not_of(" \t\n\r"));
 			body.erase(body.find_last_not_of(" \t\n\r") + 1);
 			if (body.empty()) {
-				*targetFunc = "";  // Clear — don't generate empty helper
+				targetVec->pop_back();  // Remove — don't generate empty helper
+				stageToFuncName.erase(i);
 				continue;
 			}
 		}
@@ -2754,41 +2756,63 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			} else break;
 		}
 
-		// Ensure the function signature has all 3 expected parameters:
-		// (constant spvDescriptorSetBuffer0& ds, uint3 lid, uint3 lsz)
-		auto sigEnd = funcCode.find(')');
-		auto sigStart = funcCode.find('(');
-		if (sigStart != std::string::npos && sigEnd != std::string::npos) {
-			std::string newParams = "constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV, uint3 gl_LaunchSizeNV";
-			funcCode.replace(sigStart + 1, sigEnd - sigStart - 1, newParams);
+		// Parse original parameters to find payload/callable data variables.
+		// After attribute removal, params look like: "ray_data uint4& _9, constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV"
+		// Any parameter that isn't spvDescriptorSet0/gl_LaunchIDNV/gl_LaunchSizeNV is a
+		// payload/callable data variable that needs to become a local variable.
+		std::string extraLocalDecls;
+		{
+			auto sigStart = funcCode.find('(');
+			auto sigEnd = funcCode.find(')');
+			if (sigStart != std::string::npos && sigEnd != std::string::npos) {
+				std::string params = funcCode.substr(sigStart + 1, sigEnd - sigStart - 1);
+				std::istringstream pss(params);
+				std::string param;
+				while (std::getline(pss, param, ',')) {
+					// Trim
+					size_t s = param.find_first_not_of(" \t\n\r");
+					if (s == std::string::npos) continue;
+					param = param.substr(s);
+					// Skip standard parameters
+					if (param.find("spvDescriptorSet") != std::string::npos) continue;
+					if (param.find("gl_LaunchIDNV") != std::string::npos) continue;
+					if (param.find("gl_LaunchSizeNV") != std::string::npos) continue;
+					if (param.find("gl_LaunchID") != std::string::npos) continue;
+					if (param.find("gl_LaunchSize") != std::string::npos) continue;
+					// Extract variable name (last token) and base type
+					// Remove qualifiers: ray_data, device, constant, thread, &
+					std::string cleaned = param;
+					for (auto& q : {"ray_data ", "device ", "constant ", "thread ", "threadgroup "}) {
+						size_t qp = cleaned.find(q);
+						if (qp != std::string::npos) cleaned.erase(qp, strlen(q));
+					}
+					// Remove reference (&)
+					size_t ampPos = cleaned.find('&');
+					if (ampPos != std::string::npos) cleaned.erase(ampPos, 1);
+					// Remove pointer (*)
+					size_t starPos = cleaned.find('*');
+					if (starPos != std::string::npos) cleaned.erase(starPos, 1);
+					// Trim again
+					s = cleaned.find_first_not_of(" \t");
+					if (s != std::string::npos) cleaned = cleaned.substr(s);
+					auto e = cleaned.find_last_not_of(" \t");
+					if (e != std::string::npos) cleaned = cleaned.substr(0, e + 1);
+					// Should now be "type name" like "uint4 _9"
+					if (!cleaned.empty()) {
+						extraLocalDecls += "\n    " + cleaned + ";\n";
+					}
+				}
+				// Replace signature with standard parameters
+				std::string newParams = "constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV, uint3 gl_LaunchSizeNV";
+				funcCode.replace(sigStart + 1, sigEnd - sigStart - 1, newParams);
+			}
 		}
 
-		// For intersection shaders, add local declarations for hit attribute variables
-		// that SPIRV-Cross emits as globals (StorageClassHitAttributeKHR).
-		if (stage.stage == VK_SHADER_STAGE_INTERSECTION_BIT_KHR) {
+		// Insert local declarations for payload/callable data variables at the function body start.
+		if (!extraLocalDecls.empty()) {
 			auto bodyStart = funcCode.find('{');
 			if (bodyStart != std::string::npos) {
-				// The hit attribute variable is typically a float3 named _NN.
-				// Scan the function body for assignments to undeclared _NN variables.
-				std::string localDecls;
-				std::string body = funcCode.substr(bodyStart + 1);
-				// Find patterns like "_NN = float3(...)" that need declarations
-				size_t pos = 0;
-				while ((pos = body.find(" = float3(", pos)) != std::string::npos) {
-					// Find the variable name before " = float3("
-					auto nameEnd = pos;
-					auto nameStart = body.rfind('\n', nameEnd);
-					if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
-					while (nameStart < nameEnd && body[nameStart] == ' ') nameStart++;
-					std::string varName = body.substr(nameStart, nameEnd - nameStart);
-					if (varName.size() > 0 && varName[0] == '_') {
-						localDecls += "\n    float3 " + varName + ";\n";
-					}
-					pos += 10;
-				}
-				if (!localDecls.empty()) {
-					funcCode.insert(bodyStart + 1, localDecls);
-				}
+				funcCode.insert(bodyStart + 1, extraLocalDecls);
 			}
 		}
 
@@ -2859,10 +2883,11 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				}
 			}
 
-			// Replace gl_LaunchIDNV with payload.launchID
-			{
-				std::string oldName = "gl_LaunchIDNV";
-				std::string newName = "_mvk_payload.launchID";
+			// Replace gl_LaunchIDNV and gl_LaunchSizeNV with payload accessors
+			for (auto& [oldName, newName] : std::initializer_list<std::pair<std::string, std::string>>{
+				{"gl_LaunchSizeNV", "_mvk_payload.launchSize"},
+				{"gl_LaunchIDNV", "_mvk_payload.launchID"}
+			}) {
 				size_t pos = 0;
 				while ((pos = funcBody.find(oldName, pos)) != std::string::npos) {
 					funcBody.replace(pos, oldName.length(), newName);
@@ -3020,20 +3045,103 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 	}
 
+	// Helper lambda to add a kernel parameter if it's not already present.
+	auto addKernelParam = [&](const char* param) {
+		auto kernelStart = raygenMSL.find("kernel void main0(");
+		auto kernelBody = raygenMSL.find('{', kernelStart);
+		auto found = raygenMSL.find(param, kernelStart);
+		if (found == std::string::npos || found > kernelBody) {
+			auto parenStart = raygenMSL.find('(', kernelStart);
+			int depth = 1;
+			size_t sigEnd = parenStart + 1;
+			while (sigEnd < raygenMSL.size() && depth > 0) {
+				if (raygenMSL[sigEnd] == '(') depth++;
+				else if (raygenMSL[sigEnd] == ')') depth--;
+				if (depth > 0) sigEnd++;
+			}
+			if (depth == 0) {
+				std::string prefix = (sigEnd > parenStart + 1) ? ", " : "";
+				raygenMSL.insert(sigEnd, prefix + param);
+			}
+		}
+	};
+
 	// Now modify the raygen kernel's OpTraceRayKHR site to call the helper functions.
 	// The SPIRV-Cross emission left a marker: "(void)_mtl_isect;"
 	// Replace it with calls to the closest-hit or miss function based on intersection result.
 	{
 		std::string callCode;
-		if (!closestHitFunc.empty() || !anyHitFunc.empty() || !missFunc.empty() || hasIntersection) {
+		if (!closestHitFuncs.empty() || !anyHitFuncs.empty() || !missFuncs.empty() || hasIntersection) {
 			callCode = "  if (_mtl_isect.type != intersection_type::none) {\n";
-			if (!anyHitFunc.empty())
-				callCode += "    " + anyHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-			if (!closestHitFunc.empty())
-				callCode += "    " + closestHitFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+
+			// Build hit group dispatch: map shader groups to hit shader functions.
+			// Multiple hit groups use a switch on instance_id to dispatch to the right shader.
+			std::vector<std::pair<uint32_t, std::string>> hitGroupDispatch; // group index -> chit func
+			std::vector<std::pair<uint32_t, std::string>> ahitGroupDispatch;
+			for (uint32_t g = 0; g < _shaderGroupCount; g++) {
+				auto& group = pCreateInfo->pGroups[g];
+				if (group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR ||
+					group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR) {
+					if (group.closestHitShader != VK_SHADER_UNUSED_KHR) {
+						auto it = stageToFuncName.find(group.closestHitShader);
+						if (it != stageToFuncName.end())
+							hitGroupDispatch.push_back({g, it->second});
+					}
+					if (group.anyHitShader != VK_SHADER_UNUSED_KHR) {
+						auto it = stageToFuncName.find(group.anyHitShader);
+						if (it != stageToFuncName.end())
+							ahitGroupDispatch.push_back({g, it->second});
+					}
+				}
+			}
+
+			// Build miss shader dispatch
+			std::vector<std::pair<uint32_t, std::string>> missGroupDispatch;
+			uint32_t missIdx = 0;
+			for (uint32_t g = 0; g < _shaderGroupCount; g++) {
+				auto& group = pCreateInfo->pGroups[g];
+				if (group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR &&
+					group.generalShader != VK_SHADER_UNUSED_KHR) {
+					auto it = stageToFuncName.find(group.generalShader);
+					if (it != stageToFuncName.end() &&
+						pCreateInfo->pStages[group.generalShader].stage == VK_SHADER_STAGE_MISS_BIT_KHR) {
+						missGroupDispatch.push_back({missIdx++, it->second});
+					}
+				}
+			}
+
+			// Emit any-hit dispatch
+			if (!ahitGroupDispatch.empty()) {
+				if (ahitGroupDispatch.size() == 1) {
+					callCode += "    " + ahitGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+				} else {
+					callCode += "    switch (_mtl_isect.instance_id) {\n";
+					for (auto& [gIdx, fn] : ahitGroupDispatch)
+						callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV); break;\n";
+					callCode += "      default: break;\n    }\n";
+				}
+			}
+
+			// Emit closest-hit dispatch
+			if (hitGroupDispatch.size() == 1) {
+				callCode += "    " + hitGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			} else if (hitGroupDispatch.size() > 1) {
+				callCode += "    switch (_mtl_isect.instance_id) {\n";
+				for (auto& [gIdx, fn] : hitGroupDispatch)
+					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV); break;\n";
+				callCode += "      default: break;\n    }\n";
+			}
+
 			callCode += "  } else {\n";
-			if (!missFunc.empty())
-				callCode += "    " + missFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+
+			// Emit miss dispatch
+			if (missGroupDispatch.size() == 1) {
+				callCode += "    " + missGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			} else if (missGroupDispatch.size() > 1) {
+				// Multiple miss shaders: dispatch based on missIndex from traceRayEXT
+				// For now, call the first one (missIndex selection requires SPIRV-Cross support)
+				callCode += "    " + missGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
+			}
 			callCode += "  }\n";
 		}
 
@@ -3041,10 +3149,13 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		if (markerPos != std::string::npos) {
 			raygenMSL.replace(markerPos, strlen("(void)_mtl_isect;"), callCode);
 		}
+
+		// Ensure gl_LaunchSizeNV is available for helpers that need it.
+		addKernelParam("uint3 gl_LaunchSizeNV [[threads_per_grid]]");
 	}
 
-	// Replace executeCallableEXT markers with calls to the callable helper.
-	if (!callableFunc.empty()) {
+	// Replace executeCallableEXT markers with calls to callable helpers.
+	if (!callableFuncs.empty()) {
 		// Ensure the kernel has the descriptor set parameter (the raygen shader
 		// might not reference any descriptors, but the callable shader does).
 		auto kernelStart = raygenMSL.find("kernel void main0(");
@@ -3055,7 +3166,6 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			auto mainSig2 = raygenMSL.find("kernel void main0(");
 			if (mainSig2 != std::string::npos) {
 				auto firstParam = raygenMSL.find('(', mainSig2) + 1;
-				// Check if there are existing parameters
 				auto closeP = raygenMSL.find(')', firstParam);
 				bool hasParams = false;
 				for (size_t p = firstParam; p < closeP; p++) {
@@ -3066,47 +3176,220 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				std::string suffix = hasParams ? ", " : "";
 				raygenMSL.insert(firstParam,
 					"constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]]" + suffix);
-				kernelStart = raygenMSL.find("kernel void main0(");
-				kernelBody = raygenMSL.find('{', kernelStart);
 			}
 		}
 
 		// Ensure gl_LaunchIDNV and gl_LaunchSizeNV parameters exist in the kernel.
-		// The callable test's raygen might not use these builtins directly.
-		kernelStart = raygenMSL.find("kernel void main0(");
-		kernelBody = raygenMSL.find('{', kernelStart);
-		auto addKernelParam = [&](const char* param) {
-			auto found = raygenMSL.find(param, kernelStart);
-			if (found == std::string::npos || found > kernelBody) {
-				auto parenStart = raygenMSL.find('(', kernelStart);
-				int depth = 1;
-				size_t sigEnd = parenStart + 1;
-				while (sigEnd < raygenMSL.size() && depth > 0) {
-					if (raygenMSL[sigEnd] == '(') depth++;
-					else if (raygenMSL[sigEnd] == ')') depth--;
-					if (depth > 0) sigEnd++;
-				}
-				if (depth == 0) {
-					std::string prefix = (sigEnd > parenStart + 1) ? ", " : "";
-					raygenMSL.insert(sigEnd, prefix + param);
-					kernelBody = raygenMSL.find('{', kernelStart); // update
-				}
-			}
-		};
 		addKernelParam("uint3 gl_LaunchIDNV [[thread_position_in_grid]]");
 		addKernelParam("uint3 gl_LaunchSizeNV [[threads_per_grid]]");
 
-		std::string callableCall = callableFunc + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV);\n";
-		size_t pos;
-		while ((pos = raygenMSL.find("/* MVK_EXECUTE_CALLABLE */")) != std::string::npos) {
-			raygenMSL.replace(pos, strlen("/* MVK_EXECUTE_CALLABLE */"), callableCall);
+		// Replace each callable marker, passing the caller's payload variable by reference.
+		// After each marker, find the first _NN variable used — that's the callable data.
+		{
+			size_t pos;
+			while ((pos = raygenMSL.find("/* MVK_EXECUTE_CALLABLE */")) != std::string::npos) {
+				// Find the payload variable used after the marker
+				std::string payloadVar;
+				size_t searchStart = pos + strlen("/* MVK_EXECUTE_CALLABLE */");
+				size_t nextLine = raygenMSL.find('\n', searchStart);
+				if (nextLine == std::string::npos) nextLine = raygenMSL.size();
+				// Scan remaining function body for first _NN identifier
+				for (size_t s = searchStart; s < raygenMSL.size(); s++) {
+					if (raygenMSL[s] == '_' && s + 1 < raygenMSL.size() && isdigit(raygenMSL[s + 1])) {
+						if (s > 0 && (isalnum(raygenMSL[s - 1]) || raygenMSL[s - 1] == '_')) continue;
+						size_t nameStart = s;
+						s++;
+						while (s < raygenMSL.size() && isdigit(raygenMSL[s])) s++;
+						if (s < raygenMSL.size() && (isalnum(raygenMSL[s]) || raygenMSL[s] == '_')) continue;
+						payloadVar = raygenMSL.substr(nameStart, s - nameStart);
+						break;
+					}
+				}
+				std::string callableCall = callableFuncs[0] + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV";
+				if (!payloadVar.empty()) callableCall += ", " + payloadVar;
+				callableCall += ");\n";
+				raygenMSL.replace(pos, strlen("/* MVK_EXECUTE_CALLABLE */"), callableCall);
+			}
+
+			// Add the payload parameter to each callable helper function definition.
+			// Find the callable helper's payload variable and infer its type from assignment.
+			for (auto& cfn : callableFuncs) {
+				auto funcPos = raygenMSL.find(cfn + "(");
+				if (funcPos == std::string::npos) continue;
+				auto bodyStart = raygenMSL.find('{', funcPos);
+				if (bodyStart == std::string::npos) continue;
+				int depth = 1;
+				size_t bodyEnd = bodyStart + 1;
+				while (bodyEnd < raygenMSL.size() && depth > 0) {
+					if (raygenMSL[bodyEnd] == '{') depth++;
+					else if (raygenMSL[bodyEnd] == '}') depth--;
+					bodyEnd++;
+				}
+				std::string body = raygenMSL.substr(bodyStart + 1, bodyEnd - bodyStart - 2);
+				// Find first _NN = type(...) assignment to get variable name and type
+				std::string helperPayload, payloadType;
+				static const char* knownPayloadTypes[] = {
+					"uint4", "uint3", "uint2", "uint",
+					"int4", "int3", "int2", "int",
+					"float4", "float3", "float2", "float",
+					"half4", "half3", "half2", "half", nullptr
+				};
+				for (const char** tp = knownPayloadTypes; *tp; tp++) {
+					std::string pat = std::string(" = ") + *tp + "(";
+					auto assignPos = body.find(pat);
+					if (assignPos == std::string::npos) continue;
+					// Extract the variable name before " = type("
+					auto nameEnd = assignPos;
+					auto ns = body.rfind('\n', nameEnd);
+					if (ns == std::string::npos) ns = 0; else ns++;
+					while (ns < nameEnd && (body[ns] == ' ' || body[ns] == '\t')) ns++;
+					std::string varName = body.substr(ns, nameEnd - ns);
+					if (varName.size() > 1 && varName[0] == '_' &&
+						std::all_of(varName.begin() + 1, varName.end(), ::isdigit)) {
+						helperPayload = varName;
+						payloadType = *tp;
+						break;
+					}
+				}
+				if (!helperPayload.empty() && !payloadType.empty()) {
+					auto sigClose = raygenMSL.find(')', funcPos);
+					if (sigClose != std::string::npos) {
+						raygenMSL.insert(sigClose, ", thread " + payloadType + "& " + helperPayload);
+					}
+				}
+			}
+		}
+	}
+
+	// Fix undeclared SPIR-V temporary variables in the combined MSL.
+	// SPIRV-Cross omits declarations for ray payload (StorageClassRayPayloadKHR,
+	// StorageClassIncomingRayPayloadKHR) and callable data variables. Scan each
+	// function body for undeclared _NN variables and add declarations.
+	{
+		// First pass: find all _NN = type(...) assignments to determine types.
+		std::unordered_map<std::string, std::string> varTypes; // varName -> type
+		static const char* knownTypes[] = {
+			"uint4", "uint3", "uint2", "uint",
+			"int4", "int3", "int2", "int",
+			"float4", "float3", "float2", "float",
+			"half4", "half3", "half2", "half",
+			"bool", nullptr
+		};
+
+		for (const char** tp = knownTypes; *tp; tp++) {
+			std::string pattern = std::string(" = ") + *tp + "(";
+			size_t pos = 0;
+			while ((pos = raygenMSL.find(pattern, pos)) != std::string::npos) {
+				auto nameEnd = pos;
+				auto nameStart = raygenMSL.rfind('\n', nameEnd);
+				if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
+				while (nameStart < nameEnd && (raygenMSL[nameStart] == ' ' || raygenMSL[nameStart] == '\t'))
+					nameStart++;
+				std::string varName = raygenMSL.substr(nameStart, nameEnd - nameStart);
+				if (varName.size() > 1 && varName[0] == '_' &&
+					std::all_of(varName.begin() + 1, varName.end(), ::isdigit)) {
+					if (varTypes.find(varName) == varTypes.end())
+						varTypes[varName] = *tp;
+				}
+				pos += pattern.length();
+			}
+		}
+
+		// Second pass: find all _NN identifiers used anywhere in the MSL.
+		// If they don't have a known type from assignments, default to uint4
+		// (the most common ray payload type).
+		{
+			size_t pos = 0;
+			while (pos < raygenMSL.size()) {
+				if (raygenMSL[pos] == '_' && pos + 1 < raygenMSL.size() && isdigit(raygenMSL[pos + 1])) {
+					// Check it's not part of a larger identifier (preceded by alnum or _)
+					if (pos > 0 && (isalnum(raygenMSL[pos - 1]) || raygenMSL[pos - 1] == '_')) {
+						pos++;
+						continue;
+					}
+					size_t nameStart = pos;
+					pos++; // skip '_'
+					while (pos < raygenMSL.size() && isdigit(raygenMSL[pos])) pos++;
+					// Check it's not followed by alnum or _ (would be a larger identifier)
+					if (pos < raygenMSL.size() && (isalnum(raygenMSL[pos]) || raygenMSL[pos] == '_')) continue;
+					std::string varName = raygenMSL.substr(nameStart, pos - nameStart);
+					if (varTypes.find(varName) == varTypes.end())
+						varTypes[varName] = "uint4"; // default payload type
+				} else {
+					pos++;
+				}
+			}
+		}
+
+		// For each function, check which _NN variables are used but not declared.
+		size_t funcStart = 0;
+		while (true) {
+			auto staticPos = raygenMSL.find("static void ", funcStart);
+			auto kernelPos = raygenMSL.find("kernel void ", funcStart);
+			size_t nextFunc = std::string::npos;
+			if (staticPos != std::string::npos && (kernelPos == std::string::npos || staticPos < kernelPos))
+				nextFunc = staticPos;
+			else if (kernelPos != std::string::npos)
+				nextFunc = kernelPos;
+			if (nextFunc == std::string::npos) break;
+
+			auto bodyStart = raygenMSL.find('{', nextFunc);
+			if (bodyStart == std::string::npos) break;
+
+			// Find matching closing brace
+			int depth = 1;
+			size_t bodyEnd = bodyStart + 1;
+			while (bodyEnd < raygenMSL.size() && depth > 0) {
+				if (raygenMSL[bodyEnd] == '{') depth++;
+				else if (raygenMSL[bodyEnd] == '}') depth--;
+				bodyEnd++;
+			}
+
+			std::string body = raygenMSL.substr(bodyStart, bodyEnd - bodyStart);
+			std::string paramSection = raygenMSL.substr(nextFunc, bodyStart - nextFunc);
+			std::string decls;
+
+			// Lambda to check if varName appears as a whole identifier (not substring of longer name)
+			auto findWholeWord = [](const std::string& text, const std::string& word, size_t startPos = 0) -> bool {
+				size_t pos = startPos;
+				while ((pos = text.find(word, pos)) != std::string::npos) {
+					bool leftOk = (pos == 0 || !(isalnum(text[pos - 1]) || text[pos - 1] == '_'));
+					size_t endPos = pos + word.size();
+					bool rightOk = (endPos >= text.size() || !(isalnum(text[endPos]) || text[endPos] == '_'));
+					if (leftOk && rightOk) return true;
+					pos += word.size();
+				}
+				return false;
+			};
+
+			for (auto& [varName, varType] : varTypes) {
+				if (!findWholeWord(body, varName)) continue;
+				// Already declared?
+				bool declared = false;
+				for (const char** tp = knownTypes; *tp; tp++) {
+					if (body.find(std::string(*tp) + " " + varName) != std::string::npos) {
+						declared = true; break;
+					}
+				}
+				if (declared) continue;
+				// Check if it's in the function parameter list (as a parameter, not part of the function name)
+				// Look for varName preceded by "& " or "  " (in parameter context)
+				auto sigStart = paramSection.find('(');
+				if (sigStart != std::string::npos && findWholeWord(paramSection, varName, sigStart)) continue;
+				decls += "\n    " + varType + " " + varName + " = " + varType + "(0);";
+			}
+
+			if (!decls.empty()) {
+				raygenMSL.insert(bodyStart + 1, decls);
+			}
+
+			funcStart = bodyStart + 1 + decls.size();
 		}
 	}
 
 	// Compile the combined MSL source.
 	_mtlPipelineState = nil;
 	_mtlThreadgroupSize = {4, 4, 4};
-
 
 	NSError* err = nil;
 	id<MTLDevice> mtlDev = getPhysicalDevice()->getMTLDevice();
