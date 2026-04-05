@@ -178,6 +178,15 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 				}
 			}
 			instDesc.instancedAccelerationStructures = blasArray;
+			MVKLogInfo("TLAS build: %u BLAS in array, geomCount=%u", (uint32_t)[blasArray count], geomCount);
+			if (geomCount > 0) {
+				MVKLogInfo("  geom[0].type=%u (INSTANCES=%u), rangeInfo.primitiveCount=%u",
+					bi.geometries[0].geometryType, VK_GEOMETRY_TYPE_INSTANCES_KHR,
+					bi.buildRangeInfos[0].primitiveCount);
+			}
+			for (auto& [addr, idx] : blasAddressToIndex) {
+				MVKLogInfo("  BLAS[%u] addr=0x%llx", idx, (unsigned long long)addr);
+			}
 
 			// Convert Vulkan instance descriptors to Metal format.
 			// Vulkan: VkAccelerationStructureInstanceKHR (64 bytes each)
@@ -239,6 +248,10 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 						// Map BLAS device address to index in instancedAccelerationStructures
 						auto it = blasAddressToIndex.find(vkInst->accelerationStructureReference);
 						mtlInsts[j].accelerationStructureIndex = (it != blasAddressToIndex.end()) ? it->second : 0;
+						MVKLogInfo("  Instance[%u] ref=0x%llx -> blasIdx=%u (found=%d) mask=%u", j,
+							(unsigned long long)vkInst->accelerationStructureReference,
+							mtlInsts[j].accelerationStructureIndex, (it != blasAddressToIndex.end()),
+							mtlInsts[j].mask);
 					}
 
 					instDesc.instanceDescriptorBuffer = mtlInstBuf;
