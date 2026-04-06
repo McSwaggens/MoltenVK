@@ -3122,21 +3122,34 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				}
 			}
 
-			// Add local declarations for hit attribute variables (float3 _NN)
+			// Add local declarations for undeclared hit attribute variables (_NN)
 			{
 				auto bodyStart = funcBody.find('{');
 				if (bodyStart != std::string::npos) {
 					std::string localDecls;
-					size_t pos = bodyStart;
-					while ((pos = funcBody.find(" = float3(", pos)) != std::string::npos) {
-						auto nameEnd = pos;
-						auto ns = funcBody.rfind('\n', nameEnd);
-						if (ns == std::string::npos) ns = 0; else ns++;
-						while (ns < nameEnd && funcBody[ns] == ' ') ns++;
-						std::string varName = funcBody.substr(ns, nameEnd - ns);
-						if (varName.size() > 0 && varName[0] == '_')
-							localDecls += "\n    float3 " + varName + ";";
-						pos += 10;
+					static const char* hitAttrTypes[] = {
+						"int4", "int3", "int2", "int",
+						"uint4", "uint3", "uint2", "uint",
+						"float4", "float3", "float2", "float",
+						"half4", "half3", "half2", "half", nullptr
+					};
+					for (const char** tp = hitAttrTypes; *tp; tp++) {
+						std::string pat = std::string(" = ") + *tp + "(";
+						size_t pos = bodyStart;
+						while ((pos = funcBody.find(pat, pos)) != std::string::npos) {
+							auto nameEnd = pos;
+							auto ns = funcBody.rfind('\n', nameEnd);
+							if (ns == std::string::npos) ns = 0; else ns++;
+							while (ns < nameEnd && funcBody[ns] == ' ') ns++;
+							std::string varName = funcBody.substr(ns, nameEnd - ns);
+							if (varName.size() > 1 && varName[0] == '_' &&
+								std::all_of(varName.begin() + 1, varName.end(), ::isdigit)) {
+								// Check not already declared
+								if (funcBody.find(std::string(*tp) + " " + varName, bodyStart) == std::string::npos)
+									localDecls += "\n    " + std::string(*tp) + " " + varName + ";";
+							}
+							pos += pat.size();
+						}
 					}
 					if (!localDecls.empty())
 						funcBody.insert(bodyStart + 1, localDecls);
@@ -3149,8 +3162,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				if (pos != std::string::npos) {
 					auto lineEnd = funcBody.find(';', pos);
 					if (lineEnd != std::string::npos) {
-						// Replace `bool _NN = true;` with `return {true, 1.0f};`
-						funcBody.replace(pos, lineEnd - pos + 1, "return {true, 1.0f};");
+						// Replace `bool _NN = true;` with `return {true, _mvk_isect_dist};`
+						funcBody.replace(pos, lineEnd - pos + 1, "return {true, _mvk_isect_dist};");
 					}
 				}
 			}
