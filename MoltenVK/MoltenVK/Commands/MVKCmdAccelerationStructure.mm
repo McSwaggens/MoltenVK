@@ -82,20 +82,22 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					MTLAccelerationStructureTriangleGeometryDescriptor* triDesc =
 						[MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
 
-					// Vertex data
+					// Vertex data — apply primitiveOffset and firstVertex from build range info
 					VkDeviceSize vtxOffset = 0;
 					if (triData.vertexData.deviceAddress) {
-						triDesc.vertexBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(triData.vertexData.deviceAddress, &vtxOffset);
-						triDesc.vertexBufferOffset = (NSUInteger)vtxOffset;
+						VkDeviceAddress vtxAddr = triData.vertexData.deviceAddress + rangeInfo.primitiveOffset;
+						triDesc.vertexBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(vtxAddr, &vtxOffset);
+						triDesc.vertexBufferOffset = (NSUInteger)(vtxOffset + rangeInfo.firstVertex * triData.vertexStride);
 					}
 					triDesc.vertexStride = triData.vertexStride;
 					triDesc.triangleCount = rangeInfo.primitiveCount;
 
-					// Index data
+					// Index data — apply primitiveOffset from build range info
 					if (triData.indexType != VK_INDEX_TYPE_NONE_KHR &&
 						triData.indexData.deviceAddress) {
 						VkDeviceSize idxOffset = 0;
-						triDesc.indexBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(triData.indexData.deviceAddress, &idxOffset);
+						VkDeviceAddress idxAddr = triData.indexData.deviceAddress + rangeInfo.primitiveOffset;
+						triDesc.indexBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(idxAddr, &idxOffset);
 						triDesc.indexBufferOffset = (NSUInteger)idxOffset;
 						triDesc.indexType = (triData.indexType == VK_INDEX_TYPE_UINT16)
 							? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
@@ -109,9 +111,11 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					MTLAccelerationStructureBoundingBoxGeometryDescriptor* aabbDesc =
 						[MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
 
+					// Apply primitiveOffset from build range info
 					if (aabbData.data.deviceAddress) {
 						VkDeviceSize aabbOffset = 0;
-						aabbDesc.boundingBoxBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(aabbData.data.deviceAddress, &aabbOffset);
+						VkDeviceAddress aabbAddr = aabbData.data.deviceAddress + rangeInfo.primitiveOffset;
+						aabbDesc.boundingBoxBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(aabbAddr, &aabbOffset);
 						aabbDesc.boundingBoxBufferOffset = (NSUInteger)aabbOffset;
 					}
 					aabbDesc.boundingBoxStride = aabbData.stride;

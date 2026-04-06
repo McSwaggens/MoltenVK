@@ -3689,8 +3689,9 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 					size_t nameStart = pos;
 					pos++; // skip '_'
 					while (pos < raygenMSL.size() && isdigit(raygenMSL[pos])) pos++;
-					// Check it's not followed by alnum or _ (would be a larger identifier)
+					// Check it's not followed by alnum/_ (larger identifier) or ( (type constructor)
 					if (pos < raygenMSL.size() && (isalnum(raygenMSL[pos]) || raygenMSL[pos] == '_')) continue;
+					if (pos < raygenMSL.size() && raygenMSL[pos] == '(') continue; // skip type constructors
 					std::string varName = raygenMSL.substr(nameStart, pos - nameStart);
 					if (varTypes.find(varName) == varTypes.end())
 						varTypes[varName] = "uint4"; // default payload type
