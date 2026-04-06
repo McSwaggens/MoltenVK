@@ -4619,14 +4619,24 @@ MVKBuffer* MVKDevice::removeBuffer(MVKBuffer* mvkBuff) {
 
 id<MTLBuffer> MVKDevice::getMTLBufferForDeviceAddress(VkDeviceAddress address, VkDeviceSize* pOffset) {
 	lock_guard<mutex> lock(_rezLock);
+	id<MTLBuffer> bestMtlBuf = nil;
+	uint64_t bestSize = 0;
 	for (auto* buff : _gpuAddressableBuffers) {
 		id<MTLBuffer> mtlBuf = buff->getMTLBuffer();
+		if (!mtlBuf) continue;
 		uint64_t bufStart = mtlBuf.gpuAddress + buff->getMTLBufferOffset();
 		uint64_t bufEnd = bufStart + buff->getByteCount();
 		if (address >= bufStart && address < bufEnd) {
-			if (pOffset) { *pOffset = address - mtlBuf.gpuAddress; }
-			return mtlBuf;
+			uint64_t size = bufEnd - bufStart;
+			if (size > bestSize) {
+				bestSize = size;
+				bestMtlBuf = mtlBuf;
+			}
 		}
+	}
+	if (bestMtlBuf) {
+		if (pOffset) { *pOffset = address - bestMtlBuf.gpuAddress; }
+		return bestMtlBuf;
 	}
 	if (pOffset) { *pOffset = 0; }
 	return nil;

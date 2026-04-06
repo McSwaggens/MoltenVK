@@ -170,7 +170,8 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 			NSMutableArray<id<MTLAccelerationStructure>>* blasArray = [NSMutableArray array];
 			std::unordered_map<uint64_t, uint32_t> blasAddressToIndex;
 			for (auto* as : allAS) {
-				if (as->getType() == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR &&
+				if ((as->getType() == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
+					 as->getType() == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR) &&
 					as->getMTLAccelerationStructure()) {
 					uint32_t idx = (uint32_t)[blasArray count];
 					blasAddressToIndex[as->getDeviceAddress()] = idx;
@@ -206,11 +207,6 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 				instDesc.instanceDescriptorStride = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
 
 				if (instData.data.deviceAddress && instanceCount > 0) {
-					// Read the Vulkan instance descriptors from the source buffer
-					VkDeviceSize srcOffset = 0;
-					id<MTLBuffer> srcBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(instData.data.deviceAddress, &srcOffset);
-					const uint8_t* srcData = (const uint8_t*)[srcBuf contents] + srcOffset;
-
 					// Allocate a temporary Metal buffer for converted descriptors
 					NSUInteger mtlInstSize = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor) * instanceCount;
 					id<MTLBuffer> mtlInstBuf = [cmdEncoder->getDevice()->getPhysicalDevice()->getMTLDevice() newBufferWithLength: mtlInstSize
@@ -218,8 +214,23 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 
 					auto* mtlInsts = (MTLAccelerationStructureUserIDInstanceDescriptor*)[mtlInstBuf contents];
 					for (uint32_t j = 0; j < instanceCount; j++) {
-						const VkAccelerationStructureInstanceKHR* vkInst =
-							(const VkAccelerationStructureInstanceKHR*)(srcData + j * sizeof(VkAccelerationStructureInstanceKHR));
+						const VkAccelerationStructureInstanceKHR* vkInst;
+						if (instData.arrayOfPointers) {
+							// data points to an array of device addresses, each pointing to an instance descriptor
+							VkDeviceSize ptrOffset = 0;
+							id<MTLBuffer> ptrBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(
+								instData.data.deviceAddress + j * sizeof(VkDeviceAddress), &ptrOffset);
+							const VkDeviceAddress* instAddr = (const VkDeviceAddress*)((const uint8_t*)[ptrBuf contents] + ptrOffset);
+							VkDeviceSize instOffset = 0;
+							id<MTLBuffer> instBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(*instAddr, &instOffset);
+							vkInst = (const VkAccelerationStructureInstanceKHR*)((const uint8_t*)[instBuf contents] + instOffset);
+						} else {
+							// data points directly to a flat array of instance descriptors
+							VkDeviceSize srcOffset = 0;
+							id<MTLBuffer> srcBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(instData.data.deviceAddress, &srcOffset);
+							const uint8_t* srcData = (const uint8_t*)[srcBuf contents] + srcOffset;
+							vkInst = (const VkAccelerationStructureInstanceKHR*)(srcData + j * sizeof(VkAccelerationStructureInstanceKHR));
+						}
 
 						// Convert VkTransformMatrixKHR (3x4 row-major) to MTLPackedFloat4x3 (4x3 column-major).
 						for (int col = 0; col < 4; col++) {
