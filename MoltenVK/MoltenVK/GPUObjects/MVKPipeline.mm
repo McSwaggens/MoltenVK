@@ -2753,6 +2753,85 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 		return depth == 0;
 	};
+	struct MVKRTSpecialVarInfo {
+		std::string name;
+		std::string typeName;
+		spv::StorageClass storage = spv::StorageClassGeneric;
+	};
+	class MVKRTCompilerInspector final : public SPIRV_CROSS_NAMESPACE::CompilerMSL {
+	public:
+		using CompilerMSL::CompilerMSL;
+
+		std::vector<MVKRTSpecialVarInfo> getSpecialVars(const std::string& entryPointName,
+														spv::ExecutionModel entryPointStage) {
+			if (!entryPointName.empty() && entryPointStage != spv::ExecutionModelMax) {
+				set_entry_point(entryPointName, entryPointStage);
+			}
+
+			std::vector<MVKRTSpecialVarInfo> vars;
+			ir.for_each_typed_id<SPIRV_CROSS_NAMESPACE::SPIRVariable>([&](uint32_t id, const SPIRV_CROSS_NAMESPACE::SPIRVariable& var) {
+				switch (var.storage) {
+					case spv::StorageClassRayPayloadKHR:
+					case spv::StorageClassIncomingRayPayloadKHR:
+					case spv::StorageClassHitAttributeKHR:
+					case spv::StorageClassCallableDataKHR:
+					case spv::StorageClassIncomingCallableDataKHR:
+						break;
+					default:
+						return;
+				}
+
+				std::string name = get_name(id);
+				if (name.empty()) { return; }
+
+				std::string typeName = getMSLTypeName(get_type_from_variable(id));
+				if (typeName.empty()) { return; }
+
+				vars.push_back({name, typeName, var.storage});
+			});
+			return vars;
+		}
+
+	private:
+		std::string getMSLTypeName(const SPIRV_CROSS_NAMESPACE::SPIRType& type) {
+			if (type.columns > 1) {
+				auto base = getMSLScalarTypeName(type);
+				if (base.empty()) { return {}; }
+				return base + std::to_string(type.columns) + "x" + std::to_string(type.vecsize);
+			}
+			if (type.vecsize > 1) {
+				auto base = getMSLScalarTypeName(type);
+				if (base.empty()) { return {}; }
+				return base + std::to_string(type.vecsize);
+			}
+			if (type.basetype == SPIRV_CROSS_NAMESPACE::SPIRType::Struct) {
+				auto typeName = get_name(type.self);
+				if (!typeName.empty()) { return typeName; }
+				return "spvType_" + std::to_string(type.self);
+			}
+			return getMSLScalarTypeName(type);
+		}
+
+		std::string getMSLScalarTypeName(const SPIRV_CROSS_NAMESPACE::SPIRType& type) {
+			switch (type.basetype) {
+				case SPIRV_CROSS_NAMESPACE::SPIRType::Boolean: return "bool";
+				case SPIRV_CROSS_NAMESPACE::SPIRType::Int: return "int";
+				case SPIRV_CROSS_NAMESPACE::SPIRType::UInt: return "uint";
+				case SPIRV_CROSS_NAMESPACE::SPIRType::Int64: return "long";
+				case SPIRV_CROSS_NAMESPACE::SPIRType::UInt64: return "ulong";
+				case SPIRV_CROSS_NAMESPACE::SPIRType::Half: return "half";
+				case SPIRV_CROSS_NAMESPACE::SPIRType::Float: return "float";
+				case SPIRV_CROSS_NAMESPACE::SPIRType::Double: return "double";
+				default: return {};
+			}
+		}
+	};
+	auto getRTSpecialVars = [&](const VkPipelineShaderStageCreateInfo* pStage,
+								spv::ExecutionModel entryPointStage) -> std::vector<MVKRTSpecialVarInfo> {
+		MVKShaderModule* shaderModule = (MVKShaderModule*)pStage->module;
+		MVKRTCompilerInspector inspector(shaderModule->getSPIRV());
+		return inspector.getSpecialVars(pStage->pName ? pStage->pName : "", entryPointStage);
+	};
 	auto getSpecializationExpr = [&](const VkSpecializationInfo* pSpecInfo,
 									 uint32_t constantID,
 									 const std::string& type,
@@ -2975,7 +3054,20 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	std::string intersectionFunc;
 	// Maps stage index -> helper function name for SBT group dispatch.
 	std::unordered_map<uint32_t, std::string> stageToFuncName;
+	std::unordered_map<std::string, std::vector<MVKRTSpecialVarInfo>> helperExtraArgs;
 	std::unordered_set<std::string> extractedConstantNames;
+	auto raygenSpecialVars = getRTSpecialVars(pRaygenStage, spv::ExecutionModelRayGenerationKHR);
+	auto getStructMemberName = [&](const std::string& line, size_t idPos) -> std::string {
+		auto nameEnd = line.rfind(' ', idPos - 1);
+		if (nameEnd == std::string::npos) { return {}; }
+		auto nameStart = line.rfind(' ', nameEnd - 1);
+		if (nameStart == std::string::npos) {
+			nameStart = 0;
+		} else {
+			nameStart++;
+		}
+		return trimString(line.substr(nameStart, nameEnd - nameStart));
+	};
 
 	// Compile non-raygen shaders to MSL and transform them into helper functions.
 	// Each shader gets a unique name based on its stage index.
@@ -3018,8 +3110,10 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		std::string msl = getMSLSource(&stage, execModel, funcName);
 		resolveFunctionConstants(msl, stage.pSpecializationInfo);
 		if (msl.empty() || !targetVec) continue;
+		auto stageSpecialVars = getRTSpecialVars(&stage, execModel);
 		targetVec->push_back(funcName);
 		stageToFuncName[i] = funcName;
+		std::vector<std::pair<std::string, std::string>> helperMemberRenames;
 
 		// Merge descriptor set struct members from the helper shader into the raygen's struct.
 		// The raygen and hit shaders may reference different bindings in the same set.
@@ -3058,25 +3152,24 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 						if (idNumEnd == std::string::npos) continue;
 						std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
 
-						// Find the member name
-						auto nameEnd = line.rfind(' ', idPos - 1);
-						if (nameEnd == std::string::npos) continue;
-						auto nameStart = line.rfind(' ', nameEnd - 1);
-						if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
-						std::string memberName = line.substr(nameStart, nameEnd - nameStart);
+						std::string memberName = getStructMemberName(line, idPos);
+						if (memberName.empty()) continue;
 
 						// Check if a member with the same id already exists in the raygen struct
-						auto existingId = raygenMSL.find(idStr);
+						auto existingId = raygenMSL.find(idStr, raygenStructPos);
 						if (existingId != std::string::npos && existingId < raygenStructEnd) {
 							// Check if existing member is a padding placeholder (_mN_pad)
 							auto existingLineStart = raygenMSL.rfind('\n', existingId);
 							if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
 							auto existingLineEnd = raygenMSL.find('\n', existingId);
 							std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
+							std::string existingMemberName = getStructMemberName(existingLine, existingLine.find("[[id("));
 							if (existingLine.find("_pad") != std::string::npos) {
 								// Replace padding placeholder with actual member
 								raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
 								raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
+							} else if (!existingMemberName.empty() && existingMemberName != memberName) {
+								helperMemberRenames.push_back({memberName, existingMemberName});
 							}
 							// If it's a real member (not padding), skip — it's already there
 						} else if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
@@ -3090,6 +3183,9 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 					// match Vulkan binding numbers and must not be renumbered.
 				}
 			}
+		}
+		for (auto& [oldName, newName] : helperMemberRenames) {
+			replaceWholeIdentifier(msl, oldName, newName);
 		}
 
 		// Extract just the function code (remove headers, structs, namespaces)
@@ -3196,38 +3292,73 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				}
 			}
 
-			// Extract inline/template helper functions
+			// Extract top-level helper functions that appear before the entry point.
 			{
-				static const char* helperPatterns[] = {"inline ", "template<", nullptr};
-				for (auto** pat = helperPatterns; *pat; pat++) {
-					size_t pos = 0;
-					while ((pos = helperRegion.find(*pat, pos)) != std::string::npos) {
-						auto lineS = helperRegion.rfind('\n', pos);
-						if (lineS == std::string::npos) lineS = 0; else lineS++;
-						auto braceStart = helperRegion.find('{', pos);
-						if (braceStart == std::string::npos) { pos++; continue; }
-						int depth = 1;
-						size_t braceEnd = braceStart + 1;
-						while (braceEnd < helperRegion.size() && depth > 0) {
-							if (helperRegion[braceEnd] == '{') depth++;
-							else if (helperRegion[braceEnd] == '}') depth--;
-							braceEnd++;
-						}
-						std::string helperFunc = helperRegion.substr(lineS, braceEnd - lineS);
-						auto fnStart = helperFunc.find("spv");
-						if (fnStart != std::string::npos) {
-							auto fnEnd = fnStart;
-							while (fnEnd < helperFunc.size() && (isalnum(helperFunc[fnEnd]) || helperFunc[fnEnd] == '_'))
-								fnEnd++;
-							std::string hfName = helperFunc.substr(fnStart, fnEnd - fnStart);
-							if (!findWholeIdentifier(raygenMSL, hfName)) {
-								auto insertPos = findInsertPos();
-								if (insertPos != std::string::npos)
-									raygenMSL.insert(insertPos, helperFunc + "\n\n");
-							}
-						}
-						pos = braceEnd;
+				size_t pos = 0;
+				while ((pos = helperRegion.find('{', pos)) != std::string::npos) {
+					if (!isTopLevelDeclaration(helperRegion, pos)) {
+						pos++;
+						continue;
 					}
+
+					auto funcStart = helperRegion.rfind("\n\n", pos);
+					if (funcStart == std::string::npos) {
+						funcStart = 0;
+					} else {
+						funcStart += 2;
+					}
+
+					std::string signature = trimString(helperRegion.substr(funcStart, pos - funcStart));
+					if (signature.empty() ||
+						signature.rfind("struct ", 0) == 0 ||
+						signature.rfind("constant ", 0) == 0 ||
+						signature.rfind("namespace ", 0) == 0 ||
+						signature.rfind("using ", 0) == 0 ||
+						signature.rfind("typedef ", 0) == 0 ||
+						signature.rfind("enum ", 0) == 0 ||
+						signature.find('(') == std::string::npos) {
+						pos++;
+						continue;
+					}
+
+					int depth = 1;
+					size_t braceEnd = pos + 1;
+					while (braceEnd < helperRegion.size() && depth > 0) {
+						if (helperRegion[braceEnd] == '{') depth++;
+						else if (helperRegion[braceEnd] == '}') depth--;
+						braceEnd++;
+					}
+					if (depth != 0) { break; }
+
+					std::string helperFunc = helperRegion.substr(funcStart, braceEnd - funcStart);
+					auto parenPos = signature.rfind('(');
+					auto nameEnd = parenPos;
+					while (nameEnd > 0 && (signature[nameEnd - 1] == ' ' || signature[nameEnd - 1] == '\t' || signature[nameEnd - 1] == '&' || signature[nameEnd - 1] == '*')) {
+						nameEnd--;
+					}
+					auto nameStart = nameEnd;
+					while (nameStart > 0 && (isalnum(signature[nameStart - 1]) || signature[nameStart - 1] == '_')) {
+						nameStart--;
+					}
+					std::string helperName = signature.substr(nameStart, nameEnd - nameStart);
+					if (!helperName.empty() &&
+						helperName != funcName &&
+						helperName != "if" &&
+						helperName != "for" &&
+						helperName != "while" &&
+						helperName != "switch") {
+						std::string signatureNeedle = trimString(signature);
+						if (!signatureNeedle.empty() && raygenMSL.find(signatureNeedle) != std::string::npos) {
+							pos = braceEnd;
+							continue;
+						}
+						auto insertPos = findInsertPos();
+						if (insertPos != std::string::npos) {
+							raygenMSL.insert(insertPos, helperFunc + "\n\n");
+						}
+					}
+
+					pos = braceEnd;
 				}
 			}
 
@@ -3298,6 +3429,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		// Any parameter that isn't spvDescriptorSet0/gl_LaunchIDNV/gl_LaunchSizeNV is a
 		// payload/callable data variable that needs to become a local variable.
 		std::string extraLocalDecls;
+		std::vector<std::string> extraHelperParamDecls;
+		std::vector<MVKRTSpecialVarInfo> usedSpecialVars;
 		{
 			auto sigStart = funcCode.find('(');
 			auto sigEnd = funcCode.find(')');
@@ -3345,10 +3478,47 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 						extraLocalDecls += "\n    " + cleaned + ";\n";
 					}
 				}
+
+				for (auto& var : stageSpecialVars) {
+					if (var.name.empty() || var.typeName.empty() || !findWholeIdentifier(funcCode, var.name)) {
+						continue;
+					}
+					bool alreadyAdded = false;
+					for (auto& existing : usedSpecialVars) {
+						if (existing.name == var.name) {
+							alreadyAdded = true;
+							break;
+						}
+					}
+					if (alreadyAdded) { continue; }
+
+					switch (var.storage) {
+						case spv::StorageClassRayPayloadKHR:
+						case spv::StorageClassIncomingRayPayloadKHR:
+						case spv::StorageClassCallableDataKHR:
+						case spv::StorageClassIncomingCallableDataKHR:
+							extraHelperParamDecls.push_back("thread " + var.typeName + "& " + var.name);
+							usedSpecialVars.push_back(var);
+							break;
+						case spv::StorageClassHitAttributeKHR:
+							extraHelperParamDecls.push_back(var.typeName + " " + var.name);
+							usedSpecialVars.push_back(var);
+							break;
+						default:
+							break;
+					}
+				}
+
 				// Replace signature with standard parameters plus RT builtins struct
 				std::string newParams = "constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV, uint3 gl_LaunchSizeNV, const thread _MVKRTBuiltins& _mvk_rt";
+				for (auto& paramDecl : extraHelperParamDecls) {
+					newParams += ", " + paramDecl;
+				}
 				funcCode.replace(sigStart + 1, sigEnd - sigStart - 1, newParams);
 			}
+		}
+		if (!usedSpecialVars.empty()) {
+			helperExtraArgs[funcName] = usedSpecialVars;
 		}
 
 		// Insert local declarations for payload/callable data variables at the function body start.
@@ -3680,13 +3850,35 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	// Use world-space data for object-space ray builtins and transform matrices.
 	// For triangle-only pipelines, also request triangle data so HitKind can read face winding.
 	{
-		const char* replacement = hasIntersection
-			? "intersector<instancing, world_space_data>"
-			: "intersector<triangle_data, instancing, world_space_data>";
+		bool needsTriangleIntersectionData = !hasIntersection;
+		if (!needsTriangleIntersectionData) {
+			for (auto& [_, vars] : helperExtraArgs) {
+				for (auto& var : vars) {
+					if (var.storage == spv::StorageClassHitAttributeKHR) {
+						needsTriangleIntersectionData = true;
+						break;
+					}
+				}
+				if (needsTriangleIntersectionData) { break; }
+			}
+		}
+
+		const char* replacement = needsTriangleIntersectionData
+			? "intersector<triangle_data, instancing, world_space_data>"
+			: "intersector<instancing, world_space_data>";
 		size_t iPos = 0;
 		while ((iPos = raygenMSL.find("intersector<instancing>", iPos)) != std::string::npos) {
 			raygenMSL.replace(iPos, strlen("intersector<instancing>"), replacement);
 			iPos += strlen(replacement);
+		}
+		if (needsTriangleIntersectionData) {
+			iPos = 0;
+			const std::string oldName = "intersector<instancing, world_space_data>";
+			const std::string newName = "intersector<triangle_data, instancing, world_space_data>";
+			while ((iPos = raygenMSL.find(oldName, iPos)) != std::string::npos) {
+				raygenMSL.replace(iPos, oldName.size(), newName);
+				iPos += newName.size();
+			}
 		}
 	}
 
@@ -3714,13 +3906,33 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	bool needsHitSBT = false;
 	bool needsMissSBT = false;
 	bool needsCallableSBT = callableFuncs.size() > 1;
+	bool hasNamedRaygenRTPayload = false;
+	for (auto& var : raygenSpecialVars) {
+		switch (var.storage) {
+			case spv::StorageClassRayPayloadKHR:
+			case spv::StorageClassCallableDataKHR:
+				hasNamedRaygenRTPayload = hasNamedRaygenRTPayload || !var.name.empty();
+				break;
+			default:
+				break;
+		}
+	}
+
+	auto buildHelperArgs = [&](const std::string& fn) -> std::string {
+		std::string args = "spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
+		auto it = helperExtraArgs.find(fn);
+		if (it == helperExtraArgs.end()) { return args; }
+		for (auto& var : it->second) {
+			args += ", " + var.name;
+		}
+		return args;
+	};
 
 	// Now modify the raygen kernel's OpTraceRayKHR site to call the helper functions.
 	// The SPIRV-Cross emission left a marker: "(void)_mtl_isect;"
 	// Replace it with calls to the closest-hit or miss function based on intersection result.
 	{
 		std::string callCode;
-		std::string helperArgs = "spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
 		if (!closestHitFuncs.empty() || !anyHitFuncs.empty() || !missFuncs.empty() || hasIntersection) {
 			// Populate RT builtins struct from intersection result and ray data.
 			callCode =  "  _MVKRTBuiltins _mvk_rt;\n";
@@ -3784,39 +3996,62 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				callCode += "    uint _mvk_hit_group = _mvk_hit_sbt[_mvk_sbt_offset + (_mvk_rt.geometryId * _mvk_sbt_stride)];\n";
 			}
 
+			{
+				std::unordered_map<std::string, std::string> hitAttrInit;
+				for (auto& dispatch : {ahitGroupDispatch, hitGroupDispatch}) {
+					for (auto& [gIdx, fn] : dispatch) {
+						auto it = helperExtraArgs.find(fn);
+						if (it == helperExtraArgs.end()) { continue; }
+						for (auto& var : it->second) {
+							if (var.storage != spv::StorageClassHitAttributeKHR || hitAttrInit.count(var.name)) {
+								continue;
+							}
+							if (var.typeName == "float2") {
+								hitAttrInit[var.name] = var.typeName + " " + var.name + " = _mtl_isect.triangle_barycentric_coord;";
+							} else {
+								hitAttrInit[var.name] = var.typeName + " " + var.name + " = {};";
+							}
+						}
+					}
+				}
+				for (auto& [name, init] : hitAttrInit) {
+					callCode += "    " + init + "\n";
+				}
+			}
+
 			// Emit any-hit dispatch
 			if (!ahitGroupDispatch.empty()) {
 				if (ahitGroupDispatch.size() == 1) {
-					callCode += "    " + ahitGroupDispatch[0].second + "(" + helperArgs + ");\n";
+					callCode += "    " + ahitGroupDispatch[0].second + "(" + buildHelperArgs(ahitGroupDispatch[0].second) + ");\n";
 				} else {
 					callCode += "    switch (_mvk_hit_group) {\n";
 					for (auto& [gIdx, fn] : ahitGroupDispatch)
-						callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
-					callCode += "      default: " + ahitGroupDispatch[0].second + "(" + helperArgs + "); break;\n    }\n";
+						callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
+					callCode += "      default: " + ahitGroupDispatch[0].second + "(" + buildHelperArgs(ahitGroupDispatch[0].second) + "); break;\n    }\n";
 				}
 			}
 
 			// Emit closest-hit dispatch
 			if (hitGroupDispatch.size() == 1) {
-				callCode += "    " + hitGroupDispatch[0].second + "(" + helperArgs + ");\n";
+				callCode += "    " + hitGroupDispatch[0].second + "(" + buildHelperArgs(hitGroupDispatch[0].second) + ");\n";
 			} else if (hitGroupDispatch.size() > 1) {
 				callCode += "    switch (_mvk_hit_group) {\n";
 				for (auto& [gIdx, fn] : hitGroupDispatch)
-					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
-				callCode += "      default: " + hitGroupDispatch[0].second + "(" + helperArgs + "); break;\n    }\n";
+					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
+				callCode += "      default: " + hitGroupDispatch[0].second + "(" + buildHelperArgs(hitGroupDispatch[0].second) + "); break;\n    }\n";
 			}
 
 			callCode += "  } else {\n";
 
 			// Emit miss dispatch
 			if (missGroupDispatch.size() == 1) {
-				callCode += "    " + missGroupDispatch[0].second + "(" + helperArgs + ");\n";
+				callCode += "    " + missGroupDispatch[0].second + "(" + buildHelperArgs(missGroupDispatch[0].second) + ");\n";
 			} else if (missGroupDispatch.size() > 1) {
 				needsMissSBT = true;
 				callCode += "    switch (_mvk_miss_sbt[_mvk_miss_index]) {\n";
 				for (auto& [gIdx, fn] : missGroupDispatch)
-					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
-				callCode += "      default: " + missGroupDispatch[0].second + "(" + helperArgs + "); break;\n    }\n";
+					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
+				callCode += "      default: " + missGroupDispatch[0].second + "(" + buildHelperArgs(missGroupDispatch[0].second) + "); break;\n    }\n";
 			}
 			callCode += "  }\n";
 		}
@@ -3828,7 +4063,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 		// Find the raygen payload variable and pass it to chit/miss/ahit helpers by reference.
 		// The payload variable is the first _NN identifier used after the tracing block's closing '}'.
-		{
+		if (!hasNamedRaygenRTPayload) {
 			auto blockEnd = raygenMSL.find("}", markerPos);
 			std::string payloadVar;
 			if (blockEnd != std::string::npos) {
@@ -4083,6 +4318,32 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 	}
 
+	if (!raygenSpecialVars.empty()) {
+		auto kernelPos = raygenMSL.find("kernel void main0(");
+		auto bodyStart = raygenMSL.find('{', kernelPos);
+		if (bodyStart != std::string::npos) {
+			std::string localDecls;
+			for (auto& var : raygenSpecialVars) {
+				switch (var.storage) {
+					case spv::StorageClassRayPayloadKHR:
+					case spv::StorageClassCallableDataKHR:
+						break;
+					default:
+						continue;
+				}
+
+				if (var.name.empty() || var.typeName.empty()) { continue; }
+				if (!findWholeIdentifier(raygenMSL, var.name, bodyStart)) { continue; }
+				if (findWholeIdentifier(raygenMSL.substr(kernelPos, bodyStart - kernelPos), var.name)) { continue; }
+				if (raygenMSL.find(var.typeName + " " + var.name, bodyStart) != std::string::npos) { continue; }
+				localDecls += "\n    " + var.typeName + " " + var.name + " = {};";
+			}
+			if (!localDecls.empty()) {
+				raygenMSL.insert(bodyStart + 1, localDecls);
+			}
+		}
+	}
+
 	_needsMissShaderBindingTable = needsMissSBT;
 	_needsHitShaderBindingTable = needsHitSBT;
 	_needsCallableShaderBindingTable = needsCallableSBT;
@@ -4148,6 +4409,39 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			}
 		}
 
+		auto isVarDeclaredInBody = [&](const std::string& body, const std::string& varName) -> bool {
+			size_t pos = 0;
+			while ((pos = body.find(varName, pos)) != std::string::npos) {
+				if (pos > 0 && (isalnum(body[pos - 1]) || body[pos - 1] == '_')) {
+					pos += varName.size();
+					continue;
+				}
+				size_t endPos = pos + varName.size();
+				if (endPos < body.size() && (isalnum(body[endPos]) || body[endPos] == '_')) {
+					pos += varName.size();
+					continue;
+				}
+
+				auto lineStart = body.rfind('\n', pos);
+				if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
+				std::string prefix = trimString(body.substr(lineStart, pos - lineStart));
+				if (prefix.empty()) {
+					pos = endPos;
+					continue;
+				}
+
+				char prevChar = (pos > 0) ? body[pos - 1] : '\0';
+				char suffix = (endPos < body.size()) ? body[endPos] : '\0';
+				if ((prevChar == ' ' || prevChar == '\t' || prevChar == '&' || prevChar == '*') &&
+					(suffix == ';' || suffix == '=' || suffix == '[')) {
+					return true;
+				}
+
+				pos = endPos;
+			}
+			return false;
+		};
+
 		// For each function, check which _NN variables are used but not declared.
 		size_t funcStart = 0;
 		while (true) {
@@ -4179,15 +4473,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			for (auto& [varName, varType] : varTypes) {
 				if (!findWholeIdentifier(body, varName)) continue;
 				if (extractedConstantNames.find(varName) != extractedConstantNames.end()) continue;
-				// Already declared?
-				bool declared = false;
-				for (const char** tp = knownTypes; *tp; tp++) {
-					if (findWholeIdentifier(body, varName) &&
-						body.find(std::string(*tp) + " " + varName) != std::string::npos) {
-						declared = true; break;
-					}
-				}
-				if (declared) continue;
+				if (isVarDeclaredInBody(body, varName)) continue;
 				// Check if it's in the function parameter list (as a parameter, not part of the function name)
 				// Look for varName preceded by "& " or "  " (in parameter context)
 				auto sigStart = paramSection.find('(');
@@ -4202,7 +4488,6 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			funcStart = bodyStart + 1 + decls.size();
 		}
 	}
-
 	// Compile the combined MSL source.
 	_mtlPipelineState = nil;
 	_mtlThreadgroupSize = {4, 4, 4};
@@ -4217,6 +4502,16 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	// compileOptions not released — Metal may reference it asynchronously during compilation.
 
 	if (err && !mtlLib) {
+		const char* dumpDir = getMVKConfig().shaderDumpDir;
+		if (dumpDir && *dumpDir) {
+			mkdir(dumpDir, 0755);
+			std::string combinedPath = std::string(dumpDir) + "/rt-combined-main0.metal";
+			FILE* file = fopen(combinedPath.c_str(), "wb");
+			if (file) {
+				fwrite(raygenMSL.data(), 1, raygenMSL.size(), file);
+				fclose(file);
+			}
+		}
 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
 			"RT pipeline MSL compile failed: %s", err.localizedDescription.UTF8String));
 		_hasValidMTLPipelineStates = false;
@@ -4350,7 +4645,20 @@ std::string MVKRayTracingPipeline::getMSLSource(const VkPipelineShaderStageCreat
 	}
 
 	mvk::SPIRVToMSLConversionResult conversionResult;
-	if (!shaderModule->convert(&shaderConfig, conversionResult)) {
+	mvk::SPIRVToMSLConverter spvConverter;
+	const auto& spirv = shaderModule->getSPIRV();
+	if (spirv.size() < 5) {
+		reportError(VK_ERROR_INITIALIZATION_FAILED,
+					"RT shader '%s' stage %u has invalid SPIR-V word count %zu.",
+					pStage->pName ? pStage->pName : "<unnamed>",
+					(uint32_t)execModel,
+					spirv.size());
+		return "";
+	}
+	spvConverter.setSPIRV(spirv);
+	bool shouldLogCode = mvkCfg.debugMode;
+	bool shouldLogEstimatedGLSL = shouldLogCode && mvkCfg.shaderLogEstimatedGLSL;
+	if (!spvConverter.convert(shaderConfig, conversionResult, shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL)) {
 		reportError(VK_ERROR_INITIALIZATION_FAILED,
 			"RT shader MSL conversion failed: %s", conversionResult.resultLog.c_str());
 		return "";
