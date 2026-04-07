@@ -468,6 +468,10 @@ protected:
 class MVKRayTracingPipeline : public MVKPipeline {
 
 public:
+	static constexpr uint32_t kMissSBTBufferIndex = 27;
+	static constexpr uint32_t kHitSBTBufferIndex = 28;
+	static constexpr uint32_t kCallableSBTBufferIndex = 29;
+	static constexpr uint32_t kIntersectionFunctionTableBufferIndex = 30;
 
 	/** Returns the compiled Metal compute pipeline state for the ray generation shader. */
 	id<MTLComputePipelineState> getMTLComputePipelineState() { return _mtlPipelineState; }
@@ -477,6 +481,10 @@ public:
 
 	/** Returns the threadgroup size for dispatch. */
 	const MTLSize& getThreadgroupSize() const { return _mtlThreadgroupSize; }
+
+	bool needsMissShaderBindingTable() const { return _needsMissShaderBindingTable; }
+	bool needsHitShaderBindingTable() const { return _needsHitShaderBindingTable; }
+	bool needsCallableShaderBindingTable() const { return _needsCallableShaderBindingTable; }
 
 	/** Returns the shader group handles for this pipeline. */
 	VkResult getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount,
@@ -505,6 +513,9 @@ protected:
 	MVKSmallVector<VkRayTracingShaderGroupCreateInfoKHR> _shaderGroups;
 	uint32_t _shaderGroupCount = 0;
 	uint32_t _maxRecursionDepth = 1;
+	bool _needsMissShaderBindingTable = false;
+	bool _needsHitShaderBindingTable = false;
+	bool _needsCallableShaderBindingTable = false;
 };
 
 

@@ -20,6 +20,7 @@
 #include "MVKFoundation.h"
 #include "MVKOSExtensions.h"
 #include "mvk_deprecated_api.h"
+#include <stdio.h>
 #include <vulkan/vulkan_ios.h>
 #include <vulkan/vulkan_macos.h>
 
@@ -45,6 +46,14 @@ static VkExtensionProperties kVkExtProps_ ##EXT = mvkMakeExtProps(VK_ ##EXT ##_E
 
 // Returns whether the specified properties are valid for this platform
 static bool mvkIsSupportedOnPlatform(VkExtensionProperties* pProperties) {
+#define MVK_RT_PLATFORM_EXT(extProps) ((pProperties == &kVkExtProps_KHR_ACCELERATION_STRUCTURE) || \
+									   (pProperties == &kVkExtProps_KHR_RAY_QUERY) || \
+									   (pProperties == &kVkExtProps_KHR_RAY_TRACING_PIPELINE))
+
+	if (MVK_RT_PLATFORM_EXT(pProperties)) {
+		return mvkOSVersionIsAtLeast(11.0, 14.0, kMVKOSVersionUnsupported);
+	}
+
 #define MVK_EXTENSION_MIN_OS(EXT, MAC, IOS, XROS) \
 	if (pProperties == &kVkExtProps_##EXT) { return mvkOSVersionIsAtLeast(MAC, IOS, XROS); }
 
@@ -73,6 +82,7 @@ static bool mvkIsSupportedOnPlatform(VkExtensionProperties* pProperties) {
 #define MVK_EXTENSION(var, EXT, type, macos, ios, xros)  MVK_EXTENSION_MIN_OS(EXT, macos, ios, xros)
 #include "MVKExtensions.def"
 #undef MVK_EXTENSION_MIN_OS
+#undef MVK_RT_PLATFORM_EXT
 
 	return false;
 }
@@ -223,4 +233,3 @@ VkResult MVKExtensionList::getProperties(uint32_t* pCount, VkExtensionProperties
 	*pCount = enabledCnt;
 	return VK_SUCCESS;
 }
-

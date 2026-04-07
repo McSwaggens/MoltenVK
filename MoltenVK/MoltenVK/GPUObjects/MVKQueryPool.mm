@@ -423,6 +423,60 @@ MVKTimestampQueryPool::MVKTimestampQueryPool(MVKDevice* device, const VkQueryPoo
 
 
 #pragma mark -
+#pragma mark MVKAccelerationStructureQueryPool
+
+void MVKAccelerationStructureQueryPool::propagateDebugName() {
+	setMetalObjectLabel(_mtlQueryResultsBuffer, _debugName);
+}
+
+void MVKAccelerationStructureQueryPool::resetResults(uint32_t firstQuery, uint32_t queryCount, MVKCommandEncoder* cmdEncoder) {
+	MVKQueryPool::resetResults(firstQuery, queryCount, cmdEncoder);
+
+	NSUInteger firstOffset = firstQuery * kMVKQuerySlotSizeInBytes;
+	NSUInteger size = queryCount * kMVKQuerySlotSizeInBytes;
+	if (cmdEncoder) {
+		id<MTLBlitCommandEncoder> blitEncoder = cmdEncoder->getMTLBlitEncoder(kMVKCommandUseResetQueryPool);
+		[blitEncoder fillBuffer: _mtlQueryResultsBuffer range: NSMakeRange(firstOffset, size) value: 0];
+	} else {
+		mvkClear((char*)_mtlQueryResultsBuffer.contents + firstOffset, size);
+	}
+}
+
+NSData* MVKAccelerationStructureQueryPool::getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) {
+	return [NSData dataWithBytesNoCopy: (void*)((uintptr_t)_mtlQueryResultsBuffer.contents + (firstQuery * kMVKQuerySlotSizeInBytes))
+								length: queryCount * kMVKQuerySlotSizeInBytes
+						  freeWhenDone: false];
+}
+
+id<MTLBuffer> MVKAccelerationStructureQueryPool::getResultBuffer(MVKCommandEncoder*, uint32_t firstQuery, uint32_t, NSUInteger& offset) {
+	offset = firstQuery * kMVKQuerySlotSizeInBytes;
+	return _mtlQueryResultsBuffer;
+}
+
+id<MTLComputeCommandEncoder> MVKAccelerationStructureQueryPool::encodeComputeCopyResults(MVKCommandEncoder* cmdEncoder,
+																							  uint32_t firstQuery,
+																							  uint32_t,
+																							  uint32_t index) {
+	id<MTLComputeCommandEncoder> mtlCmdEnc = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseCopyQueryPoolResults);
+	cmdEncoder->getMtlCompute().bindBuffer(mtlCmdEnc, _mtlQueryResultsBuffer, firstQuery * kMVKQuerySlotSizeInBytes, index);
+	return mtlCmdEnc;
+}
+
+MVKAccelerationStructureQueryPool::MVKAccelerationStructureQueryPool(MVKDevice* device,
+																	 const VkQueryPoolCreateInfo* pCreateInfo) :
+	MVKQueryPool(device, pCreateInfo, 1) {
+	MTLResourceOptions mtlBuffOpts = MTLResourceStorageModeShared | MTLResourceCPUCacheModeDefaultCache;
+	_mtlQueryResultsBuffer = [getMTLDevice() newBufferWithLength: (VkDeviceSize)pCreateInfo->queryCount * kMVKQuerySlotSizeInBytes
+														 options: mtlBuffOpts];
+	[_mtlQueryResultsBuffer setLabel:@"Acceleration Structure Query Result Buffer"];
+}
+
+MVKAccelerationStructureQueryPool::~MVKAccelerationStructureQueryPool() {
+	[_mtlQueryResultsBuffer release];
+}
+
+
+#pragma mark -
 #pragma mark MVKPipelineStatisticsQueryPool
 
 MVKPipelineStatisticsQueryPool::MVKPipelineStatisticsQueryPool(MVKDevice* device,

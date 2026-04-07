@@ -25,9 +25,12 @@
 #include "MVKStrings.h"
 #include "MTLRenderPipelineDescriptor+MoltenVK.h"
 #include "mvk_datatypes.hpp"
+#include <cstring>
 #include <sys/stat.h>
+#include <iomanip>
 #include <sstream>
 #include <sstream>
+#include <unordered_set>
 
 #ifndef MVK_USE_CEREAL
 #define MVK_USE_CEREAL (1)
@@ -2583,15 +2586,15 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 	// Check if there are any non-raygen shader stages.
 	bool hasNonRaygenStages = false;
-	bool hasClosestHit = false, hasAnyHit = false, hasMiss = false, hasIntersection = false, hasCallable = false;
+	bool hasIntersection = false;
 	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
 		auto& stage = pCreateInfo->pStages[i];
 		switch (stage.stage) {
-			case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR: hasClosestHit = hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:     hasAnyHit = hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_MISS_BIT_KHR:        hasMiss = hasNonRaygenStages = true; break;
+			case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR: hasNonRaygenStages = true; break;
+			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:     hasNonRaygenStages = true; break;
+			case VK_SHADER_STAGE_MISS_BIT_KHR:        hasNonRaygenStages = true; break;
 			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR: hasIntersection = hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:    hasCallable = hasNonRaygenStages = true; break;
+			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:    hasNonRaygenStages = true; break;
 			default: break;
 		}
 	}
@@ -2603,6 +2606,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		"    float3 worldRayDirection;\n"
 		"    float3 objectRayOrigin;\n"
 		"    float3 objectRayDirection;\n"
+		"    float4x3 worldToObjectTransform;\n"
+		"    float4x3 objectToWorldTransform;\n"
 		"    float rayTmin;\n"
 		"    float rayTmax;\n"
 		"    uint primitiveId;\n"
@@ -2620,20 +2625,38 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		{"gl_WorldRayDirectionEXT", "worldRayDirection"},
 		{"gl_ObjectRayOriginEXT", "objectRayOrigin"},
 		{"gl_ObjectRayDirectionEXT", "objectRayDirection"},
+		{"gl_BuiltIn_5321", "worldRayOrigin"},
+		{"gl_BuiltIn_5322", "worldRayDirection"},
+		{"gl_BuiltIn_5323", "objectRayOrigin"},
+		{"gl_BuiltIn_5324", "objectRayDirection"},
+		{"gl_WorldToObjectEXT", "worldToObjectTransform"},
+		{"gl_ObjectToWorldEXT", "objectToWorldTransform"},
+		{"gl_WorldToObject3x4EXT", "worldToObjectTransform"},
+		{"gl_ObjectToWorld3x4EXT", "objectToWorldTransform"},
+		{"gl_BuiltIn_5330", "objectToWorldTransform"},
+		{"gl_BuiltIn_5331", "worldToObjectTransform"},
 		{"gl_RayTminEXT", "rayTmin"},
 		{"gl_RayTmaxEXT", "rayTmax"},
+		{"gl_BuiltIn_5325", "rayTmin"},
+		{"gl_BuiltIn_5326", "rayTmax"},
 		{"gl_PrimitiveID", "primitiveId"},
 		{"gl_InstanceID", "instanceId"},
 		{"gl_GeometryIndexEXT", "geometryId"},
 		{"gl_InstanceCustomIndexEXT", "instanceCustomIndex"},
+		{"gl_BuiltIn_5327", "instanceCustomIndex"},
 		{"gl_HitKindEXT", "hitKind"},
 		{"gl_HitTEXT", "rayTmax"},
 		{"gl_IncomingRayFlagsEXT", "incomingRayFlags"},
+		{"gl_BuiltIn_5333", "hitKind"},
+		{"gl_BuiltIn_5351", "incomingRayFlags"},
+		{"gl_BuiltIn_5352", "geometryId"},
 		// NV variants
 		{"gl_WorldRayOriginNV", "worldRayOrigin"},
 		{"gl_WorldRayDirectionNV", "worldRayDirection"},
 		{"gl_ObjectRayOriginNV", "objectRayOrigin"},
 		{"gl_ObjectRayDirectionNV", "objectRayDirection"},
+		{"gl_WorldToObjectNV", "worldToObjectTransform"},
+		{"gl_ObjectToWorldNV", "objectToWorldTransform"},
 		{"gl_RayTminNV", "rayTmin"},
 		{"gl_RayTmaxNV", "rayTmax"},
 		{"gl_HitTNV", "rayTmax"},
@@ -2646,8 +2669,304 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		{nullptr, nullptr}
 	};
 
+	auto findWholeIdentifier = [](const std::string& text, const std::string& word, size_t startPos = 0) -> bool {
+		size_t pos = startPos;
+		while ((pos = text.find(word, pos)) != std::string::npos) {
+			bool leftOk = (pos == 0 || !(isalnum(text[pos - 1]) || text[pos - 1] == '_'));
+			size_t endPos = pos + word.size();
+			bool rightOk = (endPos >= text.size() || !(isalnum(text[endPos]) || text[endPos] == '_'));
+			if (leftOk && rightOk) { return true; }
+			pos = endPos;
+		}
+		return false;
+	};
+	auto replaceWholeIdentifier = [&](std::string& text, const std::string& oldName, const std::string& newName) {
+		size_t pos = 0;
+		while ((pos = text.find(oldName, pos)) != std::string::npos) {
+			bool leftOk = (pos == 0 || !(isalnum(text[pos - 1]) || text[pos - 1] == '_'));
+			size_t endPos = pos + oldName.size();
+			bool rightOk = (endPos >= text.size() || !(isalnum(text[endPos]) || text[endPos] == '_'));
+			if (!leftOk || !rightOk) {
+				pos = endPos;
+				continue;
+			}
+			text.replace(pos, oldName.size(), newName);
+			pos += newName.size();
+		}
+	};
+	auto extractConstantIdentifier = [](const std::string& constDef) -> std::string {
+		auto constPos = constDef.find("constant ");
+		if (constPos == std::string::npos) { return {}; }
+
+		size_t start = constPos + strlen("constant ");
+		size_t stop = constDef.size();
+		for (char term : {'[', '=', ';'}) {
+			auto pos = constDef.find(term, start);
+			if (pos != std::string::npos) {
+				stop = std::min(stop, pos);
+			}
+		}
+		if (stop <= start) { return {}; }
+
+		std::string token;
+		std::string lastIdentifier;
+		for (size_t i = start; i < stop; i++) {
+			char c = constDef[i];
+			if (isalnum(c) || c == '_') {
+				token += c;
+				continue;
+			}
+			if (!token.empty()) {
+				if (!std::all_of(token.begin(), token.end(), ::isdigit)) {
+					lastIdentifier = token;
+				}
+				token.clear();
+			}
+		}
+		if (!token.empty() && !std::all_of(token.begin(), token.end(), ::isdigit)) {
+			lastIdentifier = token;
+		}
+		return lastIdentifier;
+	};
+	auto trimString = [](const std::string& str) -> std::string {
+		auto start = str.find_first_not_of(" \t\n\r");
+		if (start == std::string::npos) { return {}; }
+		auto end = str.find_last_not_of(" \t\n\r");
+		return str.substr(start, end - start + 1);
+	};
+	auto extractConstantType = [&](const std::string& constDef, const std::string& constName) -> std::string {
+		auto constPos = constDef.find("constant ");
+		if (constPos == std::string::npos) { return {}; }
+		auto typeStart = constPos + strlen("constant ");
+		auto namePos = constDef.find(constName, typeStart);
+		if (namePos == std::string::npos || namePos <= typeStart) { return {}; }
+		return trimString(constDef.substr(typeStart, namePos - typeStart));
+	};
+	auto isTopLevelDeclaration = [](const std::string& text, size_t pos) -> bool {
+		uint32_t depth = 0;
+		for (size_t i = 0; i < pos; i++) {
+			if (text[i] == '{') {
+				depth++;
+			} else if (text[i] == '}' && depth > 0) {
+				depth--;
+			}
+		}
+		return depth == 0;
+	};
+	auto getSpecializationExpr = [&](const VkSpecializationInfo* pSpecInfo,
+									 uint32_t constantID,
+									 const std::string& type,
+									 std::string& expr) -> bool {
+		if (!pSpecInfo || !pSpecInfo->pMapEntries || !pSpecInfo->pData) { return false; }
+
+		for (uint32_t specIdx = 0; specIdx < pSpecInfo->mapEntryCount; specIdx++) {
+			const VkSpecializationMapEntry* pMapEntry = &pSpecInfo->pMapEntries[specIdx];
+			if (pMapEntry->constantID != constantID) { continue; }
+
+			const char* pData = reinterpret_cast<const char*>(pSpecInfo->pData) + pMapEntry->offset;
+			auto copyValue = [&](auto& value) -> bool {
+				if (pMapEntry->size < sizeof(value)) { return false; }
+				std::memcpy(&value, pData, sizeof(value));
+				return true;
+			};
+			auto formatFloat = [](double value, bool withSuffix) -> std::string {
+				std::ostringstream oss;
+				oss << std::setprecision(17) << value;
+				std::string out = oss.str();
+				if (out.find_first_of(".eE") == std::string::npos) {
+					out += ".0";
+				}
+				if (withSuffix) { out += "f"; }
+				return out;
+			};
+
+			if (type == "bool") {
+				uint32_t value = 0;
+				if (!copyValue(value)) { return false; }
+				expr = value ? "true" : "false";
+				return true;
+			}
+			if (type == "uint") {
+				uint32_t value = 0;
+				if (!copyValue(value)) { return false; }
+				expr = std::to_string(value) + "u";
+				return true;
+			}
+			if (type == "int") {
+				int32_t value = 0;
+				if (!copyValue(value)) { return false; }
+				expr = std::to_string(value);
+				return true;
+			}
+			if (type == "ushort") {
+				uint16_t value = 0;
+				if (!copyValue(value)) { return false; }
+				expr = "ushort(" + std::to_string(value) + "u)";
+				return true;
+			}
+			if (type == "short") {
+				int16_t value = 0;
+				if (!copyValue(value)) { return false; }
+				expr = "short(" + std::to_string(value) + ")";
+				return true;
+			}
+			if (type == "ulong") {
+				uint64_t value = 0;
+				if (!copyValue(value)) { return false; }
+				expr = std::to_string(value) + "ul";
+				return true;
+			}
+			if (type == "long") {
+				int64_t value = 0;
+				if (!copyValue(value)) { return false; }
+				expr = std::to_string(value) + "l";
+				return true;
+			}
+			if (type == "float") {
+				float value = 0.0f;
+				if (!copyValue(value)) { return false; }
+				expr = formatFloat(value, true);
+				return true;
+			}
+			if (type == "half") {
+				uint16_t bits = 0;
+				if (!copyValue(bits)) { return false; }
+				expr = "half(as_type<half>((ushort)" + std::to_string(bits) + "u))";
+				return true;
+			}
+			if (type == "double") {
+				double value = 0.0;
+				if (!copyValue(value)) { return false; }
+				expr = formatFloat(value, false);
+				return true;
+			}
+
+			return false;
+		}
+
+		return false;
+	};
+	auto resolveFunctionConstants = [&](std::string& text, const VkSpecializationInfo* pSpecInfo) {
+		struct FunctionConstantDecl {
+			std::string type;
+			uint32_t index;
+			size_t lineStart;
+			size_t lineLen;
+		};
+		std::unordered_map<std::string, FunctionConstantDecl> decls;
+		size_t pos = 0;
+		while ((pos = text.find("[[function_constant(", pos)) != std::string::npos) {
+			if (!isTopLevelDeclaration(text, pos)) {
+				pos += strlen("[[function_constant(");
+				continue;
+			}
+
+			auto lineStart = text.rfind('\n', pos);
+			if (lineStart == std::string::npos) {
+				lineStart = 0;
+			} else {
+				lineStart++;
+			}
+			auto lineEnd = text.find(';', pos);
+			if (lineEnd == std::string::npos) { break; }
+
+			std::string decl = text.substr(lineStart, lineEnd + 1 - lineStart);
+			std::string declName = extractConstantIdentifier(decl);
+			if (declName.empty()) {
+				pos = lineEnd + 1;
+				continue;
+			}
+
+			auto attrStart = decl.find("[[function_constant(");
+			auto attrEnd = (attrStart == std::string::npos) ? std::string::npos : decl.find(")]]", attrStart);
+			if (attrEnd == std::string::npos) {
+				pos = lineEnd + 1;
+				continue;
+			}
+
+			uint32_t index = (uint32_t)std::stoul(decl.substr(attrStart + strlen("[[function_constant("),
+														  attrEnd - (attrStart + strlen("[[function_constant("))));
+			decls[declName] = {
+				extractConstantType(decl, declName),
+				index,
+				lineStart,
+				lineEnd + 1 - lineStart
+			};
+			pos = lineEnd + 1;
+		}
+
+		pos = 0;
+		while ((pos = text.find("is_function_constant_defined(", pos)) != std::string::npos) {
+			if (!isTopLevelDeclaration(text, pos)) {
+				pos += strlen("is_function_constant_defined(");
+				continue;
+			}
+
+			auto lineStart = text.rfind('\n', pos);
+			if (lineStart == std::string::npos) {
+				lineStart = 0;
+			} else {
+				lineStart++;
+			}
+			auto lineEnd = text.find(';', pos);
+			if (lineEnd == std::string::npos) { break; }
+
+			std::string line = text.substr(lineStart, lineEnd + 1 - lineStart);
+			auto argStart = line.find("is_function_constant_defined(");
+			if (argStart == std::string::npos) {
+				pos = lineEnd + 1;
+				continue;
+			}
+			argStart += strlen("is_function_constant_defined(");
+			auto argEnd = line.find(')', argStart);
+			if (argEnd == std::string::npos) {
+				pos = lineEnd + 1;
+				continue;
+			}
+
+			std::string tmpName = trimString(line.substr(argStart, argEnd - argStart));
+			auto declIt = decls.find(tmpName);
+			if (declIt == decls.end()) {
+				pos = lineEnd + 1;
+				continue;
+			}
+
+			std::string constName = extractConstantIdentifier(line);
+			std::string constType = extractConstantType(line, constName);
+			auto colonPos = line.rfind(':');
+			auto semicolonPos = line.rfind(';');
+			if (colonPos == std::string::npos || semicolonPos == std::string::npos || colonPos >= semicolonPos) {
+				pos = lineEnd + 1;
+				continue;
+			}
+
+			std::string valueExpr = trimString(line.substr(colonPos + 1, semicolonPos - colonPos - 1));
+			std::string specializedExpr;
+			if (getSpecializationExpr(pSpecInfo, declIt->second.index, constType, specializedExpr)) {
+				valueExpr = specializedExpr;
+			}
+
+			std::string replacement = "constant " + constType + " " + constName + " = " + valueExpr + ";";
+			text.replace(lineStart, lineEnd + 1 - lineStart, replacement);
+			pos = lineStart + replacement.size();
+		}
+
+		std::vector<FunctionConstantDecl> sortedDecls;
+		sortedDecls.reserve(decls.size());
+		for (auto& [_, decl] : decls) {
+			sortedDecls.push_back(decl);
+		}
+		std::sort(sortedDecls.begin(), sortedDecls.end(), [](const auto& a, const auto& b) {
+			return a.lineStart > b.lineStart;
+		});
+		for (auto& decl : sortedDecls) {
+			text.erase(decl.lineStart, decl.lineLen);
+		}
+	};
+
 	// All RT pipelines use the combined MSL approach.
 	std::string raygenMSL = getMSLSource(pRaygenStage, spv::ExecutionModelRayGenerationKHR, "");
+	resolveFunctionConstants(raygenMSL, pRaygenStage->pSpecializationInfo);
 	if (raygenMSL.empty()) {
 		_hasValidMTLPipelineStates = false;
 		return;
@@ -2656,6 +2975,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	std::string intersectionFunc;
 	// Maps stage index -> helper function name for SBT group dispatch.
 	std::unordered_map<uint32_t, std::string> stageToFuncName;
+	std::unordered_set<std::string> extractedConstantNames;
 
 	// Compile non-raygen shaders to MSL and transform them into helper functions.
 	// Each shader gets a unique name based on its stage index.
@@ -2696,6 +3016,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		std::string funcName = baseName + "_" + std::to_string(i);
 
 		std::string msl = getMSLSource(&stage, execModel, funcName);
+		resolveFunctionConstants(msl, stage.pSpecializationInfo);
 		if (msl.empty() || !targetVec) continue;
 		targetVec->push_back(funcName);
 		stageToFuncName[i] = funcName;
@@ -2795,6 +3116,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		// struct types (e.g., struct _7 { ... }), template/inline functions
 		// (spvSMod, etc.), and constant arrays. These appear between
 		// "using namespace metal;" and the entry point function.
+		std::vector<std::pair<std::string, std::string>> helperConstantRenames;
 		{
 			auto usingNS = msl.find("using namespace metal;");
 			size_t helperStart = (usingNS != std::string::npos) ? usingNS + strlen("using namespace metal;") : 0;
@@ -2802,6 +3124,29 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			if (entryLineStart == std::string::npos) entryLineStart = 0;
 			if (helperStart >= entryLineStart) helperStart = 0;
 			std::string helperRegion = msl.substr(helperStart, entryLineStart - helperStart);
+
+			// Give helper-scoped constants stable unique names before merging them into the
+			// combined source, otherwise different helper stages collide on shared _NN names.
+			{
+				size_t pos = 0;
+				while ((pos = helperRegion.find("constant ", pos)) != std::string::npos) {
+					if (!isTopLevelDeclaration(helperRegion, pos)) {
+						pos += strlen("constant ");
+						continue;
+					}
+					auto lineEnd = helperRegion.find(';', pos);
+					if (lineEnd == std::string::npos) { break; }
+					std::string constDef = helperRegion.substr(pos, lineEnd + 1 - pos);
+					std::string cName = extractConstantIdentifier(constDef);
+					if (cName.size() > 1 && cName[0] == '_' && isdigit(cName[1])) {
+						helperConstantRenames.push_back({cName, cName + "_" + funcName});
+					}
+					pos = lineEnd + 1;
+				}
+				for (auto& [oldName, newName] : helperConstantRenames) {
+					replaceWholeIdentifier(helperRegion, oldName, newName);
+				}
+			}
 
 			// Find insertion point for struct types: before spvDescriptorSetBuffer0 since
 			// descriptor set members may reference these types. For helpers/constants,
@@ -2875,7 +3220,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 							while (fnEnd < helperFunc.size() && (isalnum(helperFunc[fnEnd]) || helperFunc[fnEnd] == '_'))
 								fnEnd++;
 							std::string hfName = helperFunc.substr(fnStart, fnEnd - fnStart);
-							if (raygenMSL.find(hfName) == std::string::npos) {
+							if (!findWholeIdentifier(raygenMSL, hfName)) {
 								auto insertPos = findInsertPos();
 								if (insertPos != std::string::npos)
 									raygenMSL.insert(insertPos, helperFunc + "\n\n");
@@ -2890,6 +3235,10 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			{
 				size_t pos = 0;
 				while ((pos = helperRegion.find("constant ", pos)) != std::string::npos) {
+					if (!isTopLevelDeclaration(helperRegion, pos)) {
+						pos += strlen("constant ");
+						continue;
+					}
 					auto lineS = helperRegion.rfind('\n', pos);
 					if (lineS == std::string::npos) lineS = 0; else lineS++;
 					auto lineEnd = helperRegion.find(';', pos);
@@ -2909,18 +3258,12 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 						if (lineEnd == std::string::npos) { pos += 9; continue; }
 					}
 					std::string constDef = helperRegion.substr(lineS, lineEnd + 1 - lineS);
-					// Extract the constant name (second word after "constant type")
-					auto nameEnd = constDef.find(" =");
-					if (nameEnd == std::string::npos) nameEnd = constDef.find("[");
-					if (nameEnd != std::string::npos) {
-						auto nameStart = constDef.rfind(' ', nameEnd - 1);
-						if (nameStart != std::string::npos) {
-							std::string cName = constDef.substr(nameStart + 1, nameEnd - nameStart - 1);
-							if (!cName.empty() && raygenMSL.find(cName) == std::string::npos) {
-								auto insertPos = findInsertPos();
-								if (insertPos != std::string::npos)
-									raygenMSL.insert(insertPos, constDef + "\n\n");
-							}
+					std::string cName = extractConstantIdentifier(constDef);
+					if (!cName.empty() && !findWholeIdentifier(raygenMSL, cName)) {
+						auto insertPos = findInsertPos();
+						if (insertPos != std::string::npos) {
+							raygenMSL.insert(insertPos, constDef + "\n\n");
+							extractedConstantNames.insert(cName);
 						}
 					}
 					pos = lineEnd + 1;
@@ -2931,6 +3274,9 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		auto lineStart = msl.rfind('\n', funcPos);
 		if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
 		std::string funcCode = msl.substr(lineStart);
+		for (auto& [oldName, newName] : helperConstantRenames) {
+			replaceWholeIdentifier(funcCode, oldName, newName);
+		}
 
 		// Remove [[visible]], kernel, [[intersection(...)]] qualifiers
 		for (auto& qual : {"[[visible]] ", "kernel ", "[[intersection(triangle, instancing)]] "}) {
@@ -3007,9 +3353,9 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 		// Insert local declarations for payload/callable data variables at the function body start.
 		if (!extraLocalDecls.empty()) {
-			auto bodyStart = funcCode.find('{');
-			if (bodyStart != std::string::npos) {
-				funcCode.insert(bodyStart + 1, extraLocalDecls);
+			auto funcBodyStart = funcCode.find('{');
+			if (funcBodyStart != std::string::npos) {
+				funcCode.insert(funcBodyStart + 1, extraLocalDecls);
 			}
 		}
 
@@ -3050,6 +3396,48 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 	}
 
+	// Merged helper stages can declare the same Metal function_constant index.
+	// Keep the first declaration for each index and rewrite later references to it.
+	{
+		std::unordered_map<std::string, std::string> functionConstantDecls;
+		size_t pos = 0;
+		while ((pos = raygenMSL.find("[[function_constant(", pos)) != std::string::npos) {
+			auto lineStart = raygenMSL.rfind('\n', pos);
+			if (lineStart == std::string::npos) {
+				lineStart = 0;
+			} else {
+				lineStart++;
+			}
+			auto lineEnd = raygenMSL.find(';', pos);
+			if (lineEnd == std::string::npos) { break; }
+
+			std::string decl = raygenMSL.substr(lineStart, lineEnd + 1 - lineStart);
+			std::string declName = extractConstantIdentifier(decl);
+			if (declName.empty()) {
+				pos = lineEnd + 1;
+				continue;
+			}
+
+			auto attrStart = decl.find("[[function_constant(");
+			auto attrEnd = (attrStart == std::string::npos) ? std::string::npos : decl.find(")]]", attrStart);
+			if (attrEnd == std::string::npos) {
+				pos = lineEnd + 1;
+				continue;
+			}
+
+			std::string attrKey = decl.substr(attrStart, attrEnd + 3 - attrStart);
+			auto [it, inserted] = functionConstantDecls.emplace(attrKey, declName);
+			if (!inserted) {
+				replaceWholeIdentifier(raygenMSL, declName, it->second);
+				raygenMSL.erase(lineStart, lineEnd + 1 - lineStart);
+				pos = lineStart;
+				continue;
+			}
+
+			pos = lineEnd + 1;
+		}
+	}
+
 	// Handle intersection shaders: compile as proper Metal [[intersection()]] functions.
 	// For AABB geometry, Metal requires intersection functions via MTLIntersectionFunctionTable.
 	std::string isectFuncMSL;
@@ -3059,6 +3447,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			if (stage.stage != VK_SHADER_STAGE_INTERSECTION_BIT_KHR) continue;
 
 			std::string msl = getMSLSource(&stage, spv::ExecutionModelIntersectionKHR, "_mvk_isect");
+			resolveFunctionConstants(msl, stage.pSpecializationInfo);
 			if (msl.empty()) continue;
 			intersectionFunc = "_mvk_isect";
 
@@ -3278,19 +3667,26 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 					if (depth > 0) sigEnd++;
 				}
 				if (depth == 0) {
+					const char* iftType = hasIntersection
+						? "intersection_function_table<instancing, world_space_data>"
+						: "intersection_function_table<instancing>";
 					raygenMSL.insert(sigEnd,
-						", intersection_function_table<instancing> _mvk_ift [[buffer(30)]]");
+						", " + std::string(iftType) + " _mvk_ift [[buffer(" + std::to_string(MVKRayTracingPipeline::kIntersectionFunctionTableBufferIndex) + ")]]");
 				}
 			}
 		}
 	}
 
-	// For triangle-only pipelines (no intersection functions), add triangle_data
-	// to the intersector to enable triangle_front_facing access for HitKind.
-	if (!hasIntersection) {
-		auto iPos = raygenMSL.find("intersector<instancing>");
-		if (iPos != std::string::npos) {
-			raygenMSL.replace(iPos, strlen("intersector<instancing>"), "intersector<triangle_data, instancing>");
+	// Use world-space data for object-space ray builtins and transform matrices.
+	// For triangle-only pipelines, also request triangle data so HitKind can read face winding.
+	{
+		const char* replacement = hasIntersection
+			? "intersector<instancing, world_space_data>"
+			: "intersector<triangle_data, instancing, world_space_data>";
+		size_t iPos = 0;
+		while ((iPos = raygenMSL.find("intersector<instancing>", iPos)) != std::string::npos) {
+			raygenMSL.replace(iPos, strlen("intersector<instancing>"), replacement);
+			iPos += strlen(replacement);
 		}
 	}
 
@@ -3315,6 +3711,10 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 	};
 
+	bool needsHitSBT = false;
+	bool needsMissSBT = false;
+	bool needsCallableSBT = callableFuncs.size() > 1;
+
 	// Now modify the raygen kernel's OpTraceRayKHR site to call the helper functions.
 	// The SPIRV-Cross emission left a marker: "(void)_mtl_isect;"
 	// Replace it with calls to the closest-hit or miss function based on intersection result.
@@ -3330,14 +3730,16 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			callCode += "  _mvk_rt.rayTmax = _mtl_isect.distance;\n";
 			callCode += "  _mvk_rt.primitiveId = _mtl_isect.primitive_id;\n";
 			callCode += "  _mvk_rt.instanceId = _mtl_isect.instance_id;\n";
-			callCode += "  _mvk_rt.geometryId = _mtl_isect.geometry_id;\n";
+			callCode += "  _mvk_rt.geometryId = _mtl_isect.primitive_data ? *((const device uint*)_mtl_isect.primitive_data) : _mtl_isect.geometry_id;\n";
 			callCode += "  _mvk_rt.instanceCustomIndex = _mtl_isect.user_instance_id;\n";
+			callCode += "  _mvk_rt.worldToObjectTransform = _mtl_isect.world_to_object_transform;\n";
+			callCode += "  _mvk_rt.objectToWorldTransform = _mtl_isect.object_to_world_transform;\n";
 			if (!hasIntersection)
 				callCode += "  _mvk_rt.hitKind = (_mtl_isect.type == intersection_type::triangle) ? (_mtl_isect.triangle_front_facing ? 0xFEu : 0xFFu) : 0u;\n";
 			else
 				callCode += "  _mvk_rt.hitKind = 0u;\n";
-			callCode += "  _mvk_rt.objectRayOrigin = float3(0);\n";  // TODO: requires instance transform
-			callCode += "  _mvk_rt.objectRayDirection = float3(0);\n";  // TODO: requires instance transform
+			callCode += "  _mvk_rt.objectRayOrigin = (_mvk_rt.worldToObjectTransform * float4(_mtl_r.origin, 1.0)).xyz;\n";
+			callCode += "  _mvk_rt.objectRayDirection = (_mvk_rt.worldToObjectTransform * float4(_mtl_r.direction, 0.0)).xyz;\n";
 			callCode += "  _mvk_rt.incomingRayFlags = _mtl_ray_flags;\n";
 			callCode += "  if (_mtl_isect.type != intersection_type::none) {\n";
 
@@ -3377,12 +3779,17 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				}
 			}
 
+			if (hitGroupDispatch.size() > 1 || ahitGroupDispatch.size() > 1) {
+				needsHitSBT = true;
+				callCode += "    uint _mvk_hit_group = _mvk_hit_sbt[_mvk_sbt_offset + (_mvk_rt.geometryId * _mvk_sbt_stride)];\n";
+			}
+
 			// Emit any-hit dispatch
 			if (!ahitGroupDispatch.empty()) {
 				if (ahitGroupDispatch.size() == 1) {
 					callCode += "    " + ahitGroupDispatch[0].second + "(" + helperArgs + ");\n";
 				} else {
-					callCode += "    switch (_mtl_isect.instance_id) {\n";
+					callCode += "    switch (_mvk_hit_group) {\n";
 					for (auto& [gIdx, fn] : ahitGroupDispatch)
 						callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
 					callCode += "      default: " + ahitGroupDispatch[0].second + "(" + helperArgs + "); break;\n    }\n";
@@ -3393,7 +3800,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			if (hitGroupDispatch.size() == 1) {
 				callCode += "    " + hitGroupDispatch[0].second + "(" + helperArgs + ");\n";
 			} else if (hitGroupDispatch.size() > 1) {
-				callCode += "    switch (_mtl_isect.instance_id) {\n";
+				callCode += "    switch (_mvk_hit_group) {\n";
 				for (auto& [gIdx, fn] : hitGroupDispatch)
 					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
 				callCode += "      default: " + hitGroupDispatch[0].second + "(" + helperArgs + "); break;\n    }\n";
@@ -3405,9 +3812,11 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			if (missGroupDispatch.size() == 1) {
 				callCode += "    " + missGroupDispatch[0].second + "(" + helperArgs + ");\n";
 			} else if (missGroupDispatch.size() > 1) {
-				// Multiple miss shaders: dispatch based on missIndex from traceRayEXT
-				// For now, call the first one (missIndex selection requires SPIRV-Cross support)
-				callCode += "    " + missGroupDispatch[0].second + "(" + helperArgs + ");\n";
+				needsMissSBT = true;
+				callCode += "    switch (_mvk_miss_sbt[_mvk_miss_index]) {\n";
+				for (auto& [gIdx, fn] : missGroupDispatch)
+					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + helperArgs + "); break;\n";
+				callCode += "      default: " + missGroupDispatch[0].second + "(" + helperArgs + "); break;\n    }\n";
 			}
 			callCode += "  }\n";
 		}
@@ -3530,10 +3939,28 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 		addKernelParam("uint3 gl_LaunchIDNV [[thread_position_in_grid]]");
 		addKernelParam("uint3 gl_LaunchSizeNV [[threads_per_grid]]");
+		if (needsMissSBT)
+			addKernelParam(("constant uint* _mvk_miss_sbt [[buffer(" + std::to_string(MVKRayTracingPipeline::kMissSBTBufferIndex) + ")]]").c_str());
+		if (needsHitSBT)
+			addKernelParam(("constant uint* _mvk_hit_sbt [[buffer(" + std::to_string(MVKRayTracingPipeline::kHitSBTBufferIndex) + ")]]").c_str());
 	}
 
 	// Replace executeCallableEXT markers with calls to callable helpers.
 	if (!callableFuncs.empty()) {
+		std::vector<std::pair<uint32_t, std::string>> callableGroupDispatch;
+		for (uint32_t g = 0; g < _shaderGroupCount; g++) {
+			auto& group = pCreateInfo->pGroups[g];
+			if (group.type != VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR ||
+				group.generalShader == VK_SHADER_UNUSED_KHR) {
+				continue;
+			}
+			auto it = stageToFuncName.find(group.generalShader);
+			if (it != stageToFuncName.end() &&
+				pCreateInfo->pStages[group.generalShader].stage == VK_SHADER_STAGE_CALLABLE_BIT_KHR) {
+				callableGroupDispatch.push_back({g, it->second});
+			}
+		}
+
 		// Ensure the kernel has the descriptor set parameter (the raygen shader
 		// might not reference any descriptors, but the callable shader does).
 		auto kernelStart = raygenMSL.find("kernel void main0(");
@@ -3560,6 +3987,9 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		// Ensure gl_LaunchIDNV and gl_LaunchSizeNV parameters exist in the kernel.
 		addKernelParam("uint3 gl_LaunchIDNV [[thread_position_in_grid]]");
 		addKernelParam("uint3 gl_LaunchSizeNV [[threads_per_grid]]");
+		if (needsCallableSBT) {
+			addKernelParam(("constant uint* _mvk_callable_sbt [[buffer(" + std::to_string(MVKRayTracingPipeline::kCallableSBTBufferIndex) + ")]]").c_str());
+		}
 
 		// Replace each callable marker, passing the caller's payload variable by reference.
 		// After each marker, find the first _NN variable used — that's the callable data.
@@ -3583,10 +4013,23 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 						break;
 					}
 				}
-				std::string callableCall = "{ _MVKRTBuiltins _mvk_rt = {}; " +
-					callableFuncs[0] + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
-				if (!payloadVar.empty()) callableCall += ", " + payloadVar;
-				callableCall += "); }\n";
+				std::string callableCall = "{ _MVKRTBuiltins _mvk_rt = {}; ";
+				if (callableGroupDispatch.size() <= 1) {
+					callableCall += callableFuncs[0] + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
+					if (!payloadVar.empty()) callableCall += ", " + payloadVar;
+					callableCall += "); ";
+				} else {
+					callableCall += "switch (_mvk_callable_sbt[_mvk_callable_index]) { ";
+					for (auto& [gIdx, fn] : callableGroupDispatch) {
+						callableCall += "case " + std::to_string(gIdx) + ": " + fn + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
+						if (!payloadVar.empty()) callableCall += ", " + payloadVar;
+						callableCall += "); break; ";
+					}
+					callableCall += "default: " + callableGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
+					if (!payloadVar.empty()) callableCall += ", " + payloadVar;
+					callableCall += "); break; } ";
+				}
+				callableCall += "}\n";
 				raygenMSL.replace(pos, strlen("/* MVK_EXECUTE_CALLABLE */"), callableCall);
 			}
 
@@ -3639,6 +4082,10 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			}
 		}
 	}
+
+	_needsMissShaderBindingTable = needsMissSBT;
+	_needsHitShaderBindingTable = needsHitSBT;
+	_needsCallableShaderBindingTable = needsCallableSBT;
 
 	// Fix undeclared SPIR-V temporary variables in the combined MSL.
 	// SPIRV-Cross omits declarations for ray payload (StorageClassRayPayloadKHR,
@@ -3729,25 +4176,14 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			std::string paramSection = raygenMSL.substr(nextFunc, bodyStart - nextFunc);
 			std::string decls;
 
-			// Lambda to check if varName appears as a whole identifier (not substring of longer name)
-			auto findWholeWord = [](const std::string& text, const std::string& word, size_t startPos = 0) -> bool {
-				size_t pos = startPos;
-				while ((pos = text.find(word, pos)) != std::string::npos) {
-					bool leftOk = (pos == 0 || !(isalnum(text[pos - 1]) || text[pos - 1] == '_'));
-					size_t endPos = pos + word.size();
-					bool rightOk = (endPos >= text.size() || !(isalnum(text[endPos]) || text[endPos] == '_'));
-					if (leftOk && rightOk) return true;
-					pos += word.size();
-				}
-				return false;
-			};
-
 			for (auto& [varName, varType] : varTypes) {
-				if (!findWholeWord(body, varName)) continue;
+				if (!findWholeIdentifier(body, varName)) continue;
+				if (extractedConstantNames.find(varName) != extractedConstantNames.end()) continue;
 				// Already declared?
 				bool declared = false;
 				for (const char** tp = knownTypes; *tp; tp++) {
-					if (body.find(std::string(*tp) + " " + varName) != std::string::npos) {
+					if (findWholeIdentifier(body, varName) &&
+						body.find(std::string(*tp) + " " + varName) != std::string::npos) {
 						declared = true; break;
 					}
 				}
@@ -3755,7 +4191,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				// Check if it's in the function parameter list (as a parameter, not part of the function name)
 				// Look for varName preceded by "& " or "  " (in parameter context)
 				auto sigStart = paramSection.find('(');
-				if (sigStart != std::string::npos && findWholeWord(paramSection, varName, sigStart)) continue;
+				if (sigStart != std::string::npos && findWholeIdentifier(paramSection, varName, sigStart)) continue;
 				decls += "\n    " + varType + " " + varName + " = " + varType + "(0);";
 			}
 

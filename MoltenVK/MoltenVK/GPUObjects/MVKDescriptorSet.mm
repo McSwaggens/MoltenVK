@@ -462,6 +462,8 @@ static id<MTLArgumentEncoder> createArgumentEncoder(MVKArrayRef<const MVKDescrip
 				case MVKDescriptorGPULayout::BufferAuxSize: {
 					MTLDataType type = layout == MVKDescriptorGPULayout::Sampler ? MTLDataTypeSampler :
 					                   layout == MVKDescriptorGPULayout::Texture ? MTLDataTypeTexture :
+					                   binding.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR ?
+					                                                               static_cast<MTLDataType>(MTLArgumentTypeInstanceAccelerationStructure) :
 					                                                               MTLDataTypePointer;
 					[list addObject:argumentDescriptor(index, access, type, count)];
 					break;
@@ -899,9 +901,13 @@ template <> struct MVKArgBufEncoder<MVKArgumentBufferMode::Metal3> {
 	void setBuffer(id<MTLBuffer> buf, uint64_t offset, size_t index = 0) {
 		dst[index].gpuAddress = buf.gpuAddress + offset;
 	}
+	void setAccelerationStructure(id<MTLAccelerationStructure> as, size_t index = 0) {
+		dst[index].resource = as.gpuResourceID;
+	}
 	void setNullTexture(size_t index = 0) { dst[index].resource = {}; }
 	void setNullSampler(size_t index = 0) { dst[index].resource = {}; }
 	void setNullBuffer (size_t index = 0) { dst[index].gpuAddress = 0; }
+	void setNullAccelerationStructure(size_t index = 0) { dst[index].resource = {}; }
 	void setTexture(MVKImageView* img, size_t index = 0) { setTexture(img ? img->getMTLTexture() : nil, index); }
 	void setSampler(MVKSampler* samp, size_t index = 0) { setSampler(samp ? samp->getMTLSamplerState() : nil, index); }
 	void setBuffer(const VkDescriptorBufferInfo* info, size_t index = 0) {
@@ -924,9 +930,13 @@ template <> struct MVKArgBufEncoder<MVKArgumentBufferMode::ArgEncoder> {
 	void setBuffer(id<MTLBuffer> buf, uint64_t offset, size_t index = 0) {
 		[enc setBuffer:buf offset:static_cast<NSUInteger>(offset) atIndex:base + index];
 	}
+	void setAccelerationStructure(id<MTLAccelerationStructure> as, size_t index = 0) {
+		[enc setAccelerationStructure:as atIndex:base + index];
+	}
 	void setNullTexture(size_t index = 0) { [enc setTexture:nil atIndex:base + index]; }
 	void setNullSampler(size_t index = 0) { [enc setSamplerState:nil atIndex:base + index]; }
 	void setNullBuffer (size_t index = 0) { [enc setBuffer:nil offset:0 atIndex:base + index]; }
+	void setNullAccelerationStructure(size_t index = 0) { [enc setAccelerationStructure:nil atIndex:base + index]; }
 	void setTexture(MVKImageView* img, size_t index = 0) {
 		[enc setTexture:img ? img->getMTLTexture() : nil atIndex:base + index];
 	}
@@ -995,13 +1005,9 @@ static void writeDescriptorSetGPUBuffer(
 					auto asHandle = *static_cast<const VkAccelerationStructureKHR*>(src);
 					auto* mvkAS = reinterpret_cast<MVKAccelerationStructure*>(asHandle);
 					if (mvkAS && mvkAS->getMTLAccelerationStructure()) {
-						if constexpr (ArgBufMode == MVKArgumentBufferMode::Metal3) {
-							enc.dst[0].resource = mvkAS->getMTLAccelerationStructure().gpuResourceID;
-						} else {
-							enc.setBuffer((id<MTLBuffer>)mvkAS->getMTLAccelerationStructure(), 0);
-						}
+						enc.setAccelerationStructure(mvkAS->getMTLAccelerationStructure());
 					} else {
-						enc.setNullBuffer();
+						enc.setNullAccelerationStructure();
 					}
 				} else {
 					assert(srcType == MVKDescriptorUpdateSourceType::Buffer);
@@ -1423,6 +1429,19 @@ static void copyArgBuf(MVKDevice* device, id<MTLArgumentEncoder> enc,
 	}
 }
 
+static void copyArgBufAccelerationStructures(MVKDevice* device, id<MTLArgumentEncoder> enc,
+											 const char* src, size_t srcStride,
+											 uint32_t start, uint32_t count) {
+	for (uint32_t i = 0; i < count; i++, src += srcStride) {
+		id<MTLAccelerationStructure> as = *reinterpret_cast<const id<MTLAccelerationStructure>*>(src);
+		if (as) {
+			[enc setAccelerationStructure:as atIndex:start + i];
+		} else {
+			[enc setAccelerationStructure:nil atIndex:start + i];
+		}
+	}
+}
+
 static void copyDescriptorSetBinding(
 	const MVKDescriptorSetLayout* dstLayout,
 	const MVKDescriptorBinding* srcBinding, const MVKDescriptorSet* srcSet, id<MTLArgumentEncoder> srcEnc,
@@ -1472,6 +1491,11 @@ static void copyDescriptorSetBinding(
 
 					case MVKDescriptorGPULayout::Buffer:
 					case MVKDescriptorGPULayout::BufferAuxSize: {
+						if (srcBinding->descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+							assert(cpu == MVKDescriptorCPULayout::OneID);
+							copyArgBufAccelerationStructures(dev, dstEnc, src, cpuStride, dst, count);
+							break;
+						}
 						size_t offsetOffset;
 						if (cpu == MVKDescriptorCPULayout::TwoID2Meta) {
 							src += offsetof(MVKCPUDescriptorTwoID2Meta, b); // Buffer is always second ID

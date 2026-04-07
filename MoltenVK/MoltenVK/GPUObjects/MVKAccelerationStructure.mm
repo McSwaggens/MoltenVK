@@ -39,6 +39,28 @@ VkDeviceAddress MVKAccelerationStructure::getDeviceAddress() {
 	return 0;
 }
 
+void MVKAccelerationStructure::retainBuffer(id<MTLBuffer> mtlBuffer) {
+	if (!mtlBuffer) { return; }
+	[mtlBuffer retain];
+	_retainedMTLBuffers.push_back(mtlBuffer);
+}
+
+void MVKAccelerationStructure::clearRetainedBuffers() {
+	for (auto& mtlBuffer : _retainedMTLBuffers) {
+		[mtlBuffer release];
+	}
+	_retainedMTLBuffers.clear();
+}
+
+void MVKAccelerationStructure::copyRetainedBuffersFrom(MVKAccelerationStructure* srcAS) {
+	clearRetainedBuffers();
+	if (!srcAS) { return; }
+	for (auto& mtlBuffer : srcAS->_retainedMTLBuffers) {
+		retainBuffer(mtlBuffer);
+	}
+}
+
 MVKAccelerationStructure::~MVKAccelerationStructure() {
+	clearRetainedBuffers();
 	[_mtlAccelerationStructure release];
 }

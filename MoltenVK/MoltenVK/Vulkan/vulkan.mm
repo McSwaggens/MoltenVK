@@ -26,9 +26,9 @@
 #include "MVKCmdDraw.h"
 #include "MVKCmdTransfer.h"
 #include "MVKCmdQueries.h"
-#include "MVKCmdAccelerationStructure.h"
-#include "MVKCmdRayTracing.h"
-#include "MVKAccelerationStructure.h"
+#include "../Commands/MVKCmdAccelerationStructure.h"
+#include "../Commands/MVKCmdRayTracing.h"
+#include "../GPUObjects/MVKAccelerationStructure.h"
 #include "MVKImage.h"
 #include "MVKBuffer.h"
 #include "MVKDeviceMemory.h"
@@ -3393,6 +3393,9 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 					[MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
 				triDesc.triangleCount = primCount;
 				triDesc.vertexStride = geom->geometry.triangles.vertexStride;
+				triDesc.intersectionFunctionTableOffset = g;
+				triDesc.primitiveDataStride = sizeof(uint32_t);
+				triDesc.primitiveDataElementSize = sizeof(uint32_t);
 				triDesc.opaque = (geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
 				[geomDescs addObject: triDesc];
 			} else if (geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
@@ -3400,6 +3403,9 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 					[MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
 				aabbDesc.boundingBoxCount = primCount;
 				aabbDesc.boundingBoxStride = geom->geometry.aabbs.stride;
+				aabbDesc.intersectionFunctionTableOffset = g;
+				aabbDesc.primitiveDataStride = sizeof(uint32_t);
+				aabbDesc.primitiveDataElementSize = sizeof(uint32_t);
 				aabbDesc.opaque = (geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
 				[geomDescs addObject: aabbDesc];
 			}
@@ -4888,4 +4894,3 @@ MVK_PUBLIC_SYMBOL PFN_vkVoidFunction vk_icdGetPhysicalDeviceProcAddr(
 	MVKTraceVulkanCallEnd();
 	return func;
 }
-

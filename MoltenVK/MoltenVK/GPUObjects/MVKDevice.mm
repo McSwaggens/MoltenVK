@@ -3569,10 +3569,19 @@ void MVKPhysicalDevice::initExtensions() {
 	}
 
     // gpuAddress requires Tier2 argument buffer support (per feedback from Apple engineers).
-    if (_metalFeatures.argumentBuffersTier < MTLArgumentBuffersTier2) {
+	if (_metalFeatures.argumentBuffersTier < MTLArgumentBuffersTier2) {
 		pWritableExtns->vk_KHR_buffer_device_address.enabled = false;
 		pWritableExtns->vk_EXT_buffer_device_address.enabled = false;
 	}
+
+	const bool supportsVulkanRayTracing =
+		_gpuCapabilities.supportsRayTracing &&
+		pWritableExtns->vk_KHR_buffer_device_address.enabled &&
+		pWritableExtns->vk_KHR_deferred_host_operations.enabled &&
+		pWritableExtns->vk_KHR_spirv_1_4.enabled;
+	pWritableExtns->vk_KHR_acceleration_structure.enabled = supportsVulkanRayTracing;
+	pWritableExtns->vk_KHR_ray_query.enabled = supportsVulkanRayTracing;
+	pWritableExtns->vk_KHR_ray_tracing_pipeline.enabled = supportsVulkanRayTracing;
 
 	if (!_gpuCapabilities.isAppleGPU) {
 		pWritableExtns->vk_AMD_shader_image_load_store_lod.enabled = false;
@@ -4322,6 +4331,8 @@ MVKQueryPool* MVKDevice::createQueryPool(const VkQueryPoolCreateInfo* pCreateInf
 				return new MVKOcclusionQueryPool(this, pCreateInfo);
 			case VK_QUERY_TYPE_TIMESTAMP:
 				return new MVKTimestampQueryPool(this, pCreateInfo);
+			case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
+				return new MVKAccelerationStructureQueryPool(this, pCreateInfo);
 			case VK_QUERY_TYPE_PIPELINE_STATISTICS:
 				return new MVKPipelineStatisticsQueryPool(this, pCreateInfo);
 			default:

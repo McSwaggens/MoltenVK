@@ -21,6 +21,43 @@
 #include "MVKAccelerationStructure.h"
 #include "MVKPipeline.h"
 #include "MVKCommandPool.h"
+#include <vector>
+
+
+static std::vector<uint32_t> mvkDecodeShaderBindingTable(MVKDevice* device, const VkStridedDeviceAddressRegionKHR& region) {
+	std::vector<uint32_t> groupIndices;
+	if (!region.deviceAddress || !region.size || !region.stride) { return groupIndices; }
+
+	uint32_t recordCount = static_cast<uint32_t>(region.size / region.stride);
+	if (!recordCount) { return groupIndices; }
+
+	VkDeviceSize baseOffset = 0;
+	id<MTLBuffer> mtlBuffer = device->getMTLBufferForDeviceAddress(region.deviceAddress, &baseOffset);
+	const uint8_t* bufferContents = mtlBuffer ? (const uint8_t*)mtlBuffer.contents : nullptr;
+	if (!bufferContents || mtlBuffer.length < baseOffset) { return groupIndices; }
+
+	groupIndices.resize(recordCount, 0);
+	const uint8_t* sbtData = bufferContents + baseOffset;
+	size_t availableBytes = mtlBuffer.length - baseOffset;
+	for (uint32_t i = 0; i < recordCount; i++) {
+		size_t recordOffset = i * region.stride;
+		if (recordOffset + sizeof(uint32_t) > availableBytes) { break; }
+		memcpy(&groupIndices[i], sbtData + recordOffset, sizeof(uint32_t));
+	}
+	return groupIndices;
+}
+
+static void mvkBindShaderBindingTable(MVKCommandEncoder* cmdEncoder,
+									  id<MTLComputeCommandEncoder> mtlEncoder,
+									  uint32_t bufferIndex,
+									  const std::vector<uint32_t>& groupIndices) {
+	uint32_t zero = 0;
+	if (groupIndices.empty()) {
+		cmdEncoder->setComputeBytes(mtlEncoder, &zero, sizeof(zero), bufferIndex);
+	} else {
+		cmdEncoder->setComputeBytes(mtlEncoder, groupIndices.data(), groupIndices.size() * sizeof(uint32_t), bufferIndex);
+	}
+}
 
 
 #pragma mark -
@@ -57,7 +94,7 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 	// Bind the intersection function table if present (for AABB geometry).
 	if (rtPipeline->getMTLIntersectionFunctionTable()) {
 		[mtlEncoder setIntersectionFunctionTable: rtPipeline->getMTLIntersectionFunctionTable()
-									 atBufferIndex: 30];  // matches [[buffer(30)]] in the kernel
+									 atBufferIndex: MVKRayTracingPipeline::kIntersectionFunctionTableBufferIndex];
 
 		// Bind descriptor set resources to the intersection function table
 		// so the intersection function can access images/buffers.
@@ -75,16 +112,21 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 		}
 	}
 
-	// Make acceleration structures resident. Skip if none exist.
-	auto& allAS = cmdEncoder->getDevice()->getAccelerationStructures();
-	if (!allAS.empty()) {
-		for (auto* as : allAS) {
-			if (as && as->getMTLAccelerationStructure()) {
-				[mtlEncoder useResource: as->getMTLAccelerationStructure() usage: MTLResourceUsageRead];
-			}
-		}
+	if (rtPipeline->needsMissShaderBindingTable()) {
+		mvkBindShaderBindingTable(cmdEncoder, mtlEncoder,
+								  MVKRayTracingPipeline::kMissSBTBufferIndex,
+								  mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _missSBT));
 	}
-
+	if (rtPipeline->needsHitShaderBindingTable()) {
+		mvkBindShaderBindingTable(cmdEncoder, mtlEncoder,
+								  MVKRayTracingPipeline::kHitSBTBufferIndex,
+								  mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _hitSBT));
+	}
+	if (rtPipeline->needsCallableShaderBindingTable()) {
+		mvkBindShaderBindingTable(cmdEncoder, mtlEncoder,
+								  MVKRayTracingPipeline::kCallableSBTBufferIndex,
+								  mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _callableSBT));
+	}
 
 	// Dispatch one thread per ray (width x height x depth).
 	// Use dispatchThreads so threads_per_grid is available for gl_LaunchSizeEXT.

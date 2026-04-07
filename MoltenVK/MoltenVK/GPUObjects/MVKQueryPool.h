@@ -230,6 +230,32 @@ protected:
 
 
 #pragma mark -
+#pragma mark MVKAccelerationStructureQueryPool
+
+/** A Vulkan query pool for acceleration structure compacted size queries. */
+class MVKAccelerationStructureQueryPool : public MVKQueryPool {
+
+public:
+	id<MTLBuffer> getMTLQueryResultsBuffer() const { return _mtlQueryResultsBuffer; }
+	NSUInteger getQueryOffset(uint32_t query) const { return query * kMVKQuerySlotSizeInBytes; }
+	void resetResults(uint32_t firstQuery, uint32_t queryCount, MVKCommandEncoder* cmdEncoder) override;
+
+#pragma mark Construction
+
+	MVKAccelerationStructureQueryPool(MVKDevice* device, const VkQueryPoolCreateInfo* pCreateInfo);
+	~MVKAccelerationStructureQueryPool() override;
+
+protected:
+	void propagateDebugName() override;
+	NSData* getQuerySourceData(uint32_t firstQuery, uint32_t queryCount) override;
+	id<MTLBuffer> getResultBuffer(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount, NSUInteger& offset) override;
+	id<MTLComputeCommandEncoder> encodeComputeCopyResults(MVKCommandEncoder* cmdEncoder, uint32_t firstQuery, uint32_t queryCount, uint32_t index) override;
+
+	id<MTLBuffer> _mtlQueryResultsBuffer = nil;
+};
+
+
+#pragma mark -
 #pragma mark MVKPipelineStatisticsQueryPool
 
 /** A Vulkan query pool for a query pool type that tracks pipeline statistics. */
@@ -255,4 +281,3 @@ public:
 protected:
 	void propagateDebugName() override {}
 };
-

@@ -19,6 +19,7 @@
 #pragma once
 
 #include "MVKDevice.h"
+#include <vector>
 
 #import <Metal/Metal.h>
 
@@ -39,6 +40,15 @@ public:
 
 	/** Sets the Metal acceleration structure (called during build). */
 	void setMTLAccelerationStructure(id<MTLAccelerationStructure> mtlAS) { _mtlAccelerationStructure = mtlAS; }
+
+	/** Retains a Metal buffer that must remain alive for this acceleration structure. */
+	void retainBuffer(id<MTLBuffer> mtlBuffer);
+
+	/** Releases all retained Metal buffers owned by this acceleration structure. */
+	void clearRetainedBuffers();
+
+	/** Shares retained Metal buffers from another acceleration structure copy source. */
+	void copyRetainedBuffersFrom(MVKAccelerationStructure* srcAS);
 
 	/** Returns the device address for this acceleration structure. */
 	VkDeviceAddress getDeviceAddress();
@@ -61,4 +71,5 @@ protected:
 	VkBuffer _buffer;
 	VkDeviceSize _offset;
 	VkDeviceSize _size;
+	std::vector<id<MTLBuffer>> _retainedMTLBuffers;
 };
