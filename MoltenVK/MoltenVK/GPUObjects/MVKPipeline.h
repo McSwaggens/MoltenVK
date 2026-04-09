@@ -468,9 +468,10 @@ protected:
 class MVKRayTracingPipeline : public MVKPipeline {
 
 public:
-	static constexpr uint32_t kMissSBTBufferIndex = 27;
-	static constexpr uint32_t kHitSBTBufferIndex = 28;
-	static constexpr uint32_t kCallableSBTBufferIndex = 29;
+	static constexpr uint32_t kMissSBTBufferIndex = 26;
+	static constexpr uint32_t kHitSBTBufferIndex = 27;
+	static constexpr uint32_t kCallableSBTBufferIndex = 28;
+	static constexpr uint32_t kInstanceSBTOffsetBufferIndex = 29;
 	static constexpr uint32_t kIntersectionFunctionTableBufferIndex = 30;
 
 	/** Returns the compiled Metal compute pipeline state for the ray generation shader. */
@@ -478,6 +479,8 @@ public:
 
 	/** Returns the intersection function table, or nil if no intersection shader. */
 	id<MTLIntersectionFunctionTable> getMTLIntersectionFunctionTable() { return _mtlIntersectionFunctionTable; }
+	bool usesIntersectionFunctionTable() const { return _mtlIntersectionFunctionHandle != nil; }
+	void updateMTLIntersectionFunctionTable(const std::vector<uint32_t>& hitGroupIndices);
 
 	/** Returns the threadgroup size for dispatch. */
 	const MTLSize& getThreadgroupSize() const { return _mtlThreadgroupSize; }
@@ -509,10 +512,13 @@ protected:
 
 	id<MTLComputePipelineState> _mtlPipelineState = nil;
 	id<MTLIntersectionFunctionTable> _mtlIntersectionFunctionTable = nil;
+	id<MTLFunctionHandle> _mtlIntersectionFunctionHandle = nil;
 	MTLSize _mtlThreadgroupSize = {1, 1, 1};
 	MVKSmallVector<VkRayTracingShaderGroupCreateInfoKHR> _shaderGroups;
 	uint32_t _shaderGroupCount = 0;
 	uint32_t _maxRecursionDepth = 1;
+	uint32_t _mtlIntersectionFunctionTableCount = 0;
+	MTLIntersectionFunctionSignature _mtlIntersectionFunctionSignature = MTLIntersectionFunctionSignatureNone;
 	bool _needsMissShaderBindingTable = false;
 	bool _needsHitShaderBindingTable = false;
 	bool _needsCallableShaderBindingTable = false;

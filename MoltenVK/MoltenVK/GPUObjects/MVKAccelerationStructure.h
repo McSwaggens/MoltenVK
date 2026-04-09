@@ -19,6 +19,8 @@
 #pragma once
 
 #include "MVKDevice.h"
+#include <mutex>
+#include <unordered_map>
 #include <vector>
 
 #import <Metal/Metal.h>
@@ -39,7 +41,7 @@ public:
 	id<MTLAccelerationStructure> getMTLAccelerationStructure() { return _mtlAccelerationStructure; }
 
 	/** Sets the Metal acceleration structure (called during build). */
-	void setMTLAccelerationStructure(id<MTLAccelerationStructure> mtlAS) { _mtlAccelerationStructure = mtlAS; }
+	void setMTLAccelerationStructure(id<MTLAccelerationStructure> mtlAS);
 
 	/** Retains a Metal buffer that must remain alive for this acceleration structure. */
 	void retainBuffer(id<MTLBuffer> mtlBuffer);
@@ -59,6 +61,11 @@ public:
 	/** Returns the size of this acceleration structure. */
 	VkDeviceSize getSize() { return _size; }
 
+	id<MTLBuffer> getInstanceShaderBindingTableOffsetBuffer() { return _instanceShaderBindingTableOffsetBuffer; }
+	void setInstanceShaderBindingTableOffsetBuffer(id<MTLBuffer> mtlBuffer);
+
+	static MVKAccelerationStructure* getMVKAccelerationStructure(id<MTLAccelerationStructure> mtlAS);
+
 	MVKAccelerationStructure(MVKDevice* device, const VkAccelerationStructureCreateInfoKHR* pCreateInfo);
 
 	~MVKAccelerationStructure() override;
@@ -67,9 +74,13 @@ protected:
 	void propagateDebugName() override {}
 
 	id<MTLAccelerationStructure> _mtlAccelerationStructure = nil;
+	id<MTLBuffer> _instanceShaderBindingTableOffsetBuffer = nil;
 	VkAccelerationStructureTypeKHR _type;
 	VkBuffer _buffer;
 	VkDeviceSize _offset;
 	VkDeviceSize _size;
 	std::vector<id<MTLBuffer>> _retainedMTLBuffers;
+
+	static std::mutex _mtlAccelerationStructureMapLock;
+	static std::unordered_map<uint64_t, MVKAccelerationStructure*> _mtlAccelerationStructureMap;
 };

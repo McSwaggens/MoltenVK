@@ -3394,8 +3394,8 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 				triDesc.triangleCount = primCount;
 				triDesc.vertexStride = geom->geometry.triangles.vertexStride;
 				triDesc.intersectionFunctionTableOffset = g;
-				triDesc.primitiveDataStride = sizeof(uint32_t);
-				triDesc.primitiveDataElementSize = sizeof(uint32_t);
+				triDesc.primitiveDataStride = sizeof(uint32_t) * 2;
+				triDesc.primitiveDataElementSize = sizeof(uint32_t) * 2;
 				triDesc.opaque = (geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
 				[geomDescs addObject: triDesc];
 			} else if (geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
@@ -3404,8 +3404,8 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 				aabbDesc.boundingBoxCount = primCount;
 				aabbDesc.boundingBoxStride = geom->geometry.aabbs.stride;
 				aabbDesc.intersectionFunctionTableOffset = g;
-				aabbDesc.primitiveDataStride = sizeof(uint32_t);
-				aabbDesc.primitiveDataElementSize = sizeof(uint32_t);
+				aabbDesc.primitiveDataStride = sizeof(uint32_t) * 2;
+				aabbDesc.primitiveDataElementSize = sizeof(uint32_t) * 2;
 				aabbDesc.opaque = (geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
 				[geomDescs addObject: aabbDesc];
 			}
@@ -3417,10 +3417,45 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 		if (pBuildInfo->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
 			primDesc.usage |= MTLAccelerationStructureUsageRefit;
 		}
+		if (@available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
+			primDesc.usage |= MTLAccelerationStructureUsageExtendedLimits;
+		}
+
+		// Allocate a small dummy primitive data buffer for each geometry descriptor so
+		// Metal includes per-primitive data storage in its size estimate. Without a
+		// buffer, Metal may ignore primitiveDataStride/primitiveDataElementSize.
+		NSUInteger totalPrimitiveDataSize = 0;
+		for (uint32_t g = 0; g < geomCount; g++) {
+			uint32_t primCount = pMaxPrimitiveCounts[g];
+			totalPrimitiveDataSize += primCount * sizeof(uint32_t) * 2;
+		}
+		id<MTLBuffer> dummyPrimBuf = nil;
+		if (totalPrimitiveDataSize > 0) {
+			dummyPrimBuf = [mtlDev newBufferWithLength: totalPrimitiveDataSize options: MTLResourceStorageModePrivate];
+			NSUInteger offset = 0;
+			for (NSUInteger g = 0; g < geomDescs.count; g++) {
+				id desc = geomDescs[g];
+				if ([desc isKindOfClass: [MTLAccelerationStructureTriangleGeometryDescriptor class]]) {
+					auto* triDesc = (MTLAccelerationStructureTriangleGeometryDescriptor*)desc;
+					triDesc.primitiveDataBuffer = dummyPrimBuf;
+					triDesc.primitiveDataBufferOffset = offset;
+					offset += triDesc.triangleCount * sizeof(uint32_t) * 2;
+				} else if ([desc isKindOfClass: [MTLAccelerationStructureBoundingBoxGeometryDescriptor class]]) {
+					auto* aabbDesc = (MTLAccelerationStructureBoundingBoxGeometryDescriptor*)desc;
+					aabbDesc.primitiveDataBuffer = dummyPrimBuf;
+					aabbDesc.primitiveDataBufferOffset = offset;
+					offset += aabbDesc.boundingBoxCount * sizeof(uint32_t) * 2;
+				}
+			}
+		}
 
 		MTLAccelerationStructureSizes sizes = [mtlDev accelerationStructureSizesWithDescriptor: primDesc];
+		[dummyPrimBuf release];
 		pSizeInfo->accelerationStructureSize = sizes.accelerationStructureSize;
-		pSizeInfo->buildScratchSize = sizes.buildScratchBufferSize;
+		// Metal may underestimate scratch requirements when primitiveDataBuffer is set.
+		// Add the total primitive data size to compensate for the BVH build overhead of
+		// processing per-primitive data, which is not fully reflected in the query result.
+		pSizeInfo->buildScratchSize = sizes.buildScratchBufferSize + totalPrimitiveDataSize;
 		pSizeInfo->updateScratchSize = sizes.refitScratchBufferSize;
 	} else {
 		// Top-level (instance) acceleration structure
@@ -3439,6 +3474,9 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 		}
 		if (pBuildInfo->flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
 			instDesc.usage |= MTLAccelerationStructureUsageRefit;
+		}
+		if (@available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
+			instDesc.usage |= MTLAccelerationStructureUsageExtendedLimits;
 		}
 
 		MTLAccelerationStructureSizes sizes = [mtlDev accelerationStructureSizesWithDescriptor: instDesc];

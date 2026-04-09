@@ -21,6 +21,7 @@
 #include "MVKAccelerationStructure.h"
 #include "MVKPipeline.h"
 #include "MVKCommandPool.h"
+#include "MVKDescriptorSet.h"
 #include <vector>
 
 
@@ -91,22 +92,75 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 
 	[mtlEncoder setComputePipelineState: rtPipeline->getMTLComputePipelineState()];
 
+	std::vector<uint32_t> hitGroupIndices;
+	if (_hitSBT.deviceAddress && _hitSBT.size && _hitSBT.stride &&
+		(rtPipeline->needsHitShaderBindingTable() || rtPipeline->usesIntersectionFunctionTable())) {
+		hitGroupIndices = mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _hitSBT);
+	}
+
+	id<MTLBuffer> instanceSBTOffsetBuffer = nil;
+	auto& vk = cmdEncoder->getState().vkCompute();
+	if (vk._layout) {
+		for (uint32_t s = 0; s < vk._layout->getDescriptorSetCount(); s++) {
+			MVKDescriptorSet* set = vk._descriptorSets[s];
+			const MVKDescriptorSetLayout* setLayout = vk._layout->getDescriptorSetLayout(s);
+			if (!set || !setLayout || !set->cpuBuffer) { continue; }
+
+			for (const auto& binding : setLayout->bindings()) {
+				if (binding.descriptorType != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR ||
+					binding.cpuLayout != MVKDescriptorCPULayout::OneID ||
+					!binding.descriptorCount) {
+					continue;
+				}
+
+				auto* desc = reinterpret_cast<id<MTLAccelerationStructure>*>(set->cpuBuffer + binding.cpuOffset);
+				MVKAccelerationStructure* mvkAS = MVKAccelerationStructure::getMVKAccelerationStructure(desc[0]);
+					if (mvkAS) {
+					instanceSBTOffsetBuffer = mvkAS->getInstanceShaderBindingTableOffsetBuffer();
+
+					// Mark the TLAS and all referenced BLASes for GPU access.
+					// Without useResource, Metal may evict the AS data after the first frame.
+					id<MTLAccelerationStructure> tlasAS = desc[0];
+					if (tlasAS) {
+						[mtlEncoder useResource: tlasAS usage: MTLResourceUsageRead];
+					}
+					for (auto* as : cmdEncoder->getDevice()->getAccelerationStructures()) {
+						if ((as->getType() == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
+							 as->getType() == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR) &&
+							as->getMTLAccelerationStructure()) {
+							[mtlEncoder useResource: as->getMTLAccelerationStructure() usage: MTLResourceUsageRead];
+						}
+					}
+
+					break;
+				}
+			}
+
+			if (instanceSBTOffsetBuffer) { break; }
+		}
+	}
+	[mtlEncoder setBuffer: instanceSBTOffsetBuffer
+				   offset: 0
+				  atIndex: MVKRayTracingPipeline::kInstanceSBTOffsetBufferIndex];
+
 	// Bind the intersection function table if present (for AABB geometry).
-	if (rtPipeline->getMTLIntersectionFunctionTable()) {
-		[mtlEncoder setIntersectionFunctionTable: rtPipeline->getMTLIntersectionFunctionTable()
+	if (rtPipeline->usesIntersectionFunctionTable()) {
+		rtPipeline->updateMTLIntersectionFunctionTable(hitGroupIndices);
+		id<MTLIntersectionFunctionTable> ift = rtPipeline->getMTLIntersectionFunctionTable();
+		if (ift) {
+			[mtlEncoder setIntersectionFunctionTable: ift
 									 atBufferIndex: MVKRayTracingPipeline::kIntersectionFunctionTableBufferIndex];
 
-		// Bind descriptor set resources to the intersection function table
-		// so the intersection function can access images/buffers.
-		auto& vk = cmdEncoder->getState().vkCompute();
-		if (vk._layout) {
-			for (uint32_t s = 0; s < vk._layout->getDescriptorSetCount(); s++) {
-				MVKDescriptorSet* set = vk._descriptorSets[s];
-				if (set && set->gpuBufferObject) {
-					[rtPipeline->getMTLIntersectionFunctionTable()
-						setBuffer: set->gpuBufferObject
-						   offset: set->gpuBufferOffset
-						  atIndex: s];
+			// Bind descriptor set resources to the intersection function table
+			// so the intersection function can access images/buffers.
+			if (vk._layout) {
+				for (uint32_t s = 0; s < vk._layout->getDescriptorSetCount(); s++) {
+					MVKDescriptorSet* set = vk._descriptorSets[s];
+					if (set && set->gpuBufferObject) {
+						[ift setBuffer: set->gpuBufferObject
+							   offset: set->gpuBufferOffset
+							  atIndex: s];
+					}
 				}
 			}
 		}
@@ -120,7 +174,7 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 	if (rtPipeline->needsHitShaderBindingTable()) {
 		mvkBindShaderBindingTable(cmdEncoder, mtlEncoder,
 								  MVKRayTracingPipeline::kHitSBTBufferIndex,
-								  mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _hitSBT));
+								  hitGroupIndices);
 	}
 	if (rtPipeline->needsCallableShaderBindingTable()) {
 		mvkBindShaderBindingTable(cmdEncoder, mtlEncoder,

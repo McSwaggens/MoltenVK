@@ -24,6 +24,11 @@
 #include "MVKQueryPool.h"
 #include <unordered_map>
 
+struct MVKRTPrimitiveData {
+	uint32_t geometryIndex;
+	uint32_t primitiveIndex;
+};
+
 #pragma mark -
 #pragma mark MVKCmdBuildAccelerationStructures
 
@@ -72,14 +77,14 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 		auto makePrimitiveDataBuffer = [&](uint32_t geometryIndex, uint32_t primitiveCount) -> id<MTLBuffer> {
 			if (primitiveCount == 0) { return nil; }
 
-			NSUInteger byteCount = (NSUInteger)primitiveCount * sizeof(uint32_t);
+			NSUInteger byteCount = (NSUInteger)primitiveCount * sizeof(MVKRTPrimitiveData);
 			id<MTLBuffer> primitiveDataBuffer = [cmdEncoder->getMTLDevice() newBufferWithLength: byteCount
 			                                                                             options: MTLResourceStorageModeShared];
 			if (!primitiveDataBuffer) { return nil; }
 
-			uint32_t* primitiveData = (uint32_t*)primitiveDataBuffer.contents;
+			auto* primitiveData = (MVKRTPrimitiveData*)primitiveDataBuffer.contents;
 			for (uint32_t primitiveIndex = 0; primitiveIndex < primitiveCount; primitiveIndex++) {
-				primitiveData[primitiveIndex] = geometryIndex;
+				primitiveData[primitiveIndex] = { geometryIndex, primitiveIndex };
 			}
 
 			dstAS->retainBuffer(primitiveDataBuffer);
@@ -102,10 +107,11 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					MTLAccelerationStructureTriangleGeometryDescriptor* triDesc =
 						[MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
 
-					// Vertex data — apply primitiveOffset and firstVertex from build range info
+					// Vertex data is addressed from the bound vertex buffer plus firstVertex.
+					// primitiveOffset applies to the index stream, not the vertex stream.
 					VkDeviceSize vtxOffset = 0;
 					if (triData.vertexData.deviceAddress) {
-						VkDeviceAddress vtxAddr = triData.vertexData.deviceAddress + rangeInfo.primitiveOffset;
+						VkDeviceAddress vtxAddr = triData.vertexData.deviceAddress;
 						triDesc.vertexBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(vtxAddr, &vtxOffset);
 						triDesc.vertexBufferOffset = (NSUInteger)(vtxOffset + rangeInfo.firstVertex * triData.vertexStride);
 					}
@@ -127,8 +133,8 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					if (auto primitiveDataBuffer = makePrimitiveDataBuffer(g, rangeInfo.primitiveCount)) {
 						triDesc.primitiveDataBuffer = primitiveDataBuffer;
 						triDesc.primitiveDataBufferOffset = 0;
-						triDesc.primitiveDataStride = sizeof(uint32_t);
-						triDesc.primitiveDataElementSize = sizeof(uint32_t);
+						triDesc.primitiveDataStride = sizeof(MVKRTPrimitiveData);
+						triDesc.primitiveDataElementSize = sizeof(MVKRTPrimitiveData);
 					}
 					triDesc.opaque = (geom.flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
 					[geomDescs addObject: triDesc];
@@ -151,8 +157,8 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					if (auto primitiveDataBuffer = makePrimitiveDataBuffer(g, rangeInfo.primitiveCount)) {
 						aabbDesc.primitiveDataBuffer = primitiveDataBuffer;
 						aabbDesc.primitiveDataBufferOffset = 0;
-						aabbDesc.primitiveDataStride = sizeof(uint32_t);
-						aabbDesc.primitiveDataElementSize = sizeof(uint32_t);
+						aabbDesc.primitiveDataStride = sizeof(MVKRTPrimitiveData);
+						aabbDesc.primitiveDataElementSize = sizeof(MVKRTPrimitiveData);
 					}
 					aabbDesc.opaque = (geom.flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
 
@@ -168,6 +174,9 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 			}
 			if (bi.geometryInfo.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
 				primDesc.usage |= MTLAccelerationStructureUsageRefit;
+			}
+			if (@available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
+				primDesc.usage |= MTLAccelerationStructureUsageExtendedLimits;
 			}
 
 			// Scratch buffer
@@ -240,6 +249,9 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					const MVKMTLBufferAllocation* mtlInstAlloc = cmdEncoder->getTempMTLBuffer(mtlInstSize);
 					id<MTLBuffer> mtlInstBuf = mtlInstAlloc->_mtlBuffer;
 					NSUInteger mtlInstOffset = mtlInstAlloc->_offset;
+					id<MTLBuffer> sbtOffsetBuffer = [cmdEncoder->getMTLDevice() newBufferWithLength: sizeof(uint32_t) * instanceCount
+					                                                                          options: MTLResourceStorageModeShared];
+					uint32_t* sbtOffsets = sbtOffsetBuffer ? (uint32_t*)sbtOffsetBuffer.contents : nullptr;
 
 					auto* mtlInsts = (MTLAccelerationStructureUserIDInstanceDescriptor*)((uint8_t*)mtlInstAlloc->getContents());
 					for (uint32_t j = 0; j < instanceCount; j++) {
@@ -282,6 +294,9 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 
 						mtlInsts[j].mask = vkInst->mask;
 						mtlInsts[j].intersectionFunctionTableOffset = vkInst->instanceShaderBindingTableRecordOffset;
+						if (sbtOffsets) {
+							sbtOffsets[j] = vkInst->instanceShaderBindingTableRecordOffset;
+						}
 
 						// Map instanceCustomIndex to Metal's userID
 						mtlInsts[j].userID = vkInst->instanceCustomIndex;
@@ -293,6 +308,9 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 
 					instDesc.instanceDescriptorBuffer = mtlInstBuf;
 					instDesc.instanceDescriptorBufferOffset = mtlInstOffset;
+					dstAS->setInstanceShaderBindingTableOffsetBuffer(sbtOffsetBuffer);
+					dstAS->retainBuffer(sbtOffsetBuffer);
+					[sbtOffsetBuffer release];
 				}
 			}
 
@@ -302,6 +320,9 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 			}
 			if (bi.geometryInfo.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
 				instDesc.usage |= MTLAccelerationStructureUsageRefit;
+			}
+			if (@available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
+				instDesc.usage |= MTLAccelerationStructureUsageExtendedLimits;
 			}
 
 			// Scratch buffer
