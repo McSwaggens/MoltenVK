@@ -3069,6 +3069,68 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		}
 		return trimString(line.substr(nameStart, nameEnd - nameStart));
 	};
+	// Merges spvDescriptorSetBuffer0 members from sourceMSL into raygenMSL.
+	// Members matched by [[id(N)]]: padding placeholders are replaced with real members,
+	// missing members are appended. If memberRenames is provided, records name mismatches
+	// between existing non-padding members for later fixup by the caller.
+	auto mergeDescriptorStructIntoRaygen = [&](
+			const std::string& sourceMSL,
+			std::vector<std::pair<std::string, std::string>>* memberRenames) {
+		auto srcStructStart = sourceMSL.find("struct spvDescriptorSetBuffer0");
+		if (srcStructStart == std::string::npos) { return; }
+		auto srcStructBodyStart = sourceMSL.find('{', srcStructStart);
+		auto srcStructEnd = sourceMSL.find("};", srcStructStart);
+		if (srcStructBodyStart == std::string::npos || srcStructEnd == std::string::npos) { return; }
+		std::string srcMembers = sourceMSL.substr(srcStructBodyStart + 1, srcStructEnd - srcStructBodyStart - 1);
+
+		auto raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
+		auto raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
+		if (raygenStructEnd == std::string::npos) {
+			// Raygen MSL has no descriptor set struct. Insert the full struct from the source.
+			std::string fullStruct = sourceMSL.substr(srcStructStart, srcStructEnd - srcStructStart + 2);
+			auto insertPos = raygenMSL.find("kernel void");
+			if (insertPos == std::string::npos) insertPos = raygenMSL.find("static void");
+			if (insertPos != std::string::npos) {
+				raygenMSL.insert(insertPos, fullStruct + "\n\n");
+			}
+			raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
+			raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
+		}
+		if (raygenStructEnd == std::string::npos) { return; }
+
+		std::istringstream ss(srcMembers);
+		std::string line;
+		while (std::getline(ss, line)) {
+			auto idPos = line.find("[[id(");
+			if (idPos == std::string::npos) continue;
+			auto idNumStart = idPos + 5;
+			auto idNumEnd = line.find(")]]", idNumStart);
+			if (idNumEnd == std::string::npos) continue;
+			std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
+			std::string memberName = getStructMemberName(line, idPos);
+			if (memberName.empty()) continue;
+
+			auto existingId = raygenMSL.find(idStr, raygenStructPos);
+			if (existingId != std::string::npos && existingId < raygenStructEnd) {
+				auto existingLineStart = raygenMSL.rfind('\n', existingId);
+				if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
+				auto existingLineEnd = raygenMSL.find('\n', existingId);
+				std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
+				if (existingLine.find("_pad") != std::string::npos) {
+					raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
+					raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
+				} else if (memberRenames) {
+					std::string existingMemberName = getStructMemberName(existingLine, existingLine.find("[[id("));
+					if (!existingMemberName.empty() && existingMemberName != memberName) {
+						memberRenames->push_back({memberName, existingMemberName});
+					}
+				}
+			} else if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
+				raygenMSL.insert(raygenStructEnd, line + "\n");
+				raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
+			}
+		}
+	};
 	auto normalizeHelperSignature = [&](const std::string& signature, const std::string& helperName) -> std::string {
 		auto parenPos = signature.find('(');
 		auto closePos = signature.rfind(')');
@@ -3147,76 +3209,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		targetVec->push_back(funcName);
 		stageToFuncName[i] = funcName;
 		std::vector<std::pair<std::string, std::string>> helperMemberRenames;
-
-		// Merge descriptor set struct members from the helper shader into the raygen's struct.
-		// The raygen and hit shaders may reference different bindings in the same set.
-		// Each shader has its own [[id(N)]] assignments, so we match by member name.
-		auto helperStructStart = msl.find("struct spvDescriptorSetBuffer0");
-		if (helperStructStart != std::string::npos) {
-			auto helperStructBodyStart = msl.find('{', helperStructStart);
-			auto helperStructEnd = msl.find("};", helperStructStart);
-			if (helperStructBodyStart != std::string::npos && helperStructEnd != std::string::npos) {
-				std::string helperMembers = msl.substr(helperStructBodyStart + 1, helperStructEnd - helperStructBodyStart - 1);
-				auto raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
-				auto raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
-				if (raygenStructEnd == std::string::npos) {
-					// Raygen MSL has no descriptor set struct. Insert the full struct from the helper.
-					std::string fullStruct = msl.substr(helperStructStart, helperStructEnd - helperStructStart + 2);
-					auto insertPos = raygenMSL.find("kernel void");
-					if (insertPos == std::string::npos) insertPos = raygenMSL.find("static void");
-					if (insertPos != std::string::npos) {
-						raygenMSL.insert(insertPos, fullStruct + "\n\n");
-					}
-					raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
-					raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
-				}
-				if (raygenStructEnd != std::string::npos) {
-					// Merge members: add helper struct members that aren't in the raygen struct.
-					// With pad_argument_buffer_resources=true, match by [[id(N)]] value:
-					// if the raygen has a padding placeholder at the same id, replace it.
-					std::istringstream ss(helperMembers);
-					std::string line;
-					while (std::getline(ss, line)) {
-						auto idPos = line.find("[[id(");
-						if (idPos == std::string::npos) continue;
-						// Extract the id value
-						auto idNumStart = idPos + 5;
-						auto idNumEnd = line.find(")]]", idNumStart);
-						if (idNumEnd == std::string::npos) continue;
-						std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
-
-						std::string memberName = getStructMemberName(line, idPos);
-						if (memberName.empty()) continue;
-
-						// Check if a member with the same id already exists in the raygen struct
-						auto existingId = raygenMSL.find(idStr, raygenStructPos);
-						if (existingId != std::string::npos && existingId < raygenStructEnd) {
-							// Check if existing member is a padding placeholder (_mN_pad)
-							auto existingLineStart = raygenMSL.rfind('\n', existingId);
-							if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
-							auto existingLineEnd = raygenMSL.find('\n', existingId);
-							std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
-							std::string existingMemberName = getStructMemberName(existingLine, existingLine.find("[[id("));
-							if (existingLine.find("_pad") != std::string::npos) {
-								// Replace padding placeholder with actual member
-								raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
-								raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
-							} else if (!existingMemberName.empty() && existingMemberName != memberName) {
-								helperMemberRenames.push_back({memberName, existingMemberName});
-							}
-							// If it's a real member (not padding), skip — it's already there
-						} else if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
-							// Member doesn't exist at all — add it
-							raygenMSL.insert(raygenStructEnd, line + "\n");
-							raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
-						}
-					}
-
-					// With pad_argument_buffer_resources=true, [[id(N)]] values already
-					// match Vulkan binding numbers and must not be renumbered.
-				}
-			}
-		}
+		mergeDescriptorStructIntoRaygen(msl, &helperMemberRenames);
 		for (auto& [oldName, newName] : helperMemberRenames) {
 			replaceWholeIdentifier(msl, oldName, newName);
 		}
@@ -3713,57 +3706,12 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			std::string msl = getMSLSource(&stage, spv::ExecutionModelIntersectionKHR, "_mvk_isect");
 			resolveFunctionConstants(msl, stage.pSpecializationInfo);
 			if (msl.empty()) continue;
-			{
-				FILE* file = fopen("/private/tmp/rt-isect-raw.metal", "wb");
-				if (file) {
-					fwrite(msl.data(), 1, msl.size(), file);
-					fclose(file);
-				}
-			}
 			intersectionFunc = "_mvk_isect";
 
 			// Merge intersection shader's descriptor struct members into the raygen's
 			// descriptor struct, replacing padding placeholders with real members.
 			// This must happen before extracting the merged struct for the intersection function.
-			auto isectStructStart = msl.find("struct spvDescriptorSetBuffer0");
-			if (isectStructStart != std::string::npos) {
-				auto isectStructBodyStart = msl.find('{', isectStructStart);
-				auto isectStructEnd = msl.find("};", isectStructStart);
-				if (isectStructBodyStart != std::string::npos && isectStructEnd != std::string::npos) {
-					std::string isectMembers = msl.substr(isectStructBodyStart + 1, isectStructEnd - isectStructBodyStart - 1);
-					auto raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
-					auto raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
-					if (raygenStructEnd != std::string::npos) {
-						std::istringstream ss(isectMembers);
-						std::string line;
-						while (std::getline(ss, line)) {
-							auto idPos = line.find("[[id(");
-							if (idPos == std::string::npos) continue;
-							auto idNumStart = idPos + 5;
-							auto idNumEnd = line.find(")]]", idNumStart);
-							if (idNumEnd == std::string::npos) continue;
-							std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
-							auto existingId = raygenMSL.find(idStr, raygenStructPos);
-							if (existingId != std::string::npos && existingId < raygenStructEnd) {
-								auto existingLineStart = raygenMSL.rfind('\n', existingId);
-								if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
-								auto existingLineEnd = raygenMSL.find('\n', existingId);
-								std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
-								if (existingLine.find("_pad") != std::string::npos) {
-									raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
-									raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
-								}
-							} else {
-								std::string memberName = getStructMemberName(line, idPos);
-								if (!memberName.empty() && raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
-									raygenMSL.insert(raygenStructEnd, line + "\n");
-									raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
-								}
-							}
-						}
-					}
-				}
-			}
+			mergeDescriptorStructIntoRaygen(msl, nullptr);
 
 			auto funcPos = msl.find("_mvk_isect(");
 			if (funcPos == std::string::npos) continue;
@@ -3983,52 +3931,6 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 			isectMSL += funcBody;
 			isectFuncMSL = isectMSL;
-
-			// Merge struct members from intersection shader into raygen struct
-			// (same padding-aware logic as the main helper merge)
-			auto helperStructStart = msl.find("struct spvDescriptorSetBuffer0");
-			if (helperStructStart != std::string::npos) {
-				auto helperStructBodyStart = msl.find('{', helperStructStart);
-				auto helperStructEnd = msl.find("};", helperStructStart);
-				if (helperStructBodyStart != std::string::npos && helperStructEnd != std::string::npos) {
-					std::string helperMembers = msl.substr(helperStructBodyStart + 1, helperStructEnd - helperStructBodyStart - 1);
-					auto raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
-					auto raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
-					if (raygenStructEnd != std::string::npos) {
-						std::istringstream ss(helperMembers);
-						std::string line;
-						while (std::getline(ss, line)) {
-							auto idPos = line.find("[[id(");
-							if (idPos == std::string::npos) continue;
-							auto idNumStart = idPos + 5;
-							auto idNumEnd = line.find(")]]", idNumStart);
-							if (idNumEnd == std::string::npos) continue;
-							std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
-
-							auto nameEnd = line.rfind(' ', idPos - 1);
-							if (nameEnd == std::string::npos) continue;
-							auto nameStart = line.rfind(' ', nameEnd - 1);
-							if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
-							std::string memberName = line.substr(nameStart, nameEnd - nameStart);
-
-							auto existingId = raygenMSL.find(idStr, raygenStructPos);
-							if (existingId != std::string::npos && existingId < raygenStructEnd) {
-								auto existingLineStart = raygenMSL.rfind('\n', existingId);
-								if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
-								auto existingLineEnd = raygenMSL.find('\n', existingId);
-								std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
-								if (existingLine.find("_pad") != std::string::npos) {
-									raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
-									raygenStructEnd = raygenMSL.find("};", raygenStructPos);
-								}
-							} else if (raygenMSL.substr(raygenStructPos, raygenStructEnd - raygenStructPos).find(memberName) == std::string::npos) {
-								raygenMSL.insert(raygenStructEnd, line + "\n");
-								raygenStructEnd = raygenMSL.find("};", raygenStructPos);
-							}
-						}
-					}
-				}
-			}
 			break; // Only one intersection shader
 		}
 	}
@@ -4812,10 +4714,15 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 										   options: isectOpts
 											 error: &isectErr];
 		if (isectErr && !mtlIsectLib) {
-			FILE* file = fopen("/tmp/rt-isect-full.metal", "wb");
-			if (file) {
-				fwrite(fullIsectMSL.data(), 1, fullIsectMSL.size(), file);
-				fclose(file);
+			const char* dumpDir = getMVKConfig().shaderDumpDir;
+			if (dumpDir && *dumpDir) {
+				mkdir(dumpDir, 0755);
+				std::string isectPath = std::string(dumpDir) + "/rt-isect-full.metal";
+				FILE* file = fopen(isectPath.c_str(), "wb");
+				if (file) {
+					fwrite(fullIsectMSL.data(), 1, fullIsectMSL.size(), file);
+					fclose(file);
+				}
 			}
 			reportError(VK_ERROR_INITIALIZATION_FAILED,
 				"RT intersection function compile failed: %s", isectErr.localizedDescription.UTF8String);

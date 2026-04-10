@@ -20,7 +20,6 @@
 #include "MVKFoundation.h"
 #include "MVKOSExtensions.h"
 #include "mvk_deprecated_api.h"
-#include <stdio.h>
 #include <vulkan/vulkan_ios.h>
 #include <vulkan/vulkan_macos.h>
 
