@@ -3722,6 +3722,49 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			}
 			intersectionFunc = "_mvk_isect";
 
+			// Merge intersection shader's descriptor struct members into the raygen's
+			// descriptor struct, replacing padding placeholders with real members.
+			// This must happen before extracting the merged struct for the intersection function.
+			auto isectStructStart = msl.find("struct spvDescriptorSetBuffer0");
+			if (isectStructStart != std::string::npos) {
+				auto isectStructBodyStart = msl.find('{', isectStructStart);
+				auto isectStructEnd = msl.find("};", isectStructStart);
+				if (isectStructBodyStart != std::string::npos && isectStructEnd != std::string::npos) {
+					std::string isectMembers = msl.substr(isectStructBodyStart + 1, isectStructEnd - isectStructBodyStart - 1);
+					auto raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
+					auto raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
+					if (raygenStructEnd != std::string::npos) {
+						std::istringstream ss(isectMembers);
+						std::string line;
+						while (std::getline(ss, line)) {
+							auto idPos = line.find("[[id(");
+							if (idPos == std::string::npos) continue;
+							auto idNumStart = idPos + 5;
+							auto idNumEnd = line.find(")]]", idNumStart);
+							if (idNumEnd == std::string::npos) continue;
+							std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
+							auto existingId = raygenMSL.find(idStr, raygenStructPos);
+							if (existingId != std::string::npos && existingId < raygenStructEnd) {
+								auto existingLineStart = raygenMSL.rfind('\n', existingId);
+								if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
+								auto existingLineEnd = raygenMSL.find('\n', existingId);
+								std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
+								if (existingLine.find("_pad") != std::string::npos) {
+									raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
+									raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
+								}
+							} else {
+								std::string memberName = getStructMemberName(line, idPos);
+								if (!memberName.empty() && raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
+									raygenMSL.insert(raygenStructEnd, line + "\n");
+									raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
+								}
+							}
+						}
+					}
+				}
+			}
+
 			auto funcPos = msl.find("_mvk_isect(");
 			if (funcPos == std::string::npos) continue;
 			auto lineStart = msl.rfind('\n', funcPos);
@@ -3767,6 +3810,33 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			isectMSL += "};\n\n";
 
 			std::string originalParams = msl.substr(sigStart + 1, paramListEnd - sigStart - 1);
+			// Remove compute-kernel-only parameters that are passed via the payload
+			// in intersection functions (e.g., gl_LaunchIDNV [[thread_position_in_grid]],
+			// gl_LaunchSizeNV [[threads_per_grid]]).
+			for (const char* kernelAttr : {"[[thread_position_in_grid]]", "[[threads_per_grid]]"}) {
+				auto attrPos = originalParams.find(kernelAttr);
+				if (attrPos != std::string::npos) {
+					// Find the start of this parameter (scan back to previous comma or start)
+					auto paramStart = originalParams.rfind(',', attrPos);
+					// Find the end of this parameter (scan forward to next comma or end)
+					auto paramEnd = originalParams.find(',', attrPos);
+					if (paramStart != std::string::npos) {
+						// Not the first param: remove ", param"
+						size_t end = (paramEnd != std::string::npos) ? paramEnd : originalParams.size();
+						originalParams.erase(paramStart, end - paramStart);
+					} else if (paramEnd != std::string::npos) {
+						// First param with more after: remove "param, "
+						originalParams.erase(0, paramEnd + 1);
+						// Trim leading whitespace
+						auto firstNonSpace = originalParams.find_first_not_of(" \t\n\r");
+						if (firstNonSpace != std::string::npos && firstNonSpace > 0)
+							originalParams.erase(0, firstNonSpace);
+					} else {
+						// Only param: clear
+						originalParams.clear();
+					}
+				}
+			}
 			std::string newSig = "[[intersection(bounding_box, instancing)]]\n"
 				"_MVKBBoxResult _mvk_isect(\n"
 				"    ray_data _MVKIsectPayload& _mvk_payload [[payload]]";
@@ -4630,7 +4700,11 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				}
 
 				char prevChar = (pos > 0) ? body[pos - 1] : '\0';
-				char suffix = (endPos < body.size()) ? body[endPos] : '\0';
+				// Skip whitespace after the variable name to find the actual suffix character
+				size_t suffixPos = endPos;
+				while (suffixPos < body.size() && (body[suffixPos] == ' ' || body[suffixPos] == '\t'))
+					suffixPos++;
+				char suffix = (suffixPos < body.size()) ? body[suffixPos] : '\0';
 				if ((prevChar == ' ' || prevChar == '\t' || prevChar == '&' || prevChar == '*') &&
 					(suffix == ';' || suffix == '=' || suffix == '[')) {
 					return true;
