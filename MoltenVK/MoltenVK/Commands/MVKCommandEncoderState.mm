@@ -353,7 +353,7 @@ static void bindDescriptorSets(MVKImplicitBufferData& target,
                                uint32_t firstSet, uint32_t setCount, MVKDescriptorSet*const* sets,
                                uint32_t dynamicOffsetCount, const uint32_t* dynamicOffsets) {
 	[[maybe_unused]] const uint32_t* dynamicOffsetsEnd = dynamicOffsets + dynamicOffsetCount;
-	VkShaderStageFlags vkStage = mvkVkShaderStageFlagBitsFromMVKShaderStage(stage);
+	VkShaderStageFlags vkStage = mvkVkShaderStageFlagsFromMVKShaderStage(stage);
 	for (uint32_t i = 0; i < setCount; i++) {
 		MVKDescriptorSet* set = sets[i];
 		MVKDescriptorSetLayout* setLayout = layout->getDescriptorSetLayout(firstSet + i);
@@ -1590,6 +1590,15 @@ void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
 		// Bind each descriptor set's GPU argument buffer to the compute encoder
 		// and make resources resident via useResource.
 		if (vk._layout) {
+			if (vk._layout->stageUsesPushConstants(kMVKShaderStageCompute)) {
+				uint32_t pushConstantsLength = vk._layout->getPushConstantsLength();
+				if (pushConstantsLength) {
+					mvkEncoder.setComputeBytes(encoder,
+										   vkShared._pushConstants.data(),
+										   pushConstantsLength,
+										   vk._layout->getPushConstantResourceIndex(kMVKShaderStageCompute));
+				}
+			}
 			for (uint32_t i = 0; i < vk._layout->getDescriptorSetCount(); i++) {
 				MVKDescriptorSet* set = vk._descriptorSets[i];
 				if (set && set->gpuBufferObject) {
@@ -1787,6 +1796,7 @@ void MVKCommandEncoderState::bindComputePipeline(MVKComputePipeline* pipeline) {
 }
 
 void MVKCommandEncoderState::setComputeLayout(MVKPipelineLayout* layout) {
+	_vkCompute._pipeline = nullptr;
 	if (_vkCompute._layout != layout) {
 		if (!_vkCompute._layout || _vkCompute._layout->getPushConstantsLength() < layout->getPushConstantsLength()) {
 			mvkEnsureSize(_vkShared._pushConstants, layout->getPushConstantsLength());

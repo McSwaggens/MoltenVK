@@ -670,7 +670,7 @@ MVKDescriptorSetLayout* MVKDescriptorSetLayout::Create(MVKDevice* device, const 
 		MVKShaderStageResourceBinding resourceCount = binding.totalResourceCount();
 		for (uint32_t i = 0; i < kMVKShaderStageCount; i++) {
 			auto stage = static_cast<MVKShaderStage>(i);
-			if (mvkIsAnyFlagEnabled(binding.stageFlags, mvkVkShaderStageFlagBitsFromMVKShaderStage(stage)))
+			if (mvkIsAnyFlagEnabled(binding.stageFlags, mvkVkShaderStageFlagsFromMVKShaderStage(stage)))
 				ret->_totalResourceCount.stages[stage] += resourceCount;
 		}
 		if (!binding.isVariable())

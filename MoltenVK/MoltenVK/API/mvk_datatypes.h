@@ -454,6 +454,9 @@ MVKShaderStage mvkShaderStageFromVkShaderStageFlagBits(VkShaderStageFlagBits vkS
 /** Returns the Vulkan VkShaderStageFlagBits corresponding to the specified MoltenVK MVKShaderStage. */
 VkShaderStageFlagBits mvkVkShaderStageFlagBitsFromMVKShaderStage(MVKShaderStage mvkStage);
 
+/** Returns all Vulkan shader stages executed through the specified MoltenVK shader stage. */
+VkShaderStageFlags mvkVkShaderStageFlagsFromMVKShaderStage(MVKShaderStage mvkStage);
+
 /** Returns the Metal MTLWinding corresponding to the specified SPIR-V spv::ExecutionMode. */
 MTLWinding mvkMTLWindingFromSpvExecutionMode(uint32_t spvMode);
 

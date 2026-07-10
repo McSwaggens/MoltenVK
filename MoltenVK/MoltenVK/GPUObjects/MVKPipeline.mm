@@ -51,7 +51,7 @@ using namespace SPIRV_CROSS_NAMESPACE;
 #pragma mark - MVKPipelineLayout
 
 bool MVKPipelineLayout::stageUsesPushConstants(MVKShaderStage stage) const {
-	return mvkIsAnyFlagEnabled(_pushConstantStages, mvkVkShaderStageFlagBitsFromMVKShaderStage(stage));
+	return mvkIsAnyFlagEnabled(_pushConstantStages, mvkVkShaderStageFlagsFromMVKShaderStage(stage));
 }
 
 /** Gets the layout for use with the Metal binding API (rather than argument buffers). */
@@ -196,7 +196,7 @@ void MVKPipelineLayout::populateShaderConversionConfig(SPIRVToMSLConversionConfi
 			MVKShaderStageResourceBinding resCount = desc.totalResourceCount();
 			for (uint32_t i = 0; i < kMVKShaderStageCount; i++) {
 				auto stage = static_cast<MVKShaderStage>(i);
-				bool used = mvkIsAnyFlagEnabled(desc.stageFlags, mvkVkShaderStageFlagBitsFromMVKShaderStage(stage));
+				bool used = mvkIsAnyFlagEnabled(desc.stageFlags, mvkVkShaderStageFlagsFromMVKShaderStage(stage));
 				if (argbuf) {
 					binding.stages[stage].textureIndex = argBufResIdx;
 					binding.stages[stage].bufferIndex = argBufResIdx + resCount.textureIndex;
@@ -2794,6 +2794,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		std::string name;
 		std::string typeName;
 		spv::StorageClass storage = spv::StorageClassGeneric;
+		uint32_t location = 0;
 	};
 	class MVKRTCompilerInspector final : public SPIRV_CROSS_NAMESPACE::CompilerMSL {
 	public:
@@ -2819,12 +2820,14 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				}
 
 				std::string name = get_name(id);
-				if (name.empty()) { return; }
+				if (name.empty()) { name = "_" + std::to_string(id); }
 
 				std::string typeName = getMSLTypeName(get_type_from_variable(id));
 				if (typeName.empty()) { return; }
 
-				vars.push_back({name, typeName, var.storage});
+				uint32_t location = has_decoration(id, spv::DecorationLocation)
+					? get_decoration(id, spv::DecorationLocation) : 0;
+				vars.push_back({name, typeName, var.storage, location});
 			});
 			return vars;
 		}
@@ -3788,7 +3791,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 			// Build the proper intersection function
 			std::string isectMSL;
-			isectMSL += "struct _MVKIsectPayload { uint3 launchID; uint3 launchSize; };\n\n";
+			isectMSL += "struct _MVKIsectPayload { uint3 launchID; uint3 launchSize; uint rayFlags; };\n\n";
 			isectMSL += "struct _MVKBBoxResult {\n";
 			isectMSL += "    bool accept [[accept_intersection]];\n";
 			isectMSL += "    float distance [[distance]];\n";
@@ -3939,15 +3942,44 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				}
 			}
 
-			// Replace `bool _NN = true;` (reportIntersectionEXT) with return statement
+			// Track each accepted reportIntersectionEXT. Metal intersection functions return
+			// one result, so retain the nearest report unless Vulkan requested the first hit.
 			{
-				size_t pos = funcBody.rfind("bool ");
-				if (pos != std::string::npos) {
-					auto lineEnd = funcBody.find(';', pos);
-					if (lineEnd != std::string::npos) {
-						// Replace `bool _NN = true;` with `return {true, _mvk_isect_dist};`
-						funcBody.replace(pos, lineEnd - pos + 1, "return {true, _mvk_isect_dist};");
+				auto isectBodyStart = funcBody.find('{');
+				if (isectBodyStart != std::string::npos) {
+					funcBody.insert(isectBodyStart + 1,
+						"\n    bool _mvk_reported = false;\n"
+						"    float _mvk_reported_distance = 3.402823466e+38f;");
+				}
+
+				size_t searchPos = isectBodyStart;
+				while ((searchPos = funcBody.find("bool ", searchPos)) != std::string::npos) {
+					auto assignmentEnd = funcBody.find(';', searchPos);
+					if (assignmentEnd == std::string::npos) { break; }
+					std::string declaration = funcBody.substr(searchPos, assignmentEnd - searchPos + 1);
+					if (declaration.find("= true;") == std::string::npos) {
+						searchPos = assignmentEnd + 1;
+						continue;
 					}
+					auto distancePos = funcBody.rfind("_mvk_isect_dist_", searchPos);
+					if (distancePos == std::string::npos) {
+						searchPos = assignmentEnd + 1;
+						continue;
+					}
+					auto distanceEnd = distancePos;
+					while (distanceEnd < funcBody.size() &&
+						   (isalnum(funcBody[distanceEnd]) || funcBody[distanceEnd] == '_')) {
+						distanceEnd++;
+					}
+					std::string distanceName = funcBody.substr(distancePos, distanceEnd - distancePos);
+					std::string reportCode =
+						"if ((_mvk_payload.rayFlags & " + std::to_string(spv::RayFlagsTerminateOnFirstHitKHRMask) +
+						") != 0) { return {true, " + distanceName + "}; }\n    "
+						"_mvk_reported = true;\n    "
+						"_mvk_reported_distance = min(_mvk_reported_distance, " + distanceName + ");\n    " +
+						declaration;
+					funcBody.replace(searchPos, declaration.size(), reportCode);
+					searchPos += reportCode.size();
 				}
 			}
 
@@ -3956,12 +3988,12 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 				auto funcBodyStart = funcBody.find('{');
 				auto lastReturn = funcBody.rfind("return;");
 				if (lastReturn != std::string::npos) {
-					funcBody.replace(lastReturn, 7, "return {false, 0.0f};");
+					funcBody.replace(lastReturn, 7, "return {_mvk_reported, _mvk_reported_distance};");
 				} else {
 					auto lastBrace = funcBody.rfind('}');
 					if (funcBodyStart != std::string::npos && lastBrace != std::string::npos &&
-						funcBody.find("return {false, 0.0f};", funcBodyStart) == std::string::npos) {
-						funcBody.insert(lastBrace, "\n    return {false, 0.0f};\n");
+						funcBody.find("return {_mvk_reported, _mvk_reported_distance};", funcBodyStart) == std::string::npos) {
+						funcBody.insert(lastBrace, "\n    return {_mvk_reported, _mvk_reported_distance};\n");
 					}
 				}
 			}
@@ -3978,7 +4010,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		auto kernelPos = raygenMSL.find("kernel void");
 		if (kernelPos != std::string::npos) {
 			raygenMSL.insert(kernelPos,
-				"struct _MVKIsectPayload { uint3 launchID; uint3 launchSize; };\n\n");
+				"struct _MVKIsectPayload { uint3 launchID; uint3 launchSize; uint rayFlags; };\n\n");
 		}
 
 		// Modify the OpTraceRayKHR intersect() call to pass an intersection_function_table
@@ -3987,27 +4019,27 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		//   intersector<instancing> _mtl_i;
 		//   auto _mtl_isect = _mtl_i.intersect(_mtl_r, AS, mask);
 		// We need:
-		//   _MVKIsectPayload _mtl_payload = { gl_LaunchIDNV, gl_LaunchSizeNV };
+		//   _MVKIsectPayload _mtl_payload = { gl_LaunchIDNV, gl_LaunchSizeNV, _mtl_ray_flags };
 		//   auto _mtl_isect = _mtl_i.intersect(_mtl_r, AS, mask, _mvk_ift, _mtl_payload);
 		{
-			auto iPos = raygenMSL.find("intersector<instancing>");
-			if (iPos != std::string::npos) {
+			size_t searchPos = 0;
+			while (true) {
+				auto iPos = raygenMSL.find("intersector<instancing>", searchPos);
+				if (iPos == std::string::npos) { break; }
 				// Add payload before the ray declaration
 				auto rayPos = raygenMSL.find("ray _mtl_r(", iPos);
-				if (rayPos != std::string::npos) {
-					raygenMSL.insert(rayPos,
-						"_MVKIsectPayload _mtl_payload = { gl_LaunchIDNV, gl_LaunchSizeNV };\n      ");
-				}
+				if (rayPos == std::string::npos) { break; }
+				raygenMSL.insert(rayPos,
+					"_MVKIsectPayload _mtl_payload = { gl_LaunchIDNV, gl_LaunchSizeNV, _mtl_ray_flags };\n      ");
 
 				// Find the intersect() call and add the function table + payload parameters
 				auto isectCall = raygenMSL.find(".intersect(_mtl_r,", iPos);
-				if (isectCall != std::string::npos) {
-					// Find the closing ");""
-					auto callEnd = raygenMSL.find(");", isectCall);
-					if (callEnd != std::string::npos) {
-						raygenMSL.insert(callEnd, ", _mvk_ift, _mtl_payload");
-					}
-				}
+				if (isectCall == std::string::npos) { break; }
+				// Find the closing ");"
+				auto callEnd = raygenMSL.find(");", isectCall);
+				if (callEnd == std::string::npos) { break; }
+				raygenMSL.insert(callEnd, ", _mvk_ift, _mtl_payload");
+				searchPos = callEnd + strlen(", _mvk_ift, _mtl_payload");
 			}
 
 			// Add the intersection function table as a kernel parameter.
@@ -4110,24 +4142,32 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	bool needsHitSBT = false;
 	bool needsMissSBT = false;
 	bool needsCallableSBT = callableFuncs.size() > 1;
-	bool hasNamedRaygenRTPayload = false;
-	for (auto& var : raygenSpecialVars) {
-		switch (var.storage) {
-			case spv::StorageClassRayPayloadKHR:
-			case spv::StorageClassCallableDataKHR:
-				hasNamedRaygenRTPayload = hasNamedRaygenRTPayload || !var.name.empty();
-				break;
-			default:
-				break;
-		}
-	}
-
 	auto buildHelperArgs = [&](const std::string& fn) -> std::string {
 		std::string args = "spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
 		auto it = helperExtraArgs.find(fn);
 		if (it == helperExtraArgs.end()) { return args; }
 		for (auto& var : it->second) {
-			args += ", " + var.name;
+			const MVKRTSpecialVarInfo* callerVar = nullptr;
+			spv::StorageClass callerStorage = spv::StorageClassGeneric;
+			switch (var.storage) {
+				case spv::StorageClassIncomingRayPayloadKHR:
+					callerStorage = spv::StorageClassRayPayloadKHR;
+					break;
+				case spv::StorageClassIncomingCallableDataKHR:
+					callerStorage = spv::StorageClassCallableDataKHR;
+					break;
+				default:
+					break;
+			}
+			if (callerStorage != spv::StorageClassGeneric) {
+				for (auto& candidate : raygenSpecialVars) {
+					if (candidate.storage == callerStorage && candidate.location == var.location) {
+						callerVar = &candidate;
+						break;
+					}
+				}
+			}
+			args += ", " + (callerVar ? callerVar->name : var.name);
 		}
 		return args;
 	};
@@ -4227,14 +4267,20 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 			// Emit any-hit dispatch
 			if (!ahitGroupDispatch.empty()) {
+				callCode += "    bool _mvk_opaque = _mvk_primitive_data && ((_mvk_primitive_data[2] & " +
+					std::to_string(VK_GEOMETRY_OPAQUE_BIT_KHR) + ") != 0);\n";
+				callCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsOpaqueKHRMask) + ") != 0) _mvk_opaque = true;\n";
+				callCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsNoOpaqueKHRMask) + ") != 0) _mvk_opaque = false;\n";
+				callCode += "    if (!_mvk_opaque) {\n";
 				if (ahitGroupDispatch.size() == 1) {
-					callCode += "    " + ahitGroupDispatch[0].second + "(" + buildHelperArgs(ahitGroupDispatch[0].second) + ");\n";
+					callCode += "      " + ahitGroupDispatch[0].second + "(" + buildHelperArgs(ahitGroupDispatch[0].second) + ");\n";
 				} else {
-					callCode += "    switch (_mvk_hit_group) {\n";
+					callCode += "      switch (_mvk_hit_group) {\n";
 					for (auto& [gIdx, fn] : ahitGroupDispatch)
-						callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
-					callCode += "      default: " + ahitGroupDispatch[0].second + "(" + buildHelperArgs(ahitGroupDispatch[0].second) + "); break;\n    }\n";
+						callCode += "        case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
+					callCode += "        default: " + ahitGroupDispatch[0].second + "(" + buildHelperArgs(ahitGroupDispatch[0].second) + "); break;\n      }\n";
 				}
+				callCode += "    }\n";
 			}
 
 			// Emit closest-hit dispatch
@@ -4262,101 +4308,10 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			callCode += "  }\n";
 		}
 
-		auto markerPos = raygenMSL.find("(void)_mtl_isect;");
-		if (markerPos != std::string::npos) {
+		size_t markerPos = 0;
+		while ((markerPos = raygenMSL.find("(void)_mtl_isect;", markerPos)) != std::string::npos) {
 			raygenMSL.replace(markerPos, strlen("(void)_mtl_isect;"), callCode);
-		}
-
-		// Find the raygen payload variable and pass it to chit/miss/ahit helpers by reference.
-		// The payload variable is the first _NN identifier used after the tracing block's closing '}'.
-		if (!hasNamedRaygenRTPayload) {
-			auto blockEnd = raygenMSL.find("}", markerPos);
-			std::string payloadVar;
-			if (blockEnd != std::string::npos) {
-				for (size_t s = blockEnd + 1; s < raygenMSL.size(); s++) {
-					if (raygenMSL[s] == '_' && s + 1 < raygenMSL.size() && isdigit(raygenMSL[s + 1])) {
-						if (s > 0 && (isalnum(raygenMSL[s - 1]) || raygenMSL[s - 1] == '_')) continue;
-						size_t nameStart = s;
-						s++;
-						while (s < raygenMSL.size() && isdigit(raygenMSL[s])) s++;
-						if (s < raygenMSL.size() && (isalnum(raygenMSL[s]) || raygenMSL[s] == '_')) continue;
-						payloadVar = raygenMSL.substr(nameStart, s - nameStart);
-						break;
-					}
-				}
-			}
-
-			if (!payloadVar.empty()) {
-				// Add payload as argument to all chit/miss/ahit helper calls in the dispatch code.
-				// The dispatch calls are in the format: helperFunc(helperArgs)
-				// We need to append ", payloadVar" before the closing )
-				auto allHelpers = closestHitFuncs;
-				allHelpers.insert(allHelpers.end(), anyHitFuncs.begin(), anyHitFuncs.end());
-				allHelpers.insert(allHelpers.end(), missFuncs.begin(), missFuncs.end());
-
-				for (auto& fn : allHelpers) {
-					// Find the call site in the dispatch code (already inserted into raygenMSL)
-					size_t searchStart = markerPos;
-					size_t callPos;
-					while ((callPos = raygenMSL.find(fn + "(", searchStart)) != std::string::npos) {
-						auto callClose = raygenMSL.find(");", callPos);
-						if (callClose != std::string::npos) {
-							raygenMSL.insert(callClose, ", " + payloadVar);
-							searchStart = callClose + payloadVar.size() + 5;
-						} else break;
-					}
-
-					// Add reference parameter to the helper function definition.
-					// Find the function definition (starts with "static void funcName(")
-					auto defPos = raygenMSL.find("static void " + fn + "(");
-					if (defPos != std::string::npos) {
-						auto defBody = raygenMSL.find('{', defPos);
-						if (defBody != std::string::npos) {
-							// Find the payload variable in the helper body (first _NN assigned)
-							int depth = 1;
-							size_t defEnd = defBody + 1;
-							while (defEnd < raygenMSL.size() && depth > 0) {
-								if (raygenMSL[defEnd] == '{') depth++;
-								else if (raygenMSL[defEnd] == '}') depth--;
-								defEnd++;
-							}
-							std::string body = raygenMSL.substr(defBody + 1, defEnd - defBody - 2);
-
-							// Find the helper's payload variable and its type
-							std::string helperPayload, payloadType;
-							static const char* payloadTypes[] = {
-								"int4", "int3", "int2", "int",
-								"uint4", "uint3", "uint2", "uint",
-								"float4", "float3", "float2", "float", nullptr
-							};
-							for (auto** tp = payloadTypes; *tp; tp++) {
-								std::string pat = std::string(" = ") + *tp + "(";
-								auto assignPos = body.find(pat);
-								if (assignPos == std::string::npos) continue;
-								auto nameEnd = assignPos;
-								auto ns = body.rfind('\n', nameEnd);
-								if (ns == std::string::npos) ns = 0; else ns++;
-								while (ns < nameEnd && (body[ns] == ' ' || body[ns] == '\t')) ns++;
-								std::string varName = body.substr(ns, nameEnd - ns);
-								if (varName.size() > 1 && varName[0] == '_' &&
-									std::all_of(varName.begin() + 1, varName.end(), ::isdigit)) {
-									helperPayload = varName;
-									payloadType = *tp;
-									break;
-								}
-							}
-
-							if (!helperPayload.empty() && !payloadType.empty()) {
-								// Add reference parameter to function signature
-								auto sigClose = raygenMSL.find(')', defPos);
-								if (sigClose != std::string::npos && sigClose < defBody) {
-									raygenMSL.insert(sigClose, ", thread " + payloadType + "& " + helperPayload);
-								}
-							}
-						}
-					}
-				}
-			}
+			markerPos += callCode.size();
 		}
 
 		// Ensure kernel has all parameters that helpers need.
@@ -4709,21 +4664,22 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	MTLCompileOptions* compileOptions = _device->getMTLCompileOptions();
 
 	id<MTLLibrary> mtlLib = [mtlDev newLibraryWithSource: @(raygenMSL.c_str())
-												 options: compileOptions
-												   error: &err];
+											 options: compileOptions
+											   error: &err];
 	// compileOptions not released — Metal may reference it asynchronously during compilation.
 
-	if (err && !mtlLib) {
-		const char* dumpDir = getMVKConfig().shaderDumpDir;
-		if (dumpDir && *dumpDir) {
-			mkdir(dumpDir, 0755);
-			std::string combinedPath = std::string(dumpDir) + "/rt-combined-main0.metal";
-			FILE* file = fopen(combinedPath.c_str(), "wb");
-			if (file) {
-				fwrite(raygenMSL.data(), 1, raygenMSL.size(), file);
-				fclose(file);
-			}
+	const char* rtDumpDir = getMVKConfig().shaderDumpDir;
+	if (rtDumpDir && *rtDumpDir) {
+		mkdir(rtDumpDir, 0755);
+		std::string combinedPath = std::string(rtDumpDir) + "/rt-combined-main0.metal";
+		FILE* file = fopen(combinedPath.c_str(), "wb");
+		if (file) {
+			fwrite(raygenMSL.data(), 1, raygenMSL.size(), file);
+			fclose(file);
 		}
+	}
+
+	if (err && !mtlLib) {
 		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
 			"RT pipeline MSL compile failed: %s", err.localizedDescription.UTF8String));
 		_hasValidMTLPipelineStates = false;
