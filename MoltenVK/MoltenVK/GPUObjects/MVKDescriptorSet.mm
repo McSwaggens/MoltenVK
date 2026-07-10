@@ -1,7 +1,7 @@
 /*
  * MVKDescriptorSet.mm
  *
- * Copyright (c) 2015-2025 The Brenwill Workshop Ltd. (http://www.brenwill.com)
+ * Copyright (c) 2015-2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -192,6 +192,24 @@ static MVKArgumentBufferMode pickArgumentBufferMode(MVKDevice* dev, const VkDesc
 	// Push descriptors are always binding-based
 	if (mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT))
 		return MVKArgumentBufferMode::Off;
+	auto* metalFeatures = dev->getPhysicalDevice()->getMetalFeatures();
+	bool useMac1ArgumentEncoders = dev->getPhysicalDevice()->isMacGPUFamily1() && metalFeatures->needsArgumentBufferEncoders;
+	bool isIntelGPU = useMac1ArgumentEncoders && dev->getPhysicalDevice()->isIntelGPU();
+	bool isNVIDIAGPU = useMac1ArgumentEncoders && dev->getPhysicalDevice()->isNVIDIAGPU();
+	if (!metalFeatures->nativeTextureSwizzle || useMac1ArgumentEncoders) {
+		for (uint32_t i = 0; i < pCreateInfo->bindingCount; i++) {
+			const VkDescriptorSetLayoutBinding& bind = pCreateInfo->pBindings[i];
+			if (bind.descriptorCount == 0)
+				continue;
+			if ((!metalFeatures->nativeTextureSwizzle &&
+				 (bind.descriptorType == VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER ||
+				  bind.descriptorType == VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE ||
+				  bind.descriptorType == VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT)) ||
+				(isIntelGPU && bind.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE) ||
+				(isNVIDIAGPU && bind.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER))
+				return MVKArgumentBufferMode::Off;
+		}
+	}
 #if MVK_IOS || MVK_TVOS
 	// iOS Tier 1 argument buffers do not support writable images.
 	if (dev->getPhysicalDevice()->getMetalFeatures()->argumentBuffersTier < MTLArgumentBuffersTier2) {
@@ -340,17 +358,20 @@ static MVKDescriptorCPULayout pickCPULayout(
 	if (count == 0)
 		return MVKDescriptorCPULayout::None;
 	bool nativeTAtomic = dev->getPhysicalDevice()->getMetalFeatures()->nativeTextureAtomics;
+	bool nativeTextureSwizzle = dev->getPhysicalDevice()->getMetalFeatures()->nativeTextureSwizzle;
 	switch (type) {
 		case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
 			// Multiplanar images are for ycbcr, which requires a swizzle of IDENTITY, so we don't need to store it.
 			// Immutable samplers are accessible from the layout so they also don't need to be stored.
+			if (!nativeTextureSwizzle && !planes.hasYCBCR())
+				return planes.hasImmutableSamplers() ? MVKDescriptorCPULayout::OneIDMeta : MVKDescriptorCPULayout::TwoIDMeta;
 			if (planes.planeCount() > 2)
 				return MVKDescriptorCPULayout::TwoIDMeta;
 			if (planes.planeCount() == 1 || planes.hasNonYCBCR())
 				return MVKDescriptorCPULayout::OneID;
 			return MVKDescriptorCPULayout::OneIDMeta;
 		case VK_DESCRIPTOR_TYPE_SAMPLER:                return planes.hasImmutableSamplers() ? MVKDescriptorCPULayout::None : MVKDescriptorCPULayout::OneID;
-		case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:          return MVKDescriptorCPULayout::OneID;
+		case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:          return nativeTextureSwizzle ? MVKDescriptorCPULayout::OneID : MVKDescriptorCPULayout::OneIDMeta;
 		case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:          return nativeTAtomic ? MVKDescriptorCPULayout::OneID : MVKDescriptorCPULayout::TwoID2Meta;
 		case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:   return MVKDescriptorCPULayout::OneID;
 		case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:   return nativeTAtomic ? MVKDescriptorCPULayout::OneID : MVKDescriptorCPULayout::TwoID2Meta;
@@ -1231,7 +1252,7 @@ static void writeDescriptorSetCPUBuffer(
 								if (immutableSamplers[i]->isYCBCR())
 									desc->b = img->getMTLTexture(1);
 								else
-									desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]) };
+									desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]), img->getPackedSwizzle() };
 							} else {
 								*desc = {};
 							}
@@ -1247,7 +1268,7 @@ static void writeDescriptorSetCPUBuffer(
 						if (auto* img = reinterpret_cast<MVKImageView*>(static_cast<const VkDescriptorImageInfo*>(src)->imageView)) {
 							id<MTLTexture> tex = img->getMTLTexture();
 							desc->a = tex;
-							desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]) };
+							desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]), img->getPackedSwizzle() };
 						} else {
 							*desc = {};
 						}
@@ -1273,7 +1294,7 @@ static void writeDescriptorSetCPUBuffer(
 							desc->c = img->getMTLTexture(2);
 						} else {
 							desc->b = nullptr;
-							desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]) };
+							desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]), img->getPackedSwizzle() };
 						}
 					} else {
 						*desc = {};
@@ -1284,7 +1305,7 @@ static void writeDescriptorSetCPUBuffer(
 					if (img) {
 						id<MTLTexture> tex = img->getMTLTexture();
 						desc->a = tex;
-						desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]) };
+						desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]), img->getPackedSwizzle() };
 					} else {
 						desc->a = nil;
 						desc->meta = {};
@@ -1318,7 +1339,7 @@ static void writeDescriptorSetCPUBuffer(
 							desc->a = tex;
 							desc->b = [tex buffer];
 							desc->offset = [tex bufferOffset];
-							desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]) };
+							desc->meta.img = { static_cast<uint32_t>([tex height] * [tex bufferBytesPerRow]), img->getPackedSwizzle() };
 						} else {
 							*desc = {};
 						}
@@ -1942,6 +1963,7 @@ static uint32_t maxGPUSize(MVKDescriptorGPULayout layout, const MVKPhysicalDevic
  * where each group is aligned to `groupAlign`, calculates the amount of space required to do that
  */
 static uint32_t calcGroupSizeWithPadding(uint32_t size, uint32_t groups, uint32_t elemAlign, uint32_t groupAlign) {
+	groups = std::min(groups, size / elemAlign);	// Each group needs at least one element
 	size += groups * (std::max(elemAlign, groupAlign) - elemAlign);
 	return size & ~(groupAlign - 1);
 }
@@ -1987,14 +2009,15 @@ MVKDescriptorPool* MVKDescriptorPool::Create(MVKDevice* device, const VkDescript
 			if (argBufMode == MVKArgumentBufferMode::Off || mayDisableArgumentBuffers(device))
 				cpuSize += calcGroupSizeWithPadding(inlineUniformSize, info->maxInlineUniformBlockBindings, 4, cpuAlign);
 			MVKDescriptorGPULayout gpuLayout = pickGPULayout(VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK, 1, argBufMode, device);
+			uint32_t dataAlign = gpuAlign;
 			if (gpuLayout == MVKDescriptorGPULayout::OutlinedData) {
 				// Add space for the pointers
 				gpuSize += alignDescriptorOffset(sizes.pointer.size, gpuAlign) * info->maxInlineUniformBlockBindings;
 				// Outlined data is 16-byte aligned
-				gpuAlign = std::max(gpuAlign, 16u);
+				dataAlign = std::max(dataAlign, 16u);
 			}
 			if (gpuLayout != MVKDescriptorGPULayout::None)
-				gpuSize += calcGroupSizeWithPadding(inlineUniformSize, info->maxInlineUniformBlockBindings, 4, gpuAlign);
+				gpuSize += calcGroupSizeWithPadding(inlineUniformSize, info->maxInlineUniformBlockBindings, 4, dataAlign);
 		}
 	}
 
@@ -2008,6 +2031,13 @@ MVKDescriptorPool* MVKDescriptorPool::Create(MVKDevice* device, const VkDescript
 	}
 
 	bool hostOnly = mvkIsAnyFlagEnabled(pCreateInfo->flags, VK_DESCRIPTOR_POOL_CREATE_HOST_ONLY_BIT_EXT) && argBufMode != MVKArgumentBufferMode::ArgEncoder;
+
+	// Apply Metal constant buffer offset alignment padding for descriptor sets
+	const uint32_t mtlCbufAlign = (uint32_t)device->getPhysicalDevice()->getMetalFeatures()->mtlConstantBufferAlignment;
+	const uint32_t cbufAlign = std::max(gpuAlign, hostOnly || argBufMode == MVKArgumentBufferMode::Off ? 1u : mtlCbufAlign);
+	gpuSize = calcGroupSizeWithPadding(gpuSize, pCreateInfo->maxSets, gpuAlign, cbufAlign);
+	gpuAlign = cbufAlign;
+
 	void* cpuBuffer;
 	void* hostOnlyGPUBuffer;
 	// Pad ourselves to reduce the amount of space wasted in driver padding

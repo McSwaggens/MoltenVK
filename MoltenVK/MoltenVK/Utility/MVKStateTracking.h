@@ -1,7 +1,7 @@
 /*
  * MVKStateTracking.h
  *
- * Copyright (c) 2024-2025 Evan Tang for CodeWeavers
+ * Copyright (c) 2024-2026 Evan Tang for CodeWeavers
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -168,17 +168,21 @@ struct std::hash<MVKMTLDepthStencilDescriptorData> {
 /** These buffers are dirty-tracked across draw calls, and need code to make sure they're invalidated if they ever change binding indices. */
 enum class MVKNonVolatileImplicitBuffer : uint32_t {
 	PushConstant,
+	Swizzle,
 	BufferSize,
 	DynamicOffset,
 	ViewRange,
+	EmulatedReversedDepthViewport,
 	Count
 };
 
 enum class MVKImplicitBuffer : uint32_t {
 	PushConstant  = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::PushConstant),
+	Swizzle       = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::Swizzle),
 	BufferSize    = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::BufferSize),
 	DynamicOffset = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::DynamicOffset),
 	ViewRange     = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::ViewRange),
+	EmulatedReversedDepthViewport = static_cast<uint32_t>(MVKNonVolatileImplicitBuffer::EmulatedReversedDepthViewport),
 
 	// Volatile implicit buffers
 	// These buffers are updated per draw call, and are therefore always considered dirty
@@ -188,6 +192,7 @@ enum class MVKImplicitBuffer : uint32_t {
 	TessLevel,
 	Index,
 	DispatchBase,
+	DrawId,
 	Count,
 };
 

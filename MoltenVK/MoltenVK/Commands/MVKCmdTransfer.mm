@@ -1,7 +1,7 @@
 /*
  * MVKCmdTransfer.mm
  *
- * Copyright (c) 2015-2025 The Brenwill Workshop Ltd. (http://www.brenwill.com)
+ * Copyright (c) 2015-2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -532,15 +532,20 @@ void MVKCmdBlitImage<N>::encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse com
         id<MTLTexture> srcMTLTex = _srcImage->getMTLTexture(srcPlaneIndex);
         id<MTLTexture> dstMTLTex = _dstImage->getMTLTexture(dstPlaneIndex);
         if (blitCnt && srcMTLTex && dstMTLTex) {
-			if (_srcImage->needsSwizzle()) {
-				// Use a view that has a swizzle on it.
-				srcMTLTex = [srcMTLTex newTextureViewWithPixelFormat:srcMTLTex.pixelFormat
-														 textureType:srcMTLTex.textureType
-															  levels:NSMakeRange(0, srcMTLTex.mipmapLevelCount)
-															  slices:NSMakeRange(0, srcMTLTex.arrayLength)
-															 swizzle:_srcImage->getPixelFormats()->getMTLTextureSwizzleChannels(_srcImage->getVkFormat())];
-				[cmdEncoder->_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer>) { [srcMTLTex release]; }];
-			}
+            uint32_t srcSwizzle = 0;
+            if (_srcImage->needsSwizzle()) {
+                if (mtlFeats.nativeTextureSwizzle) {
+                    // Use a view that has a swizzle on it.
+                    srcMTLTex = [srcMTLTex newTextureViewWithPixelFormat:srcMTLTex.pixelFormat
+                                                              textureType:srcMTLTex.textureType
+                                                                   levels:NSMakeRange(0, srcMTLTex.mipmapLevelCount)
+                                                                   slices:NSMakeRange(0, srcMTLTex.arrayLength)
+                                                                  swizzle:_srcImage->getPixelFormats()->getMTLTextureSwizzleChannels(_srcImage->getVkFormat())];
+                    [cmdEncoder->_mtlCmdBuffer addCompletedHandler: ^(id<MTLCommandBuffer>) { [srcMTLTex release]; }];
+                } else {
+                    srcSwizzle = mvkPackSwizzle(_srcImage->getPixelFormats()->getVkComponentMapping(_srcImage->getVkFormat()));
+                }
+            }
             cmdEncoder->endCurrentMetalEncoding();
 
             MTLRenderPassDescriptor* mtlRPD = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -588,6 +593,7 @@ void MVKCmdBlitImage<N>::encode(MVKCommandEncoder* cmdEncoder, MVKCommandUse com
             blitKey.srcFilter = mvkMTLSamplerMinMagFilterFromVkFilter(_filter);
             blitKey.srcAspect = mvkIBR.region.srcSubresource.aspectMask & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
             blitKey.dstSampleCount = mvkSampleCountFromVkSampleCountFlagBits(_dstImage->getSampleCount());
+            blitKey.srcSwizzle = srcSwizzle;
             id<MTLRenderPipelineState> mtlRPS = cmdEncoder->getCommandEncodingPool()->getCmdBlitImageMTLRenderPipelineState(blitKey);
             bool isBlittingDepth = mvkIsAnyFlagEnabled(blitKey.srcAspect, (VK_IMAGE_ASPECT_DEPTH_BIT));
             bool isBlittingStencil = mvkIsAnyFlagEnabled(blitKey.srcAspect, (VK_IMAGE_ASPECT_STENCIL_BIT));

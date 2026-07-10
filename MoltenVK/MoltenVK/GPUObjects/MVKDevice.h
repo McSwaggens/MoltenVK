@@ -1,7 +1,7 @@
 /*
  * MVKDevice.h
  *
- * Copyright (c) 2015-2025 The Brenwill Workshop Ltd. (http://www.brenwill.com)
+ * Copyright (c) 2015-2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -113,6 +113,7 @@ typedef struct MVKMTLDeviceCapabilities {
 	bool supportsApple8;
 	bool supportsApple9;
 	bool supportsApple10;
+	bool supportsMac1;
 	bool supportsMac2;
 	bool supportsMetal3;
 	bool supportsMetal4;
@@ -123,6 +124,7 @@ typedef struct MVKMTLDeviceCapabilities {
 	bool supportsDepth24Stencil8;
 	bool supports32BitFloatFiltering;
 	bool supports32BitMSAA;
+	bool supportsRenderLinearTextures;
 
 	uint8_t getHighestAppleGPU() const;
 	uint8_t getHighestMacGPU() const;
@@ -203,6 +205,18 @@ public:
 
 	/** Returns the name of this device. */
 	const char* getName() { return _properties.deviceName; }
+
+	/** Returns whether the GPU is an NVIDIA GPU. */
+	bool isNVIDIAGPU() const;
+
+	/** Returns whether the GPU is an Intel GPU. */
+	bool isIntelGPU() const;
+
+	/** Returns whether the GPU supports exactly Metal Mac GPU Family 1. */
+	bool isMacGPUFamily1() const;
+
+	/** Returns whether reversed-depth viewports should be emulated instead of passed through to Metal. */
+	bool shouldEmulateReversedDepthViewport() const;
 
 	/** Populates the specified structure with the format properties of this device. */
 	void getFormatProperties(VkFormat format, VkFormatProperties* pFormatProperties);

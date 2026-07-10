@@ -1,7 +1,7 @@
 /*
  * MVKImage.mm
  *
- * Copyright (c) 2015-2025 The Brenwill Workshop Ltd. (http://www.brenwill.com)
+ * Copyright (c) 2015-2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,10 +47,15 @@ id<MTLTexture> MVKImagePlane::getMTLTexture() {
         MVKImageMemoryBinding* memoryBinding = getMemoryBinding();
 		MVKDeviceMemory* dvcMem = memoryBinding->_deviceMemory;
 
-        if (_image->_is2DViewOn3DImageCompatible && !dvcMem->ensureMTLHeap()) {
+        // 2D-view-on-3D and block-texel views need a heap-backed texture to alias the memory. ensureMTLHeap() can return
+        // true without creating a heap, so create one if possible, then check getMTLHeap() for an actual heap.
+        if (_image->_is2DViewOn3DImageCompatible || _image->_isBlockTexelViewCompatible) {
+            dvcMem->ensureMTLHeap();
+        }
+        if (_image->_is2DViewOn3DImageCompatible && !dvcMem->getMTLHeap()) {
             MVKAssert(0, "Creating a 2D view of a 3D texture currently requires a placement heap, which is not available.");
         }
-        if (_image->_isBlockTexelViewCompatible && !dvcMem->ensureMTLHeap()) {
+        if (_image->_isBlockTexelViewCompatible && !dvcMem->getMTLHeap()) {
             MVKAssert(0, "Creating an uncompressed view of a compressed texture currently requires a placement heap, which is not available.");
         }
 
@@ -1018,6 +1023,11 @@ VkResult MVKImage::setMTLTexture(uint8_t planeIndex, id<MTLTexture> mtlTexture) 
     _planes[planeIndex]->releaseMTLTexture();
 	_planes[planeIndex]->_mtlTexture = [mtlTexture retain];		// retained
 
+	if (_planes[planeIndex]->_mtlTexture.storageMode != MTLStorageModeMemoryless) {
+		_device->makeResident(_planes[planeIndex]->_mtlTexture);
+		_device->getLiveResources().add(_planes[planeIndex]->_mtlTexture);
+	}
+
     _vkFormat = getPixelFormats()->getVkFormat(mtlTexture.pixelFormat);
 	_mtlTextureType = mtlTexture.textureType;
 	_extent.width = uint32_t(mtlTexture.width);
@@ -1369,7 +1379,7 @@ void MVKImage::validateConfig(const VkImageCreateInfo* pCreateInfo, bool isAttac
 	const auto placementHeapFlags = VK_IMAGE_CREATE_2D_VIEW_COMPATIBLE_BIT_EXT |
 	                                VK_IMAGE_CREATE_2D_ARRAY_COMPATIBLE_BIT |
 	                                VK_IMAGE_CREATE_BLOCK_TEXEL_VIEW_COMPATIBLE_BIT;
-	if (!getMVKConfig().useMTLHeap && mvkIsAnyFlagEnabled(pCreateInfo->flags, placementHeapFlags)) {
+	if (!getMetalFeatures().placementHeaps && mvkIsAnyFlagEnabled(pCreateInfo->flags, placementHeapFlags)) {
 		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCreateImage() : MTLHeap must be enabled to create 2D-on-3D or block texel view compatible images."));
 	}
 
@@ -1872,10 +1882,7 @@ id<MTLTexture> MVKImageViewPlane::newMTLTexture() {
     NSRange sliceRange = NSMakeRange(_imageView->_subresourceRange.baseArrayLayer, _imageView->_subresourceRange.layerCount);
 
     // Support 2D views of 3D textures and block texel views using memory aliasing.
-    const bool is2dViewOf3d = image->_is2DViewOn3DImageCompatible &&
-        image->getImageType() == VK_IMAGE_TYPE_3D &&
-        (_imageView->_mtlTextureType == MTLTextureType2D || _imageView->_mtlTextureType == MTLTextureType2DArray);
-
+    const bool is2dViewOf3d = _imageView->getIs2dViewOf3d();
     const bool imageCompressed = image->getIsCompressed();
     const bool viewCompressed = getPixelFormats()->getFormatType(_mtlPixFmt) == kMVKFormatCompressed;
     const bool isBlockTexelView = image->_isBlockTexelViewCompatible && imageCompressed && !viewCompressed;
@@ -1925,7 +1932,7 @@ id<MTLTexture> MVKImageViewPlane::newMTLTexture() {
     }
 
     id<MTLTexture> texView = nil;
-    if (_useSwizzle) {
+    if (_useNativeSwizzle) {
         texView = [mtlTex newTextureViewWithPixelFormat: _mtlPixFmt
                                             textureType: _imageView->_mtlTextureType
                                                  levels: levelRange
@@ -1965,7 +1972,7 @@ MVKImageViewPlane::MVKImageViewPlane(MVKImageView* imageView,
             _imageView->_subresourceRange.levelCount == _imageView->_image->_mipLevels &&
             (_imageView->_mtlTextureType == MTLTextureType3D ||
              _imageView->_subresourceRange.layerCount == _imageView->_image->_arrayLayers) &&
-            !_useSwizzle) {
+            !_useNativeSwizzle) {
             _useMTLTextureView = false;
         }
     } else {
@@ -1975,7 +1982,8 @@ MVKImageViewPlane::MVKImageViewPlane(MVKImageView* imageView,
 
 VkResult MVKImageViewPlane::initSwizzledMTLPixelFormat(const VkImageViewCreateInfo* pCreateInfo) {
 
-	_useSwizzle = false;
+	_useNativeSwizzle = false;
+	_useShaderSwizzle = false;
 	_componentSwizzle = pCreateInfo->components;
 	VkImageAspectFlags aspectMask = pCreateInfo->subresourceRange.aspectMask;
 
@@ -2103,7 +2111,9 @@ VkResult MVKImageViewPlane::initSwizzledMTLPixelFormat(const VkImageViewCreateIn
 		}
 	}
 
-	_useSwizzle = !mvkVkComponentMappingsMatch(_componentSwizzle, {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A});
+	bool useSwizzle = !mvkVkComponentMappingsMatch(_componentSwizzle, {VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A});
+	_useNativeSwizzle = useSwizzle && getMetalFeatures().nativeTextureSwizzle;
+	_useShaderSwizzle = useSwizzle && !getMetalFeatures().nativeTextureSwizzle;
 	return VK_SUCCESS;
 }
 
@@ -2130,7 +2140,7 @@ void MVKImageView::populateMTLRenderPassAttachmentDescriptor(MTLRenderPassAttach
     mtlAttDesc.texture = plane->getMTLTexture();
     // If a swizzle is being applied, use the unswizzled parent texture.
     // This is relevant for depth/stencil attachments that are also sampled and might have forced swizzles.
-    if (plane->_useSwizzle && mtlAttDesc.texture.parentTexture) {
+    if (plane->_useNativeSwizzle && mtlAttDesc.texture.parentTexture) {
         useView = false;
         mtlAttDesc.texture = mtlAttDesc.texture.parentTexture;
     }
@@ -2150,7 +2160,7 @@ void MVKImageView::populateMTLRenderPassAttachmentDescriptorResolve(MTLRenderPas
     mtlAttDesc.resolveTexture = plane->getMTLTexture();
     // If a swizzle is being applied, use the unswizzled parent texture.
     // This is relevant for depth/stencil attachments that are also sampled and might have forced swizzles.
-    if (plane->_useSwizzle && mtlAttDesc.resolveTexture.parentTexture) {
+    if (plane->_useNativeSwizzle && mtlAttDesc.resolveTexture.parentTexture) {
         useView = false;
         mtlAttDesc.resolveTexture = mtlAttDesc.resolveTexture.parentTexture;
     }
@@ -2229,7 +2239,8 @@ MVKImageView::MVKImageView(MVKDevice* device, const VkImageViewCreateInfo* pCrea
 		_subresourceRange.levelCount = _image->getMipLevelCount() - _subresourceRange.baseMipLevel;
 	}
 	if (_subresourceRange.layerCount == VK_REMAINING_ARRAY_LAYERS) {
-		_subresourceRange.layerCount = _image->getLayerCount() - _subresourceRange.baseArrayLayer;
+		uint32_t imgLayerCnt = getIs2dViewOf3d() ? _image->getExtent3D(0, _subresourceRange.baseMipLevel).depth : _image->getLayerCount();
+		_subresourceRange.layerCount = imgLayerCnt - _subresourceRange.baseArrayLayer;
 	}
 
 	auto& mtlFeats = getMetalFeatures();

@@ -1,7 +1,7 @@
 /*
  * MVKDescriptorSet.h
  *
- * Copyright (c) 2015-2025 The Brenwill Workshop Ltd. (http://www.brenwill.com)
+ * Copyright (c) 2015-2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -137,9 +137,9 @@ struct MVKDescriptorResourceCount {
 /** Descriptor metadata for images. */
 struct MVKDescriptorMetaImage {
 	uint32_t size;
-	uint32_t pad;
+	uint32_t swizzle;
 	MVKDescriptorMetaImage() = default;
-	constexpr MVKDescriptorMetaImage(uint32_t size_): size(size_), pad(0) {}
+	constexpr MVKDescriptorMetaImage(uint32_t size_, uint32_t swizzle_ = 0): size(size_), swizzle(swizzle_) {}
 };
 static_assert(sizeof(MVKDescriptorMetaImage) == sizeof(uint64_t));
 

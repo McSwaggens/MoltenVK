@@ -1,7 +1,7 @@
 /*
  * SPIRVToMSLConverter.cpp
  *
- * Copyright (c) 2015-2025 The Brenwill Workshop Ltd. (http://www.brenwill.com)
+ * Copyright (c) 2015-2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -355,17 +355,19 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
 #endif
 
 	// Populate the shader conversion results with info from the compilation run,
-	// and mark which vertex attributes and resource bindings are used by the shader
+	// and mark which vertex attributes and resource bindings are used by the shader.
 	if (wasConverted && pMSLCompiler) {
 		populateEntryPoint(pMSLCompiler, shaderConfig.options, conversionResult.resultInfo.entryPoint);
 		conversionResult.resultInfo.isRasterizationDisabled = pMSLCompiler->get_is_rasterization_disabled();
 		conversionResult.resultInfo.isPositionInvariant = pMSLCompiler->is_position_invariant();
+		conversionResult.resultInfo.needsSwizzleBuffer = pMSLCompiler->needs_swizzle_buffer();
 		conversionResult.resultInfo.needsOutputBuffer = pMSLCompiler->needs_output_buffer();
 		conversionResult.resultInfo.needsPatchOutputBuffer = pMSLCompiler->needs_patch_output_buffer();
 		conversionResult.resultInfo.needsBufferSizeBuffer = pMSLCompiler->needs_buffer_size_buffer();
 		conversionResult.resultInfo.needsInputThreadgroupMem = pMSLCompiler->needs_input_threadgroup_mem();
 		conversionResult.resultInfo.needsDispatchBaseBuffer = pMSLCompiler->needs_dispatch_base_buffer();
 		conversionResult.resultInfo.needsViewRangeBuffer = pMSLCompiler->needs_view_mask_buffer();
+		conversionResult.resultInfo.needsDrawId = pMSLCompiler->has_active_builtin(spv::BuiltInDrawIndex, spv::StorageClassInput);
 		conversionResult.resultInfo.usesPhysicalStorageBufferAddressesCapability = usesPhysicalStorageBufferAddressesCapability(pMSLCompiler);
 		populateSpecializationMacros(pMSLCompiler, conversionResult.resultInfo.specializationMacros);
 

@@ -1,7 +1,7 @@
 /*
  * SPIRVToMSLConverter.h
  *
- * Copyright (c) 2015-2025 The Brenwill Workshop Ltd. (http://www.brenwill.com)
+ * Copyright (c) 2015-2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -252,6 +252,7 @@ namespace mvk {
 		SPIRVEntryPoint entryPoint;
 		bool isRasterizationDisabled = false;
 		bool isPositionInvariant = false;
+		bool needsSwizzleBuffer = false;
 		bool needsOutputBuffer = false;
 		bool needsPatchOutputBuffer = false;
 		bool needsBufferSizeBuffer = false;
@@ -259,6 +260,7 @@ namespace mvk {
 		bool needsInputThreadgroupMem = false;
 		bool needsDispatchBaseBuffer = false;
 		bool needsViewRangeBuffer = false;
+		bool needsDrawId = false;
 		bool usesPhysicalStorageBufferAddressesCapability = false;
 		std::map<uint32_t, MSLSpecializationMacroInfo> specializationMacros;
 
