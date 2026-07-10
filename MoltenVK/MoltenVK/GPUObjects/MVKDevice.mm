@@ -632,7 +632,7 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 				rtpFeatures->rayTracingPipelineShaderGroupHandleCaptureReplay = false;
 				rtpFeatures->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false;
 				rtpFeatures->rayTracingPipelineTraceRaysIndirect = false;
-				rtpFeatures->rayTraversalPrimitiveCulling = false;
+				rtpFeatures->rayTraversalPrimitiveCulling = _gpuCapabilities.supportsRayTracing;
 				break;
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR: {
@@ -4327,26 +4327,14 @@ void MVKDevice::destroyDeferredOperation(MVKDeferredOperation* mvkDeferredOperat
 MVKAccelerationStructure* MVKDevice::createAccelerationStructure(const VkAccelerationStructureCreateInfoKHR* pCreateInfo,
 																 const VkAllocationCallbacks* pAllocator) {
 	auto* mvkAS = new MVKAccelerationStructure(this, pCreateInfo);
-	addAccelerationStructure(mvkAS);
 	return mvkAS;
 }
 
 void MVKDevice::destroyAccelerationStructure(MVKAccelerationStructure* mvkAccStruct,
 											 const VkAllocationCallbacks* pAllocator) {
 	if (mvkAccStruct) {
-		removeAccelerationStructure(mvkAccStruct);
 		mvkAccStruct->destroy();
 	}
-}
-
-void MVKDevice::addAccelerationStructure(MVKAccelerationStructure* mvkAS) {
-	lock_guard<mutex> lock(_rezLock);
-	_accelerationStructures.push_back(mvkAS);
-}
-
-void MVKDevice::removeAccelerationStructure(MVKAccelerationStructure* mvkAS) {
-	lock_guard<mutex> lock(_rezLock);
-	mvkRemoveFirstOccurance(_accelerationStructures, mvkAS);
 }
 
 MVKEvent* MVKDevice::createEvent(const VkEventCreateInfo* pCreateInfo,

@@ -20,10 +20,18 @@
 
 #include "MVKDevice.h"
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
 #import <Metal/Metal.h>
+
+/** Per-primitive metadata carried through Metal intersection results. */
+struct MVKRTPrimitiveData {
+	uint32_t geometryIndex;
+	uint32_t primitiveIndex;
+	uint32_t geometryFlags;
+};
 
 
 #pragma mark -
@@ -61,10 +69,17 @@ public:
 	/** Returns the size of this acceleration structure. */
 	VkDeviceSize getSize() { return _size; }
 
-	id<MTLBuffer> getInstanceShaderBindingTableOffsetBuffer() { return _instanceShaderBindingTableOffsetBuffer; }
+	id<MTLBuffer> getInstanceShaderBindingTableOffsetBuffer();
 	void setInstanceShaderBindingTableOffsetBuffer(id<MTLBuffer> mtlBuffer);
 
+	/** Marks this acceleration structure and its referenced BLASes as resident. */
+	void encodeResourceUsage(id<MTLComputeCommandEncoder> mtlEncoder);
+
+	/** Sets the BLASes referenced by this TLAS. Retains each. */
+	void setReferencedBLASes(NSArray<id<MTLAccelerationStructure>>* blasArray);
+
 	static MVKAccelerationStructure* getMVKAccelerationStructure(id<MTLAccelerationStructure> mtlAS);
+	static MVKAccelerationStructure* getMVKAccelerationStructure(VkDeviceAddress deviceAddress);
 
 	MVKAccelerationStructure(MVKDevice* device, const VkAccelerationStructureCreateInfoKHR* pCreateInfo);
 
@@ -80,7 +95,9 @@ protected:
 	VkDeviceSize _offset;
 	VkDeviceSize _size;
 	std::vector<id<MTLBuffer>> _retainedMTLBuffers;
+	std::vector<id<MTLAccelerationStructure>> _referencedBLASes;
+	std::mutex _metadataLock;
 
-	static std::mutex _mtlAccelerationStructureMapLock;
+	static std::shared_mutex _mtlAccelerationStructureMapLock;
 	static std::unordered_map<uint64_t, MVKAccelerationStructure*> _mtlAccelerationStructureMap;
 };

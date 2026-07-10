@@ -3394,8 +3394,8 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 				triDesc.triangleCount = primCount;
 				triDesc.vertexStride = geom->geometry.triangles.vertexStride;
 				triDesc.intersectionFunctionTableOffset = g;
-				triDesc.primitiveDataStride = sizeof(uint32_t) * 2;
-				triDesc.primitiveDataElementSize = sizeof(uint32_t) * 2;
+				triDesc.primitiveDataStride = sizeof(MVKRTPrimitiveData);
+				triDesc.primitiveDataElementSize = sizeof(MVKRTPrimitiveData);
 				triDesc.opaque = (geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
 				[geomDescs addObject: triDesc];
 			} else if (geom->geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
@@ -3404,8 +3404,8 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 				aabbDesc.boundingBoxCount = primCount;
 				aabbDesc.boundingBoxStride = geom->geometry.aabbs.stride;
 				aabbDesc.intersectionFunctionTableOffset = g;
-				aabbDesc.primitiveDataStride = sizeof(uint32_t) * 2;
-				aabbDesc.primitiveDataElementSize = sizeof(uint32_t) * 2;
+				aabbDesc.primitiveDataStride = sizeof(MVKRTPrimitiveData);
+				aabbDesc.primitiveDataElementSize = sizeof(MVKRTPrimitiveData);
 				aabbDesc.opaque = (geom->flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
 				[geomDescs addObject: aabbDesc];
 			}
@@ -3427,7 +3427,7 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 		NSUInteger totalPrimitiveDataSize = 0;
 		for (uint32_t g = 0; g < geomCount; g++) {
 			uint32_t primCount = pMaxPrimitiveCounts[g];
-			totalPrimitiveDataSize += primCount * sizeof(uint32_t) * 2;
+			totalPrimitiveDataSize += primCount * sizeof(MVKRTPrimitiveData);
 		}
 		id<MTLBuffer> dummyPrimBuf = nil;
 		if (totalPrimitiveDataSize > 0) {
@@ -3439,12 +3439,12 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetAccelerationStructureBuildSizesKHR(
 					auto* triDesc = (MTLAccelerationStructureTriangleGeometryDescriptor*)desc;
 					triDesc.primitiveDataBuffer = dummyPrimBuf;
 					triDesc.primitiveDataBufferOffset = offset;
-					offset += triDesc.triangleCount * sizeof(uint32_t) * 2;
+					offset += triDesc.triangleCount * sizeof(MVKRTPrimitiveData);
 				} else if ([desc isKindOfClass: [MTLAccelerationStructureBoundingBoxGeometryDescriptor class]]) {
 					auto* aabbDesc = (MTLAccelerationStructureBoundingBoxGeometryDescriptor*)desc;
 					aabbDesc.primitiveDataBuffer = dummyPrimBuf;
 					aabbDesc.primitiveDataBufferOffset = offset;
-					offset += aabbDesc.boundingBoxCount * sizeof(uint32_t) * 2;
+					offset += aabbDesc.boundingBoxCount * sizeof(MVKRTPrimitiveData);
 				}
 			}
 		}
@@ -3494,7 +3494,8 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkGetDeviceAccelerationStructureCompatibilityKHR(
 	VkAccelerationStructureCompatibilityKHR*    pCompatibility) {
 
 	MVKTraceVulkanCallStart();
-	*pCompatibility = VK_ACCELERATION_STRUCTURE_COMPATIBILITY_COMPATIBLE_KHR;
+	// MoltenVK does not support acceleration-structure serialization or deserialization.
+	*pCompatibility = VK_ACCELERATION_STRUCTURE_COMPATIBILITY_INCOMPATIBLE_KHR;
 	MVKTraceVulkanCallEnd();
 }
 

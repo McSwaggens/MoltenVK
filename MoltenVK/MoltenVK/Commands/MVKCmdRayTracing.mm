@@ -90,7 +90,7 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 	cmdEncoder->finalizeDispatchState();
 	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch);
 
-	[mtlEncoder setComputePipelineState: rtPipeline->getMTLComputePipelineState()];
+	cmdEncoder->getMtlCompute().bindPipeline(mtlEncoder, rtPipeline->getMTLComputePipelineState());
 
 	std::vector<uint32_t> hitGroupIndices;
 	if (_hitSBT.deviceAddress && _hitSBT.size && _hitSBT.stride &&
@@ -100,9 +100,17 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 
 	id<MTLBuffer> instanceSBTOffsetBuffer = nil;
 	auto& vk = cmdEncoder->getState().vkCompute();
+	// Collect descriptor set GPU buffers in a single pass for later IFT binding.
+	struct DescSetInfo { id<MTLBuffer> gpuBuffer; NSUInteger gpuOffset; };
+	MVKSmallVector<DescSetInfo, 4> descSetInfos;
 	if (vk._layout) {
-		for (uint32_t s = 0; s < vk._layout->getDescriptorSetCount(); s++) {
+		size_t setCount = vk._layout->getDescriptorSetCount();
+		descSetInfos.resize(setCount);
+		for (size_t s = 0; s < setCount; s++) {
 			MVKDescriptorSet* set = vk._descriptorSets[s];
+			descSetInfos[s] = { set ? set->gpuBufferObject : nil,
+								set ? set->gpuBufferOffset : 0 };
+
 			const MVKDescriptorSetLayout* setLayout = vk._layout->getDescriptorSetLayout(s);
 			if (!set || !setLayout || !set->cpuBuffer) { continue; }
 
@@ -114,29 +122,16 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 				}
 
 				auto* desc = reinterpret_cast<id<MTLAccelerationStructure>*>(set->cpuBuffer + binding.cpuOffset);
-				MVKAccelerationStructure* mvkAS = MVKAccelerationStructure::getMVKAccelerationStructure(desc[0]);
-					if (mvkAS) {
-					instanceSBTOffsetBuffer = mvkAS->getInstanceShaderBindingTableOffsetBuffer();
-
-					// Mark the TLAS and all referenced BLASes for GPU access.
-					// Without useResource, Metal may evict the AS data after the first frame.
-					id<MTLAccelerationStructure> tlasAS = desc[0];
-					if (tlasAS) {
-						[mtlEncoder useResource: tlasAS usage: MTLResourceUsageRead];
-					}
-					for (auto* as : cmdEncoder->getDevice()->getAccelerationStructures()) {
-						if ((as->getType() == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
-							 as->getType() == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR) &&
-							as->getMTLAccelerationStructure()) {
-							[mtlEncoder useResource: as->getMTLAccelerationStructure() usage: MTLResourceUsageRead];
+				uint32_t descriptorCount = binding.getDescriptorCount(set->variableDescriptorCount);
+				for (uint32_t i = 0; i < descriptorCount; i++) {
+					if (auto* mvkAS = MVKAccelerationStructure::getMVKAccelerationStructure(desc[i])) {
+						mvkAS->encodeResourceUsage(mtlEncoder);
+						if (!instanceSBTOffsetBuffer) {
+							instanceSBTOffsetBuffer = mvkAS->getInstanceShaderBindingTableOffsetBuffer();
 						}
 					}
-
-					break;
 				}
 			}
-
-			if (instanceSBTOffsetBuffer) { break; }
 		}
 	}
 	[mtlEncoder setBuffer: instanceSBTOffsetBuffer
@@ -151,16 +146,12 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 			[mtlEncoder setIntersectionFunctionTable: ift
 									 atBufferIndex: MVKRayTracingPipeline::kIntersectionFunctionTableBufferIndex];
 
-			// Bind descriptor set resources to the intersection function table
-			// so the intersection function can access images/buffers.
-			if (vk._layout) {
-				for (uint32_t s = 0; s < vk._layout->getDescriptorSetCount(); s++) {
-					MVKDescriptorSet* set = vk._descriptorSets[s];
-					if (set && set->gpuBufferObject) {
-						[ift setBuffer: set->gpuBufferObject
-							   offset: set->gpuBufferOffset
-							  atIndex: s];
-					}
+			// Bind descriptor set resources to the intersection function table.
+			for (size_t s = 0; s < descSetInfos.size(); s++) {
+				if (descSetInfos[s].gpuBuffer) {
+					[ift setBuffer: descSetInfos[s].gpuBuffer
+						   offset: descSetInfos[s].gpuOffset
+						  atIndex: s];
 				}
 			}
 		}

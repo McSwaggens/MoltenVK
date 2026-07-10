@@ -882,9 +882,6 @@ public:
 	 */
 	id<MTLBuffer> getMTLBufferForDeviceAddress(VkDeviceAddress address, VkDeviceSize* pOffset);
 
-	/** Returns all tracked acceleration structures (for TLAS instance lookups). */
-	MVKSmallVector<MVKAccelerationStructure*>& getAccelerationStructures() { return _accelerationStructures; }
-
 	/** Adds the specified host semaphore to be woken upon device loss. */
 	void addSemaphore(MVKSemaphoreImpl* sem4);
 
@@ -1071,8 +1068,6 @@ protected:
 	void propagateDebugName() override  {}
 	MVKBuffer* addBuffer(MVKBuffer* mvkBuff);
 	MVKBuffer* removeBuffer(MVKBuffer* mvkBuff);
-	void addAccelerationStructure(MVKAccelerationStructure* mvkAS);
-	void removeAccelerationStructure(MVKAccelerationStructure* mvkAS);
 	MVKImage* addImage(MVKImage* mvkImg);
 	MVKImage* removeImage(MVKImage* mvkImg);
     void initPerformanceTracking();
@@ -1115,7 +1110,6 @@ protected:
 	MVKSmallVector<MVKSmallVector<MVKQueue*, kMVKQueueCountPerQueueFamily>, kMVKQueueFamilyCount> _queuesByQueueFamilyIndex;
 	MVKSmallVector<MVKResource*> _resources;
 	MVKSmallVector<MVKBuffer*> _gpuAddressableBuffers;
-	MVKSmallVector<MVKAccelerationStructure*> _accelerationStructures;
 	MVKSmallVector<MVKPrivateDataSlot*> _privateDataSlots;
 	MVKSmallVector<bool> _privateDataSlotsAvailability;
 	MVKSmallVector<MVKSemaphoreImpl*> _awaitingSemaphores;
