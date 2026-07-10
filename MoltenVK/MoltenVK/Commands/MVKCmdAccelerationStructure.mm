@@ -237,6 +237,9 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					id<MTLBuffer> sbtOffsetBuffer = [cmdEncoder->getMTLDevice() newBufferWithLength: sizeof(uint32_t) * instanceCount
 					                                                                          options: MTLResourceStorageModeShared];
 					uint32_t* sbtOffsets = sbtOffsetBuffer ? (uint32_t*)sbtOffsetBuffer.contents : nullptr;
+					id<MTLBuffer> instanceFlagsBuffer = [cmdEncoder->getMTLDevice() newBufferWithLength: sizeof(uint32_t) * instanceCount
+					                                                                            options: MTLResourceStorageModeShared];
+					uint32_t* instanceFlags = instanceFlagsBuffer ? (uint32_t*)instanceFlagsBuffer.contents : nullptr;
 
 					auto* mtlInsts = (MTLAccelerationStructureUserIDInstanceDescriptor*)((uint8_t*)mtlInstAlloc->getContents());
 
@@ -287,6 +290,9 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 						if (sbtOffsets) {
 							sbtOffsets[j] = vkInst->instanceShaderBindingTableRecordOffset;
 						}
+						if (instanceFlags) {
+							instanceFlags[j] = vkInst->flags;
+						}
 
 						// Map instanceCustomIndex to Metal's userID
 						mtlInsts[j].userID = vkInst->instanceCustomIndex;
@@ -314,8 +320,10 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 					instDesc.instanceDescriptorBuffer = mtlInstBuf;
 					instDesc.instanceDescriptorBufferOffset = mtlInstOffset;
 					dstAS->setInstanceShaderBindingTableOffsetBuffer(sbtOffsetBuffer);
+					dstAS->setInstanceFlagsBuffer(instanceFlagsBuffer);
 					dstAS->setReferencedBLASes(blasArray);
 					[sbtOffsetBuffer release];
+					[instanceFlagsBuffer release];
 				}
 			}
 

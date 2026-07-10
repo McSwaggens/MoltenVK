@@ -75,6 +75,18 @@ id<MTLBuffer> MVKAccelerationStructure::getInstanceShaderBindingTableOffsetBuffe
 	return _instanceShaderBindingTableOffsetBuffer;
 }
 
+void MVKAccelerationStructure::setInstanceFlagsBuffer(id<MTLBuffer> mtlBuffer) {
+	std::lock_guard<std::mutex> lock(_metadataLock);
+	if (_instanceFlagsBuffer == mtlBuffer) { return; }
+	[_instanceFlagsBuffer release];
+	_instanceFlagsBuffer = [mtlBuffer retain];
+}
+
+id<MTLBuffer> MVKAccelerationStructure::getInstanceFlagsBuffer() {
+	std::lock_guard<std::mutex> lock(_metadataLock);
+	return _instanceFlagsBuffer;
+}
+
 MVKAccelerationStructure* MVKAccelerationStructure::getMVKAccelerationStructure(id<MTLAccelerationStructure> mtlAS) {
 	if (!mtlAS) { return nullptr; }
 	return getMVKAccelerationStructure(mtlAS.gpuResourceID._impl);
@@ -106,6 +118,8 @@ void MVKAccelerationStructure::clearRetainedBuffers() {
 	_referencedBLASes.clear();
 	[_instanceShaderBindingTableOffsetBuffer release];
 	_instanceShaderBindingTableOffsetBuffer = nil;
+	[_instanceFlagsBuffer release];
+	_instanceFlagsBuffer = nil;
 }
 
 void MVKAccelerationStructure::setReferencedBLASes(NSArray<id<MTLAccelerationStructure>>* blasArray) {
@@ -137,6 +151,7 @@ void MVKAccelerationStructure::copyRetainedBuffersFrom(MVKAccelerationStructure*
 	std::vector<id<MTLBuffer>> retainedBuffers;
 	std::vector<id<MTLAccelerationStructure>> referencedBLASes;
 	id<MTLBuffer> sbtOffsetBuffer = nil;
+	id<MTLBuffer> instanceFlagsBuffer = nil;
 	if (srcAS) {
 		std::lock_guard<std::mutex> srcLock(srcAS->_metadataLock);
 		retainedBuffers.reserve(srcAS->_retainedMTLBuffers.size());
@@ -148,6 +163,7 @@ void MVKAccelerationStructure::copyRetainedBuffersFrom(MVKAccelerationStructure*
 			referencedBLASes.push_back([blas retain]);
 		}
 		sbtOffsetBuffer = [srcAS->_instanceShaderBindingTableOffsetBuffer retain];
+		instanceFlagsBuffer = [srcAS->_instanceFlagsBuffer retain];
 	}
 
 	std::lock_guard<std::mutex> lock(_metadataLock);
@@ -158,9 +174,11 @@ void MVKAccelerationStructure::copyRetainedBuffersFrom(MVKAccelerationStructure*
 		[blas release];
 	}
 	[_instanceShaderBindingTableOffsetBuffer release];
+	[_instanceFlagsBuffer release];
 	_retainedMTLBuffers = std::move(retainedBuffers);
 	_referencedBLASes = std::move(referencedBLASes);
 	_instanceShaderBindingTableOffsetBuffer = sbtOffsetBuffer;
+	_instanceFlagsBuffer = instanceFlagsBuffer;
 }
 
 MVKAccelerationStructure::~MVKAccelerationStructure() {

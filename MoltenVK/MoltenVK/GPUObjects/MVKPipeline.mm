@@ -4176,6 +4176,24 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 	// The SPIRV-Cross emission left a marker: "(void)_mtl_isect;"
 	// Replace it with calls to the closest-hit or miss function based on intersection result.
 	{
+		// Metal cannot reliably distinguish Vulkan opaque and non-opaque geometry when
+		// applying opacity cull modes without an intersection function table. Remove
+		// those modes and filter results using the Vulkan metadata carried per primitive.
+		size_t opacityCullPos = 0;
+		while ((opacityCullPos = raygenMSL.find("_mtl_i.set_opacity_cull_mode(", opacityCullPos)) != std::string::npos) {
+			auto ifLineStart = raygenMSL.rfind('\n', opacityCullPos);
+			ifLineStart = (ifLineStart == std::string::npos) ? 0 : ifLineStart + 1;
+			ifLineStart = raygenMSL.rfind('\n', ifLineStart > 0 ? ifLineStart - 1 : 0);
+			ifLineStart = (ifLineStart == std::string::npos) ? 0 : ifLineStart + 1;
+			auto statementEnd = raygenMSL.find(';', opacityCullPos);
+			if (statementEnd == std::string::npos) { break; }
+			if (statementEnd + 1 < raygenMSL.size() && raygenMSL[statementEnd + 1] == '\n') {
+				statementEnd++;
+			}
+			raygenMSL.erase(ifLineStart, statementEnd - ifLineStart + 1);
+			opacityCullPos = ifLineStart;
+		}
+
 		std::string callCode;
 		if (!closestHitFuncs.empty() || !anyHitFuncs.empty() || !missFuncs.empty() || hasIntersection) {
 			// Populate RT builtins struct from intersection result and ray data.
@@ -4269,6 +4287,9 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			if (!ahitGroupDispatch.empty()) {
 				callCode += "    bool _mvk_opaque = _mvk_primitive_data && ((_mvk_primitive_data[2] & " +
 					std::to_string(VK_GEOMETRY_OPAQUE_BIT_KHR) + ") != 0);\n";
+				callCode += "    uint _mvk_instance_flags_value = _mvk_instance_flags ? _mvk_instance_flags[_mvk_rt.instanceId] : 0u;\n";
+				callCode += "    if ((_mvk_instance_flags_value & " + std::to_string(VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR) + ") != 0) _mvk_opaque = true;\n";
+				callCode += "    if ((_mvk_instance_flags_value & " + std::to_string(VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR) + ") != 0) _mvk_opaque = false;\n";
 				callCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsOpaqueKHRMask) + ") != 0) _mvk_opaque = true;\n";
 				callCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsNoOpaqueKHRMask) + ") != 0) _mvk_opaque = false;\n";
 				callCode += "    if (!_mvk_opaque) {\n";
@@ -4284,13 +4305,19 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			}
 
 			// Emit closest-hit dispatch
+			if (!hitGroupDispatch.empty()) {
+				callCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsSkipClosestHitShaderKHRMask) + ") == 0) {\n";
+			}
 			if (hitGroupDispatch.size() == 1) {
-				callCode += "    " + hitGroupDispatch[0].second + "(" + buildHelperArgs(hitGroupDispatch[0].second) + ");\n";
+				callCode += "      " + hitGroupDispatch[0].second + "(" + buildHelperArgs(hitGroupDispatch[0].second) + ");\n";
 			} else if (hitGroupDispatch.size() > 1) {
-				callCode += "    switch (_mvk_hit_group) {\n";
+				callCode += "      switch (_mvk_hit_group) {\n";
 				for (auto& [gIdx, fn] : hitGroupDispatch)
-					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
-				callCode += "      default: " + hitGroupDispatch[0].second + "(" + buildHelperArgs(hitGroupDispatch[0].second) + "); break;\n    }\n";
+					callCode += "        case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
+				callCode += "        default: " + hitGroupDispatch[0].second + "(" + buildHelperArgs(hitGroupDispatch[0].second) + "); break;\n      }\n";
+			}
+			if (!hitGroupDispatch.empty()) {
+				callCode += "    }\n";
 			}
 
 			callCode += "  } else {\n";
@@ -4310,8 +4337,32 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 		size_t markerPos = 0;
 		while ((markerPos = raygenMSL.find("(void)_mtl_isect;", markerPos)) != std::string::npos) {
-			raygenMSL.replace(markerPos, strlen("(void)_mtl_isect;"), callCode);
-			markerPos += callCode.size();
+			std::string traceCallCode;
+			auto isectDecl = raygenMSL.rfind("auto _mtl_isect = ", markerPos);
+			if (isectDecl != std::string::npos) {
+				auto expressionStart = isectDecl + strlen("auto _mtl_isect = ");
+				auto expressionEnd = raygenMSL.find(';', expressionStart);
+				if (expressionEnd != std::string::npos && expressionEnd < markerPos) {
+					std::string intersectExpression = raygenMSL.substr(expressionStart, expressionEnd - expressionStart);
+					traceCallCode += "  while (_mtl_isect.type != intersection_type::none) {\n";
+					traceCallCode += "    const device uint* _mvk_filter_primitive_data = (const device uint*)_mtl_isect.primitive_data;\n";
+					traceCallCode += "    bool _mvk_filter_opaque = _mvk_filter_primitive_data && ((_mvk_filter_primitive_data[2] & " + std::to_string(VK_GEOMETRY_OPAQUE_BIT_KHR) + ") != 0);\n";
+					traceCallCode += "    uint _mvk_filter_instance_flags = _mvk_instance_flags ? _mvk_instance_flags[_mtl_isect.instance_id] : 0u;\n";
+					traceCallCode += "    if ((_mvk_filter_instance_flags & " + std::to_string(VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR) + ") != 0) _mvk_filter_opaque = true;\n";
+					traceCallCode += "    if ((_mvk_filter_instance_flags & " + std::to_string(VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR) + ") != 0) _mvk_filter_opaque = false;\n";
+					traceCallCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsOpaqueKHRMask) + ") != 0) _mvk_filter_opaque = true;\n";
+					traceCallCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsNoOpaqueKHRMask) + ") != 0) _mvk_filter_opaque = false;\n";
+					traceCallCode += "    bool _mvk_filter_culled = ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsCullOpaqueKHRMask) + ") != 0) && _mvk_filter_opaque;\n";
+					traceCallCode += "    _mvk_filter_culled = _mvk_filter_culled || (((_mtl_ray_flags & " + std::to_string(spv::RayFlagsCullNoOpaqueKHRMask) + ") != 0) && !_mvk_filter_opaque);\n";
+					traceCallCode += "    if (!_mvk_filter_culled) break;\n";
+					traceCallCode += "    _mtl_r.min_distance = nextafter(_mtl_isect.distance, 3.402823466e+38f);\n";
+					traceCallCode += "    _mtl_isect = " + intersectExpression + ";\n";
+					traceCallCode += "  }\n";
+				}
+			}
+			traceCallCode += callCode;
+			raygenMSL.replace(markerPos, strlen("(void)_mtl_isect;"), traceCallCode);
+			markerPos += traceCallCode.size();
 		}
 
 		// Ensure kernel has all parameters that helpers need.
@@ -4341,6 +4392,7 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 			addKernelParam(("constant uint* _mvk_hit_sbt [[buffer(" + std::to_string(MVKRayTracingPipeline::kHitSBTBufferIndex) + ")]]").c_str());
 		if (needsHitSBT)
 			addKernelParam(("constant uint* _mvk_instance_sbt_offsets [[buffer(" + std::to_string(MVKRayTracingPipeline::kInstanceSBTOffsetBufferIndex) + ")]]").c_str());
+		addKernelParam(("constant uint* _mvk_instance_flags [[buffer(" + std::to_string(MVKRayTracingPipeline::kInstanceFlagsBufferIndex) + ")]]").c_str());
 	}
 
 	// Replace executeCallableEXT markers with calls to callable helpers.

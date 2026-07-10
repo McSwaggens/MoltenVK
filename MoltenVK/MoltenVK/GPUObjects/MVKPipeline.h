@@ -471,6 +471,7 @@ protected:
 class MVKRayTracingPipeline : public MVKPipeline {
 
 public:
+	static constexpr uint32_t kInstanceFlagsBufferIndex = 25;
 	static constexpr uint32_t kMissSBTBufferIndex = 26;
 	static constexpr uint32_t kHitSBTBufferIndex = 27;
 	static constexpr uint32_t kCallableSBTBufferIndex = 28;

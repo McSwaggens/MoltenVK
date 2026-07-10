@@ -71,6 +71,8 @@ public:
 
 	id<MTLBuffer> getInstanceShaderBindingTableOffsetBuffer();
 	void setInstanceShaderBindingTableOffsetBuffer(id<MTLBuffer> mtlBuffer);
+	id<MTLBuffer> getInstanceFlagsBuffer();
+	void setInstanceFlagsBuffer(id<MTLBuffer> mtlBuffer);
 
 	/** Marks this acceleration structure and its referenced BLASes as resident. */
 	void encodeResourceUsage(id<MTLComputeCommandEncoder> mtlEncoder);
@@ -90,6 +92,7 @@ protected:
 
 	id<MTLAccelerationStructure> _mtlAccelerationStructure = nil;
 	id<MTLBuffer> _instanceShaderBindingTableOffsetBuffer = nil;
+	id<MTLBuffer> _instanceFlagsBuffer = nil;
 	VkAccelerationStructureTypeKHR _type;
 	VkBuffer _buffer;
 	VkDeviceSize _offset;

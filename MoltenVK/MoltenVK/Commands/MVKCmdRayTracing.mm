@@ -99,6 +99,7 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 	}
 
 	id<MTLBuffer> instanceSBTOffsetBuffer = nil;
+	id<MTLBuffer> instanceFlagsBuffer = nil;
 	auto& vk = cmdEncoder->getState().vkCompute();
 	// Collect descriptor set GPU buffers in a single pass for later IFT binding.
 	struct DescSetInfo { id<MTLBuffer> gpuBuffer; NSUInteger gpuOffset; };
@@ -129,6 +130,9 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 						if (!instanceSBTOffsetBuffer) {
 							instanceSBTOffsetBuffer = mvkAS->getInstanceShaderBindingTableOffsetBuffer();
 						}
+						if (!instanceFlagsBuffer) {
+							instanceFlagsBuffer = mvkAS->getInstanceFlagsBuffer();
+						}
 					}
 				}
 			}
@@ -137,6 +141,9 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 	[mtlEncoder setBuffer: instanceSBTOffsetBuffer
 				   offset: 0
 				  atIndex: MVKRayTracingPipeline::kInstanceSBTOffsetBufferIndex];
+	[mtlEncoder setBuffer: instanceFlagsBuffer
+				   offset: 0
+				  atIndex: MVKRayTracingPipeline::kInstanceFlagsBufferIndex];
 
 	// Bind the intersection function table if present (for AABB geometry).
 	if (rtPipeline->usesIntersectionFunctionTable()) {
