@@ -134,6 +134,9 @@ MVKMTLDeviceCapabilities::MVKMTLDeviceCapabilities(id<MTLDevice> mtlDev) {
 #if !MVK_OS_SIMULATOR
 	supportsRenderLinearTextures = supportsApple1;
 #endif
+#if MVK_XCODE_26 && !MVK_TVOS && !MVK_VISIONOS
+	supportsSamplerReduction = supportsApple10 && mvkOSVersionIsAtLeast(26.0);
+#endif
 }
 
 
@@ -863,7 +866,7 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 	supportedProps12.roundingModeIndependence = VK_SHADER_FLOAT_CONTROLS_INDEPENDENCE_NONE;
 	supportedProps12.shaderSignedZeroInfNanPreserveFloat16 = true;
 	supportedProps12.shaderSignedZeroInfNanPreserveFloat32 = true;
-	supportedProps12.shaderSignedZeroInfNanPreserveFloat64 = true;
+	supportedProps12.shaderSignedZeroInfNanPreserveFloat64 = false;
 	supportedProps12.shaderDenormPreserveFloat16 = false;
 	supportedProps12.shaderDenormPreserveFloat32 = false;
 	supportedProps12.shaderDenormPreserveFloat64 = false;
@@ -872,7 +875,7 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 	supportedProps12.shaderDenormFlushToZeroFloat64 = false;
 	supportedProps12.shaderRoundingModeRTEFloat16 = true;
 	supportedProps12.shaderRoundingModeRTEFloat32 = true;
-	supportedProps12.shaderRoundingModeRTEFloat64 = true;
+	supportedProps12.shaderRoundingModeRTEFloat64 = false;
 	supportedProps12.shaderRoundingModeRTZFloat16 = false;
 	supportedProps12.shaderRoundingModeRTZFloat32 = false;
 	supportedProps12.shaderRoundingModeRTZFloat64 = false;
@@ -905,8 +908,8 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 	supportedProps12.supportedStencilResolveModes = VK_RESOLVE_MODE_SAMPLE_ZERO_BIT;	// Metal allows you to set the stencil resolve filter to either Sample0 or the same sample used for depth resolve. This is impossible to express in Vulkan.
 	supportedProps12.independentResolveNone = true;
 	supportedProps12.independentResolve = true;
-	supportedProps12.filterMinmaxSingleComponentFormats = false;
-	supportedProps12.filterMinmaxImageComponentMapping = false;
+	supportedProps12.filterMinmaxSingleComponentFormats = _gpuCapabilities.supportsSamplerReduction;
+	supportedProps12.filterMinmaxImageComponentMapping = _gpuCapabilities.supportsSamplerReduction;
 	supportedProps12.maxTimelineSemaphoreValueDifference = std::numeric_limits<uint64_t>::max();
 	supportedProps12.framebufferIntegerColorSampleCounts = _metalFeatures.supportedSampleCounts;
 
@@ -2557,6 +2560,13 @@ void MVKPhysicalDevice::initMetalFeatures() {
 		_metalFeatures.nativeTextureSwizzle = true;
     }
 
+	// Intel UHD 630 (Gen9) reports Mac2 family through Metal,
+	// but simd_reduction operations (simd_sum, etc.) produce
+	// incorrect results on this hardware.
+	if (_properties.vendorID == kIntelVendorId) {
+		_metalFeatures.simdReduction = false;
+	}
+
     if (supportsMTLGPUFamily(Apple1)) {
 		_metalFeatures.mtlBufferAlignment = 64;
 		_metalFeatures.mtlConstantBufferAlignment = 4;
@@ -2567,12 +2577,14 @@ void MVKPhysicalDevice::initMetalFeatures() {
 
 		_metalFeatures.maxPerStageDynamicMTLBufferCount = _metalFeatures.maxPerStageBufferCount;
 		_metalFeatures.tileBasedDeferredRendering = true;
+		_metalFeatures.nativeTextureSwizzle = true;
 
 		// From testing, these guarantees are only true on Apple GPUs.
 		_metalFeatures.subgroupUniformControlFlow = true;
 		_metalFeatures.maximalReconvergence = true;
-		_metalFeatures.quadControlFlow = true;
-		_metalFeatures.nativeTextureSwizzle = true;
+
+		// FIXME: Fails tests using fragment terminate with quads on Apple GPUs.
+		_metalFeatures.quadControlFlow = false;
 
 		// Don't use barriers in render passes on Apple GPUs. Apple GPUs don't support them,
 		// and in fact Metal's validation layer will complain if you try to use them.
@@ -2662,12 +2674,9 @@ void MVKPhysicalDevice::initMetalFeatures() {
 	} else if ( mvkOSVersionIsAtLeast(13.0, 16.0, 1.0) ) {
 		_metalFeatures.mslVersionEnum = MTLLanguageVersion3_0;
 		setMSLVersion(3, 0);
-	} else if ( mvkOSVersionIsAtLeast(12.0, 15.0, 1.0) ) {
+	} else {
 		_metalFeatures.mslVersionEnum = MTLLanguageVersion2_4;
 		setMSLVersion(2, 4);
-	} else {
-		_metalFeatures.mslVersionEnum = MTLLanguageVersion2_3;
-		setMSLVersion(2, 3);
 	}
 
 	_metalFeatures.programmableSamplePositions = _mtlDevice.areProgrammableSamplePositionsSupported;
@@ -2709,8 +2718,11 @@ void MVKPhysicalDevice::initMetalFeatures() {
                 _metalFeatures.minSubgroupSize = 8;
                 break;
             case kAMDVendorId:
-                _metalFeatures.maxSubgroupSize = 64;
-                _metalFeatures.minSubgroupSize = isAMDRDNAGPU() ? 32 : _metalFeatures.maxSubgroupSize;
+                // Metal simdgroup operations (simd_shuffle_xor, etc.) produce incorrect
+                // results on AMD GPUs with 64-wide subgroups. Use 32-wide subgroups which
+                // matches RDNA wave32 mode and works correctly.
+                _metalFeatures.maxSubgroupSize = 32;
+                _metalFeatures.minSubgroupSize = 32;
                 break;
             case kAppleVendorId:
                 _metalFeatures.maxSubgroupSize = 32;
@@ -2869,9 +2881,9 @@ void MVKPhysicalDevice::initFeatures() {
 	// Additional non-extension Vulkan 1.2 features.
 	mvkClear(&_vulkan12NoExtFeatures);		// Start with everything cleared
 	_vulkan12NoExtFeatures.samplerMirrorClampToEdge = _metalFeatures.samplerMirrorClampToEdge;
-	_vulkan12NoExtFeatures.drawIndirectCount = false;
+	_vulkan12NoExtFeatures.drawIndirectCount = _metalFeatures.indirectDrawing;
 	_vulkan12NoExtFeatures.descriptorIndexing = _metalFeatures.arrayOfTextures && _metalFeatures.arrayOfSamplers;
-	_vulkan12NoExtFeatures.samplerFilterMinmax = false;
+	_vulkan12NoExtFeatures.samplerFilterMinmax = _gpuCapabilities.supportsSamplerReduction;
 	_vulkan12NoExtFeatures.shaderOutputViewportIndex = _features.multiViewport;
 	_vulkan12NoExtFeatures.shaderOutputLayer = _metalFeatures.layeredRendering;
 	_vulkan12NoExtFeatures.subgroupBroadcastDynamicId = _metalFeatures.simdPermute || _metalFeatures.quadPermute;
@@ -3593,6 +3605,9 @@ void MVKPhysicalDevice::initExtensions() {
 	}
 	if (!_metalFeatures.placementHeaps) {
 		pWritableExtns->vk_EXT_image_2d_view_of_3d.enabled = false;
+	}
+	if (!_gpuCapabilities.supportsSamplerReduction) {
+		pWritableExtns->vk_EXT_sampler_filter_minmax.enabled = false;
 	}
 
     // gpuAddress requires Tier2 argument buffer support (per feedback from Apple engineers).
