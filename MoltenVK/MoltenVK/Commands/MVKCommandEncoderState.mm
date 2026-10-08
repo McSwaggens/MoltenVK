@@ -554,6 +554,9 @@ static void executeBindOps(id<MTLCommandEncoder> encoder,
 		MVKDescriptorSet* set = common._descriptorSets[op.set];
 		uint32_t target = op.target;
 		MVKDescriptorSetLayout* setLayout = common._layout->getDescriptorSetLayout(op.set);
+		// The binding index may be that of the argument buffer layout through which ray tracing shaders read a push
+		// descriptor set. MVKPipelineLayout::populateBindOperations() asserts that it matches the binding of this layout.
+		assert(op.bindingIdx < setLayout->bindings().size());
 		const MVKDescriptorBinding& binding = setLayout->bindings()[op.bindingIdx];
 		const char* src = set->cpuBuffer + binding.cpuOffset + op.offset();
 		const uint32_t* dynOffs = implicitBufferData.dynamicOffsets.data() + op.target2;
@@ -785,35 +788,18 @@ static void bindVulkanGraphicsToMetalCompute(
 	                   MVKResourceBinder::Compute());
 }
 
-/** Binds resources for running Vulkan compute commands on a Metal compute command encoder. */
-static void bindVulkanComputeToMetalCompute(
+/**
+ * Binds resources for running Vulkan compute or ray tracing commands on a Metal compute command encoder.
+ * The shaders of both bind points use the resources of the compute stage.
+ */
+template <typename VkState, typename Pipeline>
+static void bindVulkanComputeStageToMetalCompute(
   id<MTLComputeCommandEncoder> encoder,
   MVKCommandEncoder& mvkEncoder,
-  const MVKVulkanComputeCommandEncoderState& vkState,
+  const VkState& vkState,
   const MVKVulkanSharedCommandEncoderState& vkShared,
   MVKMetalComputeCommandEncoderState& mtlState,
-  MVKComputePipeline* pipeline) {
-	bindMetalResources(encoder,
-	                   mvkEncoder,
-	                   vkState,
-	                   pipeline->getStageResources(),
-	                   vkState._implicitBufferData,
-	                   vkShared._pushConstants.data(),
-	                   kMVKShaderStageCompute,
-	                   MVKResourceUsageStages::Compute,
-	                   mtlState._exists,
-	                   mtlState._bindings,
-	                   MVKResourceBinder::Compute());
-}
-
-/** Binds resources for running Vulkan ray tracing commands on a Metal compute command encoder. */
-static void bindVulkanRayTracingToMetalCompute(
-  id<MTLComputeCommandEncoder> encoder,
-  MVKCommandEncoder& mvkEncoder,
-  const MVKVulkanRayTracingCommandEncoderState& vkState,
-  const MVKVulkanSharedCommandEncoderState& vkShared,
-  MVKMetalComputeCommandEncoderState& mtlState,
-  MVKRayTracingPipeline* pipeline) {
+  Pipeline* pipeline) {
 	bindMetalResources(encoder,
 	                   mvkEncoder,
 	                   vkState,
@@ -1065,9 +1051,9 @@ void MVKVulkanGraphicsCommandEncoderState::bindDescriptorSets(
 	}
 }
 
-#pragma mark - MVKVulkanComputeCommandEncoderState
+#pragma mark - MVKVulkanComputeStageEncoderState
 
-void MVKVulkanComputeCommandEncoderState::bindDescriptorSets(
+void MVKVulkanComputeStageEncoderState::bindDescriptorSets(
 	MVKPipelineLayout* layout,
 	uint32_t firstSet,
 	uint32_t setCount,
@@ -1075,23 +1061,6 @@ void MVKVulkanComputeCommandEncoderState::bindDescriptorSets(
 	uint32_t dynamicOffsetCount,
 	const uint32_t* dynamicOffsets)
 {
-	::bindDescriptorSets(_implicitBufferData, kMVKShaderStageCompute, layout, firstSet, setCount, sets, dynamicOffsetCount, dynamicOffsets);
-	for (uint32_t i = 0; i < setCount; i++) {
-		_descriptorSets[firstSet + i] = sets[i];
-	}
-}
-
-#pragma mark - MVKVulkanRayTracingCommandEncoderState
-
-void MVKVulkanRayTracingCommandEncoderState::bindDescriptorSets(
-	MVKPipelineLayout* layout,
-	uint32_t firstSet,
-	uint32_t setCount,
-	MVKDescriptorSet*const* sets,
-	uint32_t dynamicOffsetCount,
-	const uint32_t* dynamicOffsets)
-{
-	// Ray tracing shaders run in Metal compute pipelines, using the resource bindings of the compute stage.
 	::bindDescriptorSets(_implicitBufferData, kMVKShaderStageCompute, layout, firstSet, setCount, sets, dynamicOffsetCount, dynamicOffsets);
 	for (uint32_t i = 0; i < setCount; i++) {
 		_descriptorSets[firstSet + i] = sets[i];
@@ -1651,16 +1620,35 @@ void MVKMetalComputeCommandEncoderState::bindTexture(id<MTLComputeCommandEncoder
 void MVKMetalComputeCommandEncoderState::bindSampler(id<MTLComputeCommandEncoder> encoder, id<MTLSamplerState> sampler, NSUInteger index) {
 	::bindSampler(encoder, sampler, index, _exists, _bindings, MVKComputeBinder());
 }
+// A function table occupies a buffer index. Its binding is tracked like that of a buffer, identified by the table,
+// so it is invalidated by binding anything else at the index, and binding the same table again is skipped.
+void MVKMetalComputeCommandEncoderState::bindVisibleFunctionTable(id<MTLComputeCommandEncoder> encoder, id<MTLVisibleFunctionTable> table, NSUInteger index) {
+	assert(index < kMVKMaxBufferCount);
+	MVKStageResourceBindings::Buffer binding = { reinterpret_cast<id<MTLBuffer>>(table), 0 };
+	if (!_exists.buffers.get(index) || _bindings.buffers[index] != binding) {
+		if (index < kMVKMaxDescriptorSetCount) { _exists.descriptorSetData.clear(index); }
+		_exists.buffers.set(index);
+		_bindings.buffers[index] = binding;
+		[encoder setVisibleFunctionTable:table atBufferIndex:index];
+	}
+}
 
-void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
+/**
+ * Binds the Metal pipeline and the resources of a Vulkan bind point whose shaders run in the Metal compute stage,
+ * and returns whether the Vulkan pipeline has a Metal pipeline. Resources added to the use resource helper are
+ * left for the caller to use.
+ */
+template <typename VkState>
+bool MVKMetalComputeCommandEncoderState::bindVulkanComputeStage(
   id<MTLComputeCommandEncoder> encoder,
   MVKCommandEncoder& mvkEncoder,
-  const MVKVulkanComputeCommandEncoderState& vk,
-  const MVKVulkanSharedCommandEncoderState& vkShared) {
-	MVKComputePipeline* pipeline = vk._pipeline;
+  const VkState& vk,
+  const MVKVulkanSharedCommandEncoderState& vkShared,
+  bool isVkRayTracing) {
+	auto* pipeline = vk._pipeline;
 	id<MTLComputePipelineState> mtlPipeline = pipeline->getPipelineState();
 	if (!mtlPipeline) // Abort if pipeline could not be created.
-		return;
+		return false;
 
 	_vkPipeline = pipeline;
 
@@ -1669,16 +1657,27 @@ void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
 		[encoder setComputePipelineState:mtlPipeline];
 	}
 
-	if (_vkStage != kMVKShaderStageCompute || _isVkRayTracing) {
+	if (_vkStage != kMVKShaderStageCompute || _isVkRayTracing != isVkRayTracing) {
 		if (_vkStage != kMVKShaderStageCount) {
 			// Switching from another Vulkan bind point, need to invalidate implicit buffers too
 			invalidateVulkanBindPointResources(*this);
 		}
 		_vkStage = kMVKShaderStageCompute;
-		_isVkRayTracing = false;
+		_isVkRayTracing = isVkRayTracing;
 	}
 
-	bindVulkanComputeToMetalCompute(encoder, mvkEncoder, vk, vkShared, *this, pipeline);
+	bindVulkanComputeStageToMetalCompute(encoder, mvkEncoder, vk, vkShared, *this, pipeline);
+	return true;
+}
+
+void MVKMetalComputeCommandEncoderState::prepareComputeDispatch(
+  id<MTLComputeCommandEncoder> encoder,
+  MVKCommandEncoder& mvkEncoder,
+  const MVKVulkanComputeCommandEncoderState& vk,
+  const MVKVulkanSharedCommandEncoderState& vkShared) {
+	if (!bindVulkanComputeStage(encoder, mvkEncoder, vk, vkShared, false))
+		return;
+
 	mvkEncoder.getState().mtlShared()._useResource.bindAndResetCompute(encoder);
 }
 
@@ -1687,32 +1686,13 @@ void MVKMetalComputeCommandEncoderState::prepareRayTracingDispatch(
   MVKCommandEncoder& mvkEncoder,
   const MVKVulkanRayTracingCommandEncoderState& vk,
   const MVKVulkanSharedCommandEncoderState& vkShared) {
-	MVKRayTracingPipeline* pipeline = vk._pipeline;
-	id<MTLComputePipelineState> mtlPipeline = pipeline->getPipelineState();
-	if (!mtlPipeline) // Abort if pipeline could not be created.
+	if (!bindVulkanComputeStage(encoder, mvkEncoder, vk, vkShared, true))
 		return;
 
-	_vkPipeline = pipeline;
-
-	if (_pipeline != mtlPipeline) {
-		_pipeline = mtlPipeline;
-		[encoder setComputePipelineState:mtlPipeline];
-	}
-
-	if (_vkStage != kMVKShaderStageCompute || !_isVkRayTracing) {
-		if (_vkStage != kMVKShaderStageCount) {
-			// Switching from another Vulkan bind point, need to invalidate implicit buffers too
-			invalidateVulkanBindPointResources(*this);
-		}
-		_vkStage = kMVKShaderStageCompute;
-		_isVkRayTracing = true;
-	}
-
-	bindVulkanRayTracingToMetalCompute(encoder, mvkEncoder, vk, vkShared, *this, pipeline);
-
-	// The function table and group table are volatile implicit buffers, because they belong to the Metal pipeline.
+	// The function table and group table belong to the pipeline, and stay bound for later dispatches with it.
+	MVKRayTracingPipeline* pipeline = vk._pipeline;
 	const MVKImplicitBufferBindings& implicitBuffers = pipeline->getStageResources().implicitBuffers;
-	[encoder setVisibleFunctionTable:pipeline->getMTLFunctionTable() atBufferIndex:implicitBuffers.ids[MVKImplicitBuffer::RayTracingFunctionTable]];
+	bindVisibleFunctionTable(encoder, pipeline->getMTLFunctionTable(), implicitBuffers.ids[MVKImplicitBuffer::RayTracingFunctionTable]);
 	bindBuffer(encoder, pipeline->getMTLGroupTable(), 0, implicitBuffers.ids[MVKImplicitBuffer::RayTracingGroupTable]);
 	mvkEncoder.getState().mtlShared()._useResource.bindAndResetCompute(encoder);
 }
@@ -1859,41 +1839,31 @@ void MVKCommandEncoderState::setGraphicsDepthClipState(const MVKDepthClipState& 
 	}
 }
 
+/** Sets the layout of the pipeline bound to the Vulkan state of the given bind point, invalidating any necessary resources. */
+void MVKCommandEncoderState::bindPipelineLayout(VkPipelineBindPoint bindPoint, MVKVulkanCommonEncoderState& vkState, MVKPipelineLayout* layout) {
+	if (vkState._layout != layout) {
+		if (!vkState._layout || vkState._layout->getPushConstantsLength() < layout->getPushConstantsLength()) {
+			mvkEnsureSize(_vkShared._pushConstants, layout->getPushConstantsLength());
+			invalidateImplicitBuffer(*this, bindPoint, MVKNonVolatileImplicitBuffer::PushConstant);
+		}
+		vkState.setLayout(layout);
+	}
+}
+
 void MVKCommandEncoderState::bindGraphicsPipeline(MVKGraphicsPipeline* pipeline) {
 	_mtlGraphics.changePipeline(_vkGraphics._pipeline, pipeline);
 	_vkGraphics._pipeline = pipeline;
-	MVKPipelineLayout* layout = pipeline->getLayout();
-	if (_vkGraphics._layout != layout) {
-		if (!_vkGraphics._layout || _vkGraphics._layout->getPushConstantsLength() < layout->getPushConstantsLength()) {
-			mvkEnsureSize(_vkShared._pushConstants, layout->getPushConstantsLength());
-			invalidateImplicitBuffer(*this, VK_PIPELINE_BIND_POINT_GRAPHICS, MVKNonVolatileImplicitBuffer::PushConstant);
-		}
-		_vkGraphics.setLayout(layout);
-	}
+	bindPipelineLayout(VK_PIPELINE_BIND_POINT_GRAPHICS, _vkGraphics, pipeline->getLayout());
 }
 
 void MVKCommandEncoderState::bindComputePipeline(MVKComputePipeline* pipeline) {
 	_vkCompute._pipeline = pipeline;
-	MVKPipelineLayout* layout = pipeline->getLayout();
-	if (_vkCompute._layout != layout) {
-		if (!_vkCompute._layout || _vkCompute._layout->getPushConstantsLength() < layout->getPushConstantsLength()) {
-			mvkEnsureSize(_vkShared._pushConstants, layout->getPushConstantsLength());
-			invalidateImplicitBuffer(*this, VK_PIPELINE_BIND_POINT_COMPUTE, MVKNonVolatileImplicitBuffer::PushConstant);
-		}
-		_vkCompute.setLayout(layout);
-	}
+	bindPipelineLayout(VK_PIPELINE_BIND_POINT_COMPUTE, _vkCompute, pipeline->getLayout());
 }
 
 void MVKCommandEncoderState::bindRayTracingPipeline(MVKRayTracingPipeline* pipeline) {
 	_vkRayTracing._pipeline = pipeline;
-	MVKPipelineLayout* layout = pipeline->getLayout();
-	if (_vkRayTracing._layout != layout) {
-		if (!_vkRayTracing._layout || _vkRayTracing._layout->getPushConstantsLength() < layout->getPushConstantsLength()) {
-			mvkEnsureSize(_vkShared._pushConstants, layout->getPushConstantsLength());
-			invalidateImplicitBuffer(*this, VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, MVKNonVolatileImplicitBuffer::PushConstant);
-		}
-		_vkRayTracing.setLayout(layout);
-	}
+	bindPipelineLayout(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, _vkRayTracing, pipeline->getLayout());
 }
 
 void MVKCommandEncoderState::pushConstants(uint32_t offset, uint32_t size, const void* data) {
