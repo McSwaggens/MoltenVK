@@ -483,9 +483,6 @@ static id<MTLArgumentEncoder> createArgumentEncoder(MVKArrayRef<const MVKDescrip
 					MTLDataType type = layout == MVKDescriptorGPULayout::Sampler ? MTLDataTypeSampler :
 					                   layout == MVKDescriptorGPULayout::Texture ? MTLDataTypeTexture :
 					                                                               MTLDataTypePointer;
-					if (binding.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR && !device->useAccelerationStructureHeaders()) {
-						type = MTLDataTypeInstanceAccelerationStructure;
-					}
 					[list addObject:argumentDescriptor(index, access, type, count)];
 					break;
 				}
@@ -946,9 +943,6 @@ template <> struct MVKArgBufEncoder<MVKArgumentBufferMode::Metal3> {
 	void setBuffer(id<MTLBuffer> buf, uint64_t offset, size_t index = 0) {
 		dst[index].gpuAddress = buf.gpuAddress + offset;
 	}
-	void setAccelerationStructure(id<MTLAccelerationStructure> as, size_t index = 0) {
-		dst[index].resource = as ? as.gpuResourceID : MTLResourceID{};
-	}
 	void setNullTexture(size_t index = 0) { dst[index].resource = {}; }
 	void setNullSampler(size_t index = 0) { dst[index].resource = {}; }
 	void setNullBuffer (size_t index = 0) { dst[index].gpuAddress = 0; }
@@ -973,9 +967,6 @@ template <> struct MVKArgBufEncoder<MVKArgumentBufferMode::ArgEncoder> {
 	void setSampler(id<MTLSamplerState> samp, size_t index = 0) { [enc setSamplerState:samp atIndex:base + index]; }
 	void setBuffer(id<MTLBuffer> buf, uint64_t offset, size_t index = 0) {
 		[enc setBuffer:buf offset:static_cast<NSUInteger>(offset) atIndex:base + index];
-	}
-	void setAccelerationStructure(id<MTLAccelerationStructure> as, size_t index = 0) {
-		[enc setAccelerationStructure:as atIndex:base + index];
 	}
 	void setNullTexture(size_t index = 0) { [enc setTexture:nil atIndex:base + index]; }
 	void setNullSampler(size_t index = 0) { [enc setSamplerState:nil atIndex:base + index]; }
@@ -1124,24 +1115,17 @@ static void advanceBinding(const MVKDescriptorBinding** binding) {
 	*binding = next;
 }
 
-/**
- * Acceleration structures are written to a buffer slot, either as the address of their header,
- * or as the resource ID of the Metal acceleration structure, depending on how shaders read them.
- */
+/** Acceleration structures are written to a buffer slot, as the address of their header. */
 template <MVKArgumentBufferMode ArgBufMode>
 static void writeAccelerationStructureGPUBuffer(
 	const MVKDescriptorBinding& binding, const MVKDescriptorSet* set, id<MTLArgumentEncoder> enc_,
 	const void* src, size_t srcStride, uint32_t start, uint32_t count)
 {
 	constexpr size_t dstStride = descriptorGPUStride(ArgBufMode, MVKDescriptorGPULayout::Buffer);
-	bool useHeaders = set->layout->getDevice()->useAccelerationStructureHeaders();
 	MVKArgBufEncoder<ArgBufMode> enc(enc_, set->gpuBuffer);
 	enc.advance((ArgBufMode == MVKArgumentBufferMode::ArgEncoder ? binding.argBufID : binding.gpuOffset) + start * dstStride);
 	for (uint32_t i = 0; i < count; i++) {
-		auto* mvkAccStruct = *static_cast<MVKAccelerationStructure*const*>(src);
-		if ( !useHeaders ) {
-			enc.setAccelerationStructure(mvkAccStruct ? mvkAccStruct->getMTLAccelerationStructure() : nil);
-		} else if (mvkAccStruct) {
+		if (auto* mvkAccStruct = *static_cast<MVKAccelerationStructure*const*>(src)) {
 			enc.setBuffer(mvkAccStruct->getHeaderMTLBuffer(), mvkAccStruct->getHeaderOffset());
 		} else {
 			enc.setNullBuffer();
@@ -1225,25 +1209,6 @@ static void writeDescriptorSetGPUBuffer(
 			for (advanceBinding(&binding); !binding->descriptorCount; advanceBinding(&binding))
 				;
 		}
-	}
-}
-
-/**
- * With headers, an acceleration structure descriptor is a buffer descriptor of its header, which can be bound like
- * other buffers. Otherwise, it holds the Metal acceleration structure, which cannot be bound as a discrete buffer.
- */
-static void writeAccelerationStructureCPUDescriptor(const MVKDescriptorSetLayout* layout,
-													MVKCPUDescriptorOneID2Meta* desc,
-													MVKAccelerationStructure* mvkAccStruct) {
-	*desc = {};
-	if ( !mvkAccStruct ) { return; }
-
-	if (layout->getDevice()->useAccelerationStructureHeaders()) {
-		desc->a = mvkAccStruct->getHeaderMTLBuffer();
-		desc->offset = mvkAccStruct->getHeaderOffset();
-		desc->meta.buffer = sizeof(MVKAccelerationStructureHeader);
-	} else if (layout->argBufMode() != MVKArgumentBufferMode::Off) {
-		desc->a = mvkAccStruct->getMTLAccelerationStructure();
 	}
 }
 
@@ -1373,7 +1338,13 @@ static void writeDescriptorSetCPUBuffer(
 			case MVKDescriptorCPULayout::OneID2Meta: {
 				auto* desc = reinterpret_cast<MVKCPUDescriptorOneID2Meta*>(dst);
 				if (srcType == MVKDescriptorUpdateSourceType::AccelerationStructure) {
-					writeAccelerationStructureCPUDescriptor(layout, desc, *static_cast<MVKAccelerationStructure*const*>(src));
+					// A buffer descriptor of the header of the acceleration structure.
+					*desc = {};
+					if (auto* mvkAccStruct = *static_cast<MVKAccelerationStructure*const*>(src)) {
+						desc->a = mvkAccStruct->getHeaderMTLBuffer();
+						desc->offset = mvkAccStruct->getHeaderOffset();
+						desc->meta.buffer = sizeof(MVKAccelerationStructureHeader);
+					}
 					break;
 				}
 				assert(srcType == MVKDescriptorUpdateSourceType::Buffer);
@@ -1509,22 +1480,6 @@ static void copyArgBuf(MVKDevice* device, id<MTLArgumentEncoder> enc,
 	}
 }
 
-/** Encode the acceleration structures from cpu binding table entry `src` to the given argument encoder. */
-static void copyArgBufAccelerationStructures(MVKDevice* device, id<MTLArgumentEncoder> enc,
-											 const char* src, size_t srcStride,
-											 uint32_t start, uint32_t count)
-{
-	bool useHeaders = device->useAccelerationStructureHeaders();
-	for (uint32_t i = 0; i < count; i++, src += srcStride) {
-		auto* desc = reinterpret_cast<const MVKCPUDescriptorOneID2Meta*>(src);
-		if (useHeaders) {
-			[enc setBuffer:desc->a offset:desc->offset atIndex:start + i];
-		} else {
-			[enc setAccelerationStructure:desc->a atIndex:start + i];
-		}
-	}
-}
-
 static void copyDescriptorSetBinding(
 	const MVKDescriptorSetLayout* dstLayout,
 	const MVKDescriptorBinding* srcBinding, const MVKDescriptorSet* srcSet, id<MTLArgumentEncoder> srcEnc,
@@ -1574,10 +1529,7 @@ static void copyDescriptorSetBinding(
 
 					case MVKDescriptorGPULayout::Buffer:
 					case MVKDescriptorGPULayout::BufferAuxSize: {
-						if (srcBinding->descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
-							copyArgBufAccelerationStructures(dev, dstEnc, src, cpuStride, dst, count);
-							break;
-						}
+						// Acceleration structure descriptors are buffer descriptors of their headers.
 						size_t offsetOffset;
 						if (cpu == MVKDescriptorCPULayout::TwoID2Meta) {
 							src += offsetof(MVKCPUDescriptorTwoID2Meta, b); // Buffer is always second ID

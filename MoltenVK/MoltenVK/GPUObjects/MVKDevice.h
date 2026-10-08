@@ -948,13 +948,6 @@ public:
 	/** Returns the pool that allocates the headers of the acceleration structures of this device. */
 	MVKAccelerationStructureHeaderPool* getAccelerationStructureHeaderPool() { return _accelerationStructureHeaderPool; }
 
-	/**
-	 * Returns whether acceleration structure descriptors contain the device address of the header of the
-	 * acceleration structure, instead of the resource ID of the Metal acceleration structure. Shaders must be
-	 * compiled for the same representation.
-	 */
-	bool useAccelerationStructureHeaders() { return true; }
-
 	/** Adds the specified host semaphore to be woken upon device loss. */
 	void addSemaphore(MVKSemaphoreImpl* sem4);
 
