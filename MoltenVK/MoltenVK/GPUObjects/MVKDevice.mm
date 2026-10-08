@@ -4424,8 +4424,8 @@ static MTLAccelerationStructureUsage getMTLAccelerationStructureUsage(VkBuildAcc
 	if (mvkIsAnyFlagEnabled(flags, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR)) {
 		mtlUsage |= MTLAccelerationStructureUsagePreferFastBuild;
 	}
-#if MVK_XCODE_26
-	if (@available(macOS 26.0, iOS 26.0, tvOS 26.0, *)) {
+#if MVK_XCODE_26 && !MVK_TVOS && !MVK_VISIONOS
+	if (@available(macOS 26.0, iOS 26.0, *)) {
 		if (mvkIsAnyFlagEnabled(flags, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)) {
 			mtlUsage |= MTLAccelerationStructureUsagePreferFastIntersection;
 		}
