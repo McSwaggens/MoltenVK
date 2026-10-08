@@ -176,6 +176,22 @@ id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdTraceRaysIndirectConve
 	MVK_ENC_REZ_ACCESS(_mtlTraceRaysIndirectConvertBuffersComputePipelineState, newCmdTraceRaysIndirectConvertBuffersMTLComputePipelineState(_commandPool));
 }
 
+id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdConvertAccelerationStructureInstancesMTLComputePipelineState() {
+	MVK_ENC_REZ_ACCESS(_mtlConvertAccelerationStructureInstancesComputePipelineState, newCmdConvertAccelerationStructureInstancesMTLComputePipelineState(_commandPool));
+}
+
+id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdConvertAccelerationStructureTransformsMTLComputePipelineState() {
+	MVK_ENC_REZ_ACCESS(_mtlConvertAccelerationStructureTransformsComputePipelineState, newCmdConvertAccelerationStructureTransformsMTLComputePipelineState(_commandPool));
+}
+
+id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdCopyAccelerationStructureVerticesMTLComputePipelineState() {
+	MVK_ENC_REZ_ACCESS(_mtlCopyAccelerationStructureVerticesComputePipelineState, newCmdCopyAccelerationStructureVerticesMTLComputePipelineState(_commandPool));
+}
+
+id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState() {
+	MVK_ENC_REZ_ACCESS(_mtlConvertAccelerationStructureBoundingBoxesComputePipelineState, newCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState(_commandPool));
+}
+
 void MVKCommandEncodingPool::clear() {
 	lock_guard<mutex> lock(_lock);
 	destroyMetalResources();
@@ -279,4 +295,16 @@ void MVKCommandEncodingPool::destroyMetalResources() {
 
     [_mtlTraceRaysIndirectConvertBuffersComputePipelineState release];
     _mtlTraceRaysIndirectConvertBuffersComputePipelineState = nil;
+
+	[_mtlConvertAccelerationStructureInstancesComputePipelineState release];
+	_mtlConvertAccelerationStructureInstancesComputePipelineState = nil;
+
+	[_mtlConvertAccelerationStructureTransformsComputePipelineState release];
+	_mtlConvertAccelerationStructureTransformsComputePipelineState = nil;
+
+	[_mtlCopyAccelerationStructureVerticesComputePipelineState release];
+	_mtlCopyAccelerationStructureVerticesComputePipelineState = nil;
+
+	[_mtlConvertAccelerationStructureBoundingBoxesComputePipelineState release];
+	_mtlConvertAccelerationStructureBoundingBoxesComputePipelineState = nil;
 }

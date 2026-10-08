@@ -18,356 +18,351 @@
 
 #include "MVKCmdAccelerationStructure.h"
 #include "MVKCommandBuffer.h"
-#include "MVKAccelerationStructure.h"
-#include "MVKBuffer.h"
 #include "MVKCommandPool.h"
+#include "MVKAccelerationStructure.h"
 #include "MVKQueryPool.h"
-#include <unordered_map>
+
+using namespace std;
+
+
+#pragma mark -
+#pragma mark Support functions
+
+// Must match the instance conversion shader.
+typedef struct {
+	uint64_t instances;
+	uint64_t instanceSBTOffsets;
+	uint32_t arrayOfPointers;
+} MVKAccelerationStructureInstanceParams;
+
+// Must match the vertex copy shader.
+typedef struct {
+	uint64_t vertices;
+	uint32_t stride;
+	uint32_t vertexSize;
+} MVKAccelerationStructureVertexParams;
+
+// Must match the bounding box conversion shader.
+typedef struct {
+	uint64_t boundingBoxes;
+	uint64_t stride;
+} MVKAccelerationStructureBoundingBoxParams;
+
+// Dispatches one thread for each of the specified number of elements.
+static void dispatchThreads(id<MTLComputeCommandEncoder> mtlComputeEnc, id<MTLComputePipelineState> mtlPSO, NSUInteger count) {
+	[mtlComputeEnc dispatchThreads: MTLSizeMake(count, 1, 1)
+			 threadsPerThreadgroup: MTLSizeMake(min(count, mtlPSO.maxTotalThreadsPerThreadgroup), 1, 1)];
+}
+
+static bool hasTransform(const VkAccelerationStructureGeometryKHR& geometry, const VkAccelerationStructureBuildRangeInfoKHR& rangeInfo) {
+	return (geometry.geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+			geometry.geometry.triangles.transformData.deviceAddress &&
+			rangeInfo.primitiveCount);
+}
+
+// Metal requires vertex buffer offsets to be 4-byte aligned, while Vulkan only requires vertex component alignment.
+static bool hasMisalignedVertices(const VkAccelerationStructureGeometryKHR& geometry, MTLAccelerationStructureGeometryDescriptor* mtlGeoDesc) {
+	return (geometry.geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+			((MTLAccelerationStructureTriangleGeometryDescriptor*)mtlGeoDesc).vertexBufferOffset % 4);
+}
+
+static bool hasBoundingBoxes(const VkAccelerationStructureGeometryKHR& geometry, const VkAccelerationStructureBuildRangeInfoKHR& rangeInfo) {
+	return geometry.geometryType == VK_GEOMETRY_TYPE_AABBS_KHR && rangeInfo.primitiveCount;
+}
+
+// Returns whether any build inputs must be converted for Metal.
+static bool needsInputConversion(const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+								 const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfos,
+								 MTLAccelerationStructureDescriptor* mtlDesc) {
+	if (buildInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+		return ((MTLInstanceAccelerationStructureDescriptor*)mtlDesc).instanceCount;
+	}
+
+	NSArray<MTLAccelerationStructureGeometryDescriptor*>* mtlGeoDescs = ((MTLPrimitiveAccelerationStructureDescriptor*)mtlDesc).geometryDescriptors;
+	for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
+		const auto& geometry = buildInfo.pGeometries[geoIdx];
+		if (hasTransform(geometry, pRangeInfos[geoIdx]) ||
+			hasMisalignedVertices(geometry, mtlGeoDescs[geoIdx]) ||
+			hasBoundingBoxes(geometry, pRangeInfos[geoIdx])) { return true; }
+	}
+	return false;
+}
+
+// Returns the compute encoder for converting build inputs, which read their data, and the headers
+// of bottom-level acceleration structures, through device addresses.
+static id<MTLComputeCommandEncoder> getInputConversionMTLComputeEncoder(MVKCommandEncoder* cmdEncoder) {
+	id<MTLComputeCommandEncoder> mtlComputeEnc = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseBuildAccelerationStructures);
+	MVKDevice* mvkDev = cmdEncoder->getDevice();
+	if ( !mvkDev->hasResidencySet() ) {
+		MVKUseResourceHelper& rez = cmdEncoder->getState().mtlShared()._useResource;
+		mvkDev->encodeGPUAddressableBuffers(rez, MVKResourceUsageStages::Compute);
+		mvkDev->encodeAccelerationStructures(rez, MVKResourceUsageStages::Compute);
+		rez.bindAndResetCompute(mtlComputeEnc);
+	}
+	return mtlComputeEnc;
+}
+
+// Top-level acceleration structure builds read the bottom-level acceleration structures referenced by
+// their instances, which Metal cannot track, so make all acceleration structures resident.
+static void useAccelerationStructures(MVKCommandEncoder* cmdEncoder, id<MTLAccelerationStructureCommandEncoder> mtlASEnc) {
+	MVKUseResourceHelper rez;
+	cmdEncoder->getDevice()->encodeAccelerationStructures(rez, MVKResourceUsageStages::Compute);
+	auto& mtlRezs = rez.entries[MVKResourceUsageStages::Compute].read;
+	if ( !mtlRezs.empty() ) {
+		[mtlASEnc useResources: mtlRezs.data() count: mtlRezs.size() usage: MTLResourceUsageRead];
+	}
+}
+
 
 #pragma mark -
 #pragma mark MVKCmdBuildAccelerationStructures
 
 VkResult MVKCmdBuildAccelerationStructures::setContent(MVKCommandBuffer* cmdBuff,
-                                                       uint32_t infoCount,
-                                                       const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
-                                                       const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos) {
-	_buildInfos.resize(infoCount);
-	for (uint32_t i = 0; i < infoCount; i++) {
-		auto& bi = _buildInfos[i];
-		bi.geometryInfo = pInfos[i];
-
-		uint32_t geomCount = pInfos[i].geometryCount;
-		bi.geometries.resize(geomCount);
-		const VkAccelerationStructureGeometryKHR* pGeometries =
-			pInfos[i].pGeometries ? pInfos[i].pGeometries : nullptr;
-		const VkAccelerationStructureGeometryKHR* const* ppGeometries =
-			pInfos[i].ppGeometries;
-
-		for (uint32_t g = 0; g < geomCount; g++) {
-			if (pGeometries) {
-				bi.geometries[g] = pGeometries[g];
-			} else if (ppGeometries) {
-				bi.geometries[g] = *ppGeometries[g];
-			}
+													   uint32_t infoCount,
+													   const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
+													   const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos) {
+	// Copy the geometries and build ranges, and clear any pointers into app memory.
+	_buildInfos.clear();
+	_geometries.clear();
+	_rangeInfos.clear();
+	for (uint32_t infoIdx = 0; infoIdx < infoCount; infoIdx++) {
+		const auto& buildInfo = pInfos[infoIdx];
+		for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
+			auto& geometry = _geometries.emplace_back(MVKAccelerationStructure::getGeometry(buildInfo, geoIdx));
+			geometry.pNext = nullptr;
+			geometry.geometry.triangles.pNext = nullptr;	// The geometry data union members share their pNext location
+			_rangeInfos.push_back(ppBuildRangeInfos[infoIdx][geoIdx]);
 		}
-
-		bi.buildRangeInfos.resize(geomCount);
-		for (uint32_t g = 0; g < geomCount; g++) {
-			bi.buildRangeInfos[g] = ppBuildRangeInfos[i][g];
-		}
+		auto& info = _buildInfos.emplace_back(buildInfo);
+		info.pNext = nullptr;
+		info.ppGeometries = nullptr;
 	}
+
+	// Now that the geometries will no longer move, point each build info at its geometries.
+	const VkAccelerationStructureGeometryKHR* pGeometries = _geometries.data();
+	for (auto& info : _buildInfos) {
+		info.pGeometries = pGeometries;
+		pGeometries += info.geometryCount;
+	}
+
 	return VK_SUCCESS;
 }
 
+const VkAccelerationStructureBuildRangeInfoKHR* MVKCmdBuildAccelerationStructures::getRangeInfos(const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo) {
+	return &_rangeInfos[buildInfo.pGeometries - _geometries.data()];
+}
+
 void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
-	id<MTLCommandBuffer> mtlCmdBuff = cmdEncoder->_mtlCmdBuffer;
-	id<MTLAccelerationStructureCommandEncoder> asEncoder = [mtlCmdBuff accelerationStructureCommandEncoder];
+	size_t infoCount = _buildInfos.size();
+	MTLAccelerationStructureDescriptor* mtlDescs[infoCount];
+	for (size_t infoIdx = 0; infoIdx < infoCount; infoIdx++) {
+		const auto& buildInfo = _buildInfos[infoIdx];
+		mtlDescs[infoIdx] = cmdEncoder->getDevice()->getMTLAccelerationStructureDescriptor(buildInfo, getRangeInfos(buildInfo), true);
+		if ( !mtlDescs[infoIdx] ) {
+			cmdEncoder->reportError(VK_ERROR_INVALID_DEVICE_ADDRESS_EXT, "vkCmdBuildAccelerationStructuresKHR(): Acceleration structure geometry data must be held in a buffer created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT.");
+		}
+	}
+	encodeInputConversions(cmdEncoder, mtlDescs);
+	encodeBuilds(cmdEncoder, mtlDescs);
+}
 
-	for (auto& bi : _buildInfos) {
-		auto* dstAS = (MVKAccelerationStructure*)bi.geometryInfo.dstAccelerationStructure;
-		id<MTLAccelerationStructure> mtlDstAS = dstAS->getMTLAccelerationStructure();
-		uint32_t geomCount = bi.geometryInfo.geometryCount;
-		dstAS->clearRetainedBuffers();
+// Some build inputs must be converted for Metal: the instances of top-level acceleration structures, and geometry
+// transforms, have different layouts than in Vulkan, vertex offsets must be aligned, and bounding boxes are enlarged.
+// Convert them on the GPU, because earlier GPU commands may write them, and they may be in private memory.
+void MVKCmdBuildAccelerationStructures::encodeInputConversions(MVKCommandEncoder* cmdEncoder, MTLAccelerationStructureDescriptor* const* mtlDescs) {
+	id<MTLComputeCommandEncoder> mtlComputeEnc = nil;
+	for (size_t infoIdx = 0; infoIdx < _buildInfos.size(); infoIdx++) {
+		MTLAccelerationStructureDescriptor* mtlDesc = mtlDescs[infoIdx];
+		const auto& buildInfo = _buildInfos[infoIdx];
+		if ( !mtlDesc || !needsInputConversion(buildInfo, getRangeInfos(buildInfo), mtlDesc) ) { continue; }
 
-		auto makePrimitiveDataBuffer = [&](uint32_t geometryIndex,
-										   uint32_t primitiveCount,
-										   VkGeometryFlagsKHR geometryFlags) -> id<MTLBuffer> {
-			if (primitiveCount == 0) { return nil; }
+		if ( !mtlComputeEnc ) { mtlComputeEnc = getInputConversionMTLComputeEncoder(cmdEncoder); }
 
-			NSUInteger byteCount = (NSUInteger)primitiveCount * sizeof(MVKRTPrimitiveData);
-			id<MTLBuffer> primitiveDataBuffer = [cmdEncoder->getMTLDevice() newBufferWithLength: byteCount
-			                                                                             options: MTLResourceStorageModeShared];
-			if (!primitiveDataBuffer) { return nil; }
-
-			auto* primitiveData = (MVKRTPrimitiveData*)primitiveDataBuffer.contents;
-			for (uint32_t primitiveIndex = 0; primitiveIndex < primitiveCount; primitiveIndex++) {
-				primitiveData[primitiveIndex] = { geometryIndex, primitiveIndex, geometryFlags };
-			}
-
-			dstAS->retainBuffer(primitiveDataBuffer);
-			[primitiveDataBuffer release];
-			return primitiveDataBuffer;
-		};
-
-		if (bi.geometryInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
-			// Build a primitive (bottom-level) acceleration structure.
-			MTLPrimitiveAccelerationStructureDescriptor* primDesc =
-				[MTLPrimitiveAccelerationStructureDescriptor descriptor];
-
-			NSMutableArray* geomDescs = [NSMutableArray arrayWithCapacity: geomCount];
-			for (uint32_t g = 0; g < geomCount; g++) {
-				auto& geom = bi.geometries[g];
-				auto& rangeInfo = bi.buildRangeInfos[g];
-
-				if (geom.geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR) {
-					auto& triData = geom.geometry.triangles;
-					MTLAccelerationStructureTriangleGeometryDescriptor* triDesc =
-						[MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
-
-					// Vertex data is addressed from the bound vertex buffer plus firstVertex.
-					// primitiveOffset applies to the index stream, not the vertex stream.
-					VkDeviceSize vtxOffset = 0;
-					if (triData.vertexData.deviceAddress) {
-						VkDeviceAddress vtxAddr = triData.vertexData.deviceAddress;
-						triDesc.vertexBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(vtxAddr, &vtxOffset);
-						triDesc.vertexBufferOffset = (NSUInteger)(vtxOffset + rangeInfo.firstVertex * triData.vertexStride);
-					}
-					triDesc.vertexStride = triData.vertexStride;
-					triDesc.triangleCount = rangeInfo.primitiveCount;
-					triDesc.intersectionFunctionTableOffset = g;
-
-					// Index data — apply primitiveOffset from build range info
-					if (triData.indexType != VK_INDEX_TYPE_NONE_KHR &&
-						triData.indexData.deviceAddress) {
-						VkDeviceSize idxOffset = 0;
-						VkDeviceAddress idxAddr = triData.indexData.deviceAddress + rangeInfo.primitiveOffset;
-						triDesc.indexBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(idxAddr, &idxOffset);
-						triDesc.indexBufferOffset = (NSUInteger)idxOffset;
-						triDesc.indexType = (triData.indexType == VK_INDEX_TYPE_UINT16)
-							? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
-					}
-
-					if (auto primitiveDataBuffer = makePrimitiveDataBuffer(g, rangeInfo.primitiveCount, geom.flags)) {
-						triDesc.primitiveDataBuffer = primitiveDataBuffer;
-						triDesc.primitiveDataBufferOffset = 0;
-						triDesc.primitiveDataStride = sizeof(MVKRTPrimitiveData);
-						triDesc.primitiveDataElementSize = sizeof(MVKRTPrimitiveData);
-					}
-					triDesc.opaque = (geom.flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
-					[geomDescs addObject: triDesc];
-
-				} else if (geom.geometryType == VK_GEOMETRY_TYPE_AABBS_KHR) {
-					auto& aabbData = geom.geometry.aabbs;
-					MTLAccelerationStructureBoundingBoxGeometryDescriptor* aabbDesc =
-						[MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
-
-					// Apply primitiveOffset from build range info
-					if (aabbData.data.deviceAddress) {
-						VkDeviceSize aabbOffset = 0;
-						VkDeviceAddress aabbAddr = aabbData.data.deviceAddress + rangeInfo.primitiveOffset;
-						aabbDesc.boundingBoxBuffer = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(aabbAddr, &aabbOffset);
-						aabbDesc.boundingBoxBufferOffset = (NSUInteger)aabbOffset;
-					}
-					aabbDesc.boundingBoxStride = aabbData.stride;
-					aabbDesc.boundingBoxCount = rangeInfo.primitiveCount;
-					aabbDesc.intersectionFunctionTableOffset = g;
-					if (auto primitiveDataBuffer = makePrimitiveDataBuffer(g, rangeInfo.primitiveCount, geom.flags)) {
-						aabbDesc.primitiveDataBuffer = primitiveDataBuffer;
-						aabbDesc.primitiveDataBufferOffset = 0;
-						aabbDesc.primitiveDataStride = sizeof(MVKRTPrimitiveData);
-						aabbDesc.primitiveDataElementSize = sizeof(MVKRTPrimitiveData);
-					}
-					aabbDesc.opaque = (geom.flags & VK_GEOMETRY_OPAQUE_BIT_KHR) != 0;
-
-					[geomDescs addObject: aabbDesc];
-				}
-			}
-
-			primDesc.geometryDescriptors = geomDescs;
-
-			// Build flags
-			if (bi.geometryInfo.flags & VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) {
-				primDesc.usage |= MTLAccelerationStructureUsagePreferFastBuild;
-			}
-			if (bi.geometryInfo.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
-				primDesc.usage |= MTLAccelerationStructureUsageRefit;
-			}
-			if (@available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
-				primDesc.usage |= MTLAccelerationStructureUsageExtendedLimits;
-			}
-
-			// Scratch buffer
-			id<MTLBuffer> scratchBuf = nil;
-			NSUInteger scratchOffset = 0;
-			if (bi.geometryInfo.scratchData.deviceAddress) {
-				VkDeviceSize scrOff = 0;
-				scratchBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(bi.geometryInfo.scratchData.deviceAddress, &scrOff);
-				scratchOffset = (NSUInteger)scrOff;
-			}
-
-			if (bi.geometryInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR) {
-				[asEncoder buildAccelerationStructure: mtlDstAS
-										  descriptor: primDesc
-									   scratchBuffer: scratchBuf
-								 scratchBufferOffset: scratchOffset];
-			} else {
-				// Update/refit
-				id<MTLAccelerationStructure> mtlSrcAS = mtlDstAS;
-				if (bi.geometryInfo.srcAccelerationStructure) {
-					auto* srcAS = (MVKAccelerationStructure*)bi.geometryInfo.srcAccelerationStructure;
-					mtlSrcAS = srcAS->getMTLAccelerationStructure();
-				}
-				[asEncoder refitAccelerationStructure: mtlSrcAS
-										  descriptor: primDesc
-										 destination: mtlDstAS
-									   scratchBuffer: scratchBuf
-								 scratchBufferOffset: scratchOffset];
-			}
+		if (buildInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+			encodeInstanceConversion(cmdEncoder, mtlComputeEnc, buildInfo, (MTLInstanceAccelerationStructureDescriptor*)mtlDesc);
 		} else {
-			// Build an instance (top-level) acceleration structure.
-			MTLInstanceAccelerationStructureDescriptor* instDesc =
-				[MTLInstanceAccelerationStructureDescriptor descriptor];
+			auto* mtlPrimDesc = (MTLPrimitiveAccelerationStructureDescriptor*)mtlDesc;
+			encodeTransformConversion(cmdEncoder, mtlComputeEnc, buildInfo, mtlPrimDesc);
+			encodeVertexAlignment(cmdEncoder, mtlComputeEnc, buildInfo, mtlPrimDesc);
+			encodeBoundingBoxConversion(cmdEncoder, mtlComputeEnc, buildInfo, mtlPrimDesc);
+		}
+	}
+}
 
-			// Build a compact array containing only the BLASes referenced by this TLAS.
-			NSMutableArray<id<MTLAccelerationStructure>>* blasArray = [NSMutableArray array];
-			std::unordered_map<uint64_t, uint32_t> blasAddressToIndex;
-			// Convert Vulkan instance descriptors to Metal format.
-			// Vulkan: VkAccelerationStructureInstanceKHR (64 bytes each)
-			//   [0-47]  transform (3x4 row-major float)
-			//   [48]    instanceCustomIndex:24 + mask:8
-			//   [52]    instanceShaderBindingTableRecordOffset:24 + flags:8
-			//   [56]    accelerationStructureReference (uint64_t device address)
-			// Metal: MTLAccelerationStructureUserIDInstanceDescriptor (68 bytes each)
-			//   Same as MTLAccelerationStructureInstanceDescriptor but adds userID field
-			//   for VkAccelerationStructureInstanceKHR::instanceCustomIndex mapping.
-			if (geomCount > 0 && bi.geometries[0].geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
-				auto& instData = bi.geometries[0].geometry.instances;
-				auto& rangeInfo = bi.buildRangeInfos[0];
-				uint32_t instanceCount = rangeInfo.primitiveCount;
-				instDesc.instanceCount = instanceCount;
-				instDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeUserID;
-				instDesc.instanceDescriptorStride = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor);
+// Converts the Vulkan instances to Metal instance descriptors, and writes their SBT record offsets to a buffer of the
+// destination acceleration structure, and the address of that buffer to the header of the destination.
+void MVKCmdBuildAccelerationStructures::encodeInstanceConversion(MVKCommandEncoder* cmdEncoder,
+																 id<MTLComputeCommandEncoder> mtlComputeEnc,
+																 const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+																 MTLInstanceAccelerationStructureDescriptor* mtlInstDesc) {
+	uint32_t instCnt = (uint32_t)mtlInstDesc.instanceCount;
+	const MVKMTLBufferAllocation* mtlInstAlloc = cmdEncoder->getTempMTLBuffer(instCnt * sizeof(MTLIndirectAccelerationStructureInstanceDescriptor), true);
+	mtlInstDesc.instanceDescriptorBuffer = mtlInstAlloc->_mtlBuffer;
+	mtlInstDesc.instanceDescriptorBufferOffset = mtlInstAlloc->_offset;
 
-				if (instData.data.deviceAddress && instanceCount > 0) {
-					// Allocate a command-scoped temporary Metal buffer for converted descriptors.
-					NSUInteger mtlInstSize = sizeof(MTLAccelerationStructureUserIDInstanceDescriptor) * instanceCount;
-					const MVKMTLBufferAllocation* mtlInstAlloc = cmdEncoder->getTempMTLBuffer(mtlInstSize);
-					id<MTLBuffer> mtlInstBuf = mtlInstAlloc->_mtlBuffer;
-					NSUInteger mtlInstOffset = mtlInstAlloc->_offset;
-					id<MTLBuffer> sbtOffsetBuffer = [cmdEncoder->getMTLDevice() newBufferWithLength: sizeof(uint32_t) * instanceCount
-					                                                                          options: MTLResourceStorageModeShared];
-					uint32_t* sbtOffsets = sbtOffsetBuffer ? (uint32_t*)sbtOffsetBuffer.contents : nullptr;
-					id<MTLBuffer> instanceFlagsBuffer = [cmdEncoder->getMTLDevice() newBufferWithLength: sizeof(uint32_t) * instanceCount
-					                                                                            options: MTLResourceStorageModeShared];
-					uint32_t* instanceFlags = instanceFlagsBuffer ? (uint32_t*)instanceFlagsBuffer.contents : nullptr;
+	auto* mvkAccStruct = (MVKAccelerationStructure*)buildInfo.dstAccelerationStructure;
+	id<MTLBuffer> sbtOffsetsMTLBuff = mvkAccStruct->getInstanceSBTOffsetsMTLBuffer(instCnt);
+	if ( !sbtOffsetsMTLBuff ) {
+		cmdEncoder->reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkCmdBuildAccelerationStructuresKHR(): Could not allocate the instance data of an acceleration structure.");
+		return;
+	}
 
-					auto* mtlInsts = (MTLAccelerationStructureUserIDInstanceDescriptor*)((uint8_t*)mtlInstAlloc->getContents());
+	const auto& instances = buildInfo.pGeometries[0].geometry.instances;
+	MVKAccelerationStructureInstanceParams params = {
+		.instances = instances.data.deviceAddress + getRangeInfos(buildInfo)[0].primitiveOffset,
+		.instanceSBTOffsets = sbtOffsetsMTLBuff.gpuAddress,
+		.arrayOfPointers = instances.arrayOfPointers,
+	};
 
-					// For non-arrayOfPointers, hoist the invariant buffer lookup out of the loop.
-					const uint8_t* flatSrcData = nullptr;
-					if (!instData.arrayOfPointers) {
-						VkDeviceSize srcOffset = 0;
-						id<MTLBuffer> srcBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(instData.data.deviceAddress, &srcOffset);
-						flatSrcData = (const uint8_t*)[srcBuf contents] + srcOffset;
-					}
+	id<MTLComputePipelineState> mtlPSO = cmdEncoder->getCommandEncodingPool()->getCmdConvertAccelerationStructureInstancesMTLComputePipelineState();
+	MVKMetalComputeCommandEncoderState& mtlState = cmdEncoder->getMtlCompute();
+	mtlState.bindPipeline(mtlComputeEnc, mtlPSO);
+	mtlState.bindStructBytes(mtlComputeEnc, &params, 0);
+	mtlState.bindBuffer(mtlComputeEnc, mtlInstAlloc->_mtlBuffer, mtlInstAlloc->_offset, 1);
+	mtlState.bindBuffer(mtlComputeEnc, sbtOffsetsMTLBuff, 0, 2);
+	mtlState.bindBuffer(mtlComputeEnc, mvkAccStruct->getHeaderMTLBuffer(), mvkAccStruct->getHeaderOffset(), 3);
+	dispatchThreads(mtlComputeEnc, mtlPSO, instCnt);
+}
 
-					for (uint32_t j = 0; j < instanceCount; j++) {
-						const VkAccelerationStructureInstanceKHR* vkInst;
-						if (instData.arrayOfPointers) {
-							// data points to an array of device addresses, each pointing to an instance descriptor
-							VkDeviceSize ptrOffset = 0;
-							id<MTLBuffer> ptrBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(
-								instData.data.deviceAddress + j * sizeof(VkDeviceAddress), &ptrOffset);
-							const VkDeviceAddress* instAddr = (const VkDeviceAddress*)((const uint8_t*)[ptrBuf contents] + ptrOffset);
-							VkDeviceSize instOffset = 0;
-							id<MTLBuffer> instBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(*instAddr, &instOffset);
-							vkInst = (const VkAccelerationStructureInstanceKHR*)((const uint8_t*)[instBuf contents] + instOffset);
-						} else {
-							vkInst = (const VkAccelerationStructureInstanceKHR*)(flatSrcData + j * sizeof(VkAccelerationStructureInstanceKHR));
-						}
-
-						// Convert VkTransformMatrixKHR (3x4 row-major) to MTLPackedFloat4x3 (4x3 column-major).
-						for (int col = 0; col < 4; col++) {
-							for (int row = 0; row < 3; row++) {
-								mtlInsts[j].transformationMatrix.columns[col][row] = vkInst->transform.matrix[row][col];
-							}
-						}
-
-						// Convert flags
-						MTLAccelerationStructureInstanceOptions options = MTLAccelerationStructureInstanceOptionNone;
-						if (vkInst->flags & VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR)
-							options |= MTLAccelerationStructureInstanceOptionDisableTriangleCulling;
-						if (vkInst->flags & VK_GEOMETRY_INSTANCE_TRIANGLE_FLIP_FACING_BIT_KHR)
-							options |= MTLAccelerationStructureInstanceOptionTriangleFrontFacingWindingCounterClockwise;
-						if (vkInst->flags & VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR)
-							options |= MTLAccelerationStructureInstanceOptionOpaque;
-						if (vkInst->flags & VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR)
-							options |= MTLAccelerationStructureInstanceOptionNonOpaque;
-						mtlInsts[j].options = options;
-
-						mtlInsts[j].mask = vkInst->mask;
-						mtlInsts[j].intersectionFunctionTableOffset = vkInst->instanceShaderBindingTableRecordOffset;
-						if (sbtOffsets) {
-							sbtOffsets[j] = vkInst->instanceShaderBindingTableRecordOffset;
-						}
-						if (instanceFlags) {
-							instanceFlags[j] = vkInst->flags;
-						}
-
-						// Map instanceCustomIndex to Metal's userID
-						mtlInsts[j].userID = vkInst->instanceCustomIndex;
-
-						// Map the BLAS address directly to its wrapper, and add each referenced
-						// Metal acceleration structure once to the TLAS descriptor.
-						auto it = blasAddressToIndex.find(vkInst->accelerationStructureReference);
-						uint32_t blasIdx = 0;
-						if (it != blasAddressToIndex.end()) {
-							blasIdx = it->second;
-						} else if (auto* blas = MVKAccelerationStructure::getMVKAccelerationStructure(vkInst->accelerationStructureReference)) {
-							auto type = blas->getType();
-							id<MTLAccelerationStructure> mtlBLAS = blas->getMTLAccelerationStructure();
-							if ((type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR ||
-								 type == VK_ACCELERATION_STRUCTURE_TYPE_GENERIC_KHR) && mtlBLAS) {
-								blasIdx = (uint32_t)blasArray.count;
-								blasAddressToIndex.emplace(vkInst->accelerationStructureReference, blasIdx);
-								[blasArray addObject: mtlBLAS];
-							}
-						}
-						mtlInsts[j].accelerationStructureIndex = blasIdx;
-					}
-
-					instDesc.instancedAccelerationStructures = blasArray;
-					instDesc.instanceDescriptorBuffer = mtlInstBuf;
-					instDesc.instanceDescriptorBufferOffset = mtlInstOffset;
-					dstAS->setInstanceShaderBindingTableOffsetBuffer(sbtOffsetBuffer);
-					dstAS->setInstanceFlagsBuffer(instanceFlagsBuffer);
-					dstAS->setReferencedBLASes(blasArray);
-					[sbtOffsetBuffer release];
-					[instanceFlagsBuffer release];
-				}
-			}
-
-			// Build flags
-			if (bi.geometryInfo.flags & VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR) {
-				instDesc.usage |= MTLAccelerationStructureUsagePreferFastBuild;
-			}
-			if (bi.geometryInfo.flags & VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR) {
-				instDesc.usage |= MTLAccelerationStructureUsageRefit;
-			}
-			if (@available(macOS 12.0, iOS 15.0, tvOS 16.0, *)) {
-				instDesc.usage |= MTLAccelerationStructureUsageExtendedLimits;
-			}
-
-			// Scratch buffer
-			id<MTLBuffer> scratchBuf = nil;
-			NSUInteger scratchOffset = 0;
-			if (bi.geometryInfo.scratchData.deviceAddress) {
-				VkDeviceSize scrOff = 0;
-				scratchBuf = cmdEncoder->getDevice()->getMTLBufferForDeviceAddress(bi.geometryInfo.scratchData.deviceAddress, &scrOff);
-				scratchOffset = (NSUInteger)scrOff;
-			}
-
-			if (bi.geometryInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_BUILD_KHR) {
-				[asEncoder buildAccelerationStructure: mtlDstAS
-										  descriptor: instDesc
-									   scratchBuffer: scratchBuf
-								 scratchBufferOffset: scratchOffset];
-			} else {
-				id<MTLAccelerationStructure> mtlSrcAS = mtlDstAS;
-				if (bi.geometryInfo.srcAccelerationStructure) {
-					auto* srcAS = (MVKAccelerationStructure*)bi.geometryInfo.srcAccelerationStructure;
-					mtlSrcAS = srcAS->getMTLAccelerationStructure();
-				}
-				[asEncoder refitAccelerationStructure: mtlSrcAS
-										  descriptor: instDesc
-										 destination: mtlDstAS
-									   scratchBuffer: scratchBuf
-								 scratchBufferOffset: scratchOffset];
-			}
+// Converts the geometry transforms to the Metal matrix layout, in a temporary buffer referenced by the geometry descriptors.
+void MVKCmdBuildAccelerationStructures::encodeTransformConversion(MVKCommandEncoder* cmdEncoder,
+																  id<MTLComputeCommandEncoder> mtlComputeEnc,
+																  const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+																  MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc) {
+	const auto* pRangeInfos = getRangeInfos(buildInfo);
+	MVKSmallVector<uint64_t, 8> vkTransformAddrs;
+	MVKSmallVector<MTLAccelerationStructureTriangleGeometryDescriptor*, 8> mtlTriDescs;
+	for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
+		const auto& geometry = buildInfo.pGeometries[geoIdx];
+		if (hasTransform(geometry, pRangeInfos[geoIdx])) {
+			vkTransformAddrs.push_back(geometry.geometry.triangles.transformData.deviceAddress + pRangeInfos[geoIdx].transformOffset);
+			mtlTriDescs.push_back((MTLAccelerationStructureTriangleGeometryDescriptor*)mtlPrimDesc.geometryDescriptors[geoIdx]);
 		}
 	}
 
-	[asEncoder endEncoding];
+	size_t xfmCnt = vkTransformAddrs.size();
+	if ( !xfmCnt ) { return; }
+
+	const MVKMTLBufferAllocation* mtlXfmAlloc = cmdEncoder->getTempMTLBuffer(xfmCnt * sizeof(MTLPackedFloat4x3), true);
+	for (size_t xfmIdx = 0; xfmIdx < xfmCnt; xfmIdx++) {
+		mtlTriDescs[xfmIdx].transformationMatrixBuffer = mtlXfmAlloc->_mtlBuffer;
+		mtlTriDescs[xfmIdx].transformationMatrixBufferOffset = mtlXfmAlloc->_offset + xfmIdx * sizeof(MTLPackedFloat4x3);
+	}
+
+	id<MTLComputePipelineState> mtlPSO = cmdEncoder->getCommandEncodingPool()->getCmdConvertAccelerationStructureTransformsMTLComputePipelineState();
+	MVKMetalComputeCommandEncoderState& mtlState = cmdEncoder->getMtlCompute();
+	mtlState.bindPipeline(mtlComputeEnc, mtlPSO);
+	cmdEncoder->setComputeBytes(mtlComputeEnc, vkTransformAddrs.data(), xfmCnt * sizeof(uint64_t), 0);
+	mtlState.bindBuffer(mtlComputeEnc, mtlXfmAlloc->_mtlBuffer, mtlXfmAlloc->_offset, 1);
+	dispatchThreads(mtlComputeEnc, mtlPSO, xfmCnt);
+}
+
+// Copies the vertices of geometries whose vertex buffer offsets Metal does not support to temporary buffers,
+// and references those from the geometry descriptors instead.
+void MVKCmdBuildAccelerationStructures::encodeVertexAlignment(MVKCommandEncoder* cmdEncoder,
+															  id<MTLComputeCommandEncoder> mtlComputeEnc,
+															  const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+															  MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc) {
+	const auto* pRangeInfos = getRangeInfos(buildInfo);
+	for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
+		const auto& geometry = buildInfo.pGeometries[geoIdx];
+		auto* mtlTriDesc = (MTLAccelerationStructureTriangleGeometryDescriptor*)mtlPrimDesc.geometryDescriptors[geoIdx];
+		if ( !hasMisalignedVertices(geometry, mtlTriDesc) ) { continue; }
+
+		// Indexed triangles access the vertices from firstVertex to maxVertex.
+		const auto& triangles = geometry.geometry.triangles;
+		const auto& rangeInfo = pRangeInfos[geoIdx];
+		uint32_t vtxCnt = (triangles.indexType == VK_INDEX_TYPE_NONE_KHR
+						   ? rangeInfo.primitiveCount * 3
+						   : triangles.maxVertex + 1 - min(rangeInfo.firstVertex, triangles.maxVertex + 1));
+		MVKAccelerationStructureVertexParams params = {
+			.vertices = mtlTriDesc.vertexBuffer.gpuAddress + mtlTriDesc.vertexBufferOffset,
+			.stride = (uint32_t)triangles.vertexStride,
+			.vertexSize = cmdEncoder->getPixelFormats()->getBytesPerBlock(triangles.vertexFormat),
+		};
+		const MVKMTLBufferAllocation* mtlVtxAlloc = cmdEncoder->getTempMTLBuffer(max(vtxCnt, 1u) * triangles.vertexStride, true);
+		mtlTriDesc.vertexBuffer = mtlVtxAlloc->_mtlBuffer;
+		mtlTriDesc.vertexBufferOffset = mtlVtxAlloc->_offset;
+		if ( !vtxCnt ) { continue; }
+
+		id<MTLComputePipelineState> mtlPSO = cmdEncoder->getCommandEncodingPool()->getCmdCopyAccelerationStructureVerticesMTLComputePipelineState();
+		MVKMetalComputeCommandEncoderState& mtlState = cmdEncoder->getMtlCompute();
+		mtlState.bindPipeline(mtlComputeEnc, mtlPSO);
+		mtlState.bindStructBytes(mtlComputeEnc, &params, 0);
+		mtlState.bindBuffer(mtlComputeEnc, mtlVtxAlloc->_mtlBuffer, mtlVtxAlloc->_offset, 1);
+		dispatchThreads(mtlComputeEnc, mtlPSO, vtxCnt);
+	}
+}
+
+// Metal does not report the intersection of a ray that runs exactly along a face of a bounding box, while Vulkan expects
+// it. Bounding box intersections may be reported conservatively, so build from slightly enlarged copies of the boxes.
+void MVKCmdBuildAccelerationStructures::encodeBoundingBoxConversion(MVKCommandEncoder* cmdEncoder,
+																	id<MTLComputeCommandEncoder> mtlComputeEnc,
+																	const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+																	MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc) {
+	const auto* pRangeInfos = getRangeInfos(buildInfo);
+	for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
+		const auto& geometry = buildInfo.pGeometries[geoIdx];
+		const auto& rangeInfo = pRangeInfos[geoIdx];
+		if ( !hasBoundingBoxes(geometry, rangeInfo) ) { continue; }
+
+		auto* mtlBoxDesc = (MTLAccelerationStructureBoundingBoxGeometryDescriptor*)mtlPrimDesc.geometryDescriptors[geoIdx];
+		MVKAccelerationStructureBoundingBoxParams params = {
+			.boundingBoxes = mtlBoxDesc.boundingBoxBuffer.gpuAddress + mtlBoxDesc.boundingBoxBufferOffset,
+			.stride = mtlBoxDesc.boundingBoxStride,
+		};
+		const MVKMTLBufferAllocation* mtlBoxAlloc = cmdEncoder->getTempMTLBuffer(rangeInfo.primitiveCount * sizeof(MTLAxisAlignedBoundingBox), true);
+		mtlBoxDesc.boundingBoxBuffer = mtlBoxAlloc->_mtlBuffer;
+		mtlBoxDesc.boundingBoxBufferOffset = mtlBoxAlloc->_offset;
+		mtlBoxDesc.boundingBoxStride = sizeof(MTLAxisAlignedBoundingBox);
+
+		id<MTLComputePipelineState> mtlPSO = cmdEncoder->getCommandEncodingPool()->getCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState();
+		MVKMetalComputeCommandEncoderState& mtlState = cmdEncoder->getMtlCompute();
+		mtlState.bindPipeline(mtlComputeEnc, mtlPSO);
+		mtlState.bindStructBytes(mtlComputeEnc, &params, 0);
+		mtlState.bindBuffer(mtlComputeEnc, mtlBoxAlloc->_mtlBuffer, mtlBoxAlloc->_offset, 1);
+		dispatchThreads(mtlComputeEnc, mtlPSO, rangeInfo.primitiveCount);
+	}
+}
+
+void MVKCmdBuildAccelerationStructures::encodeBuilds(MVKCommandEncoder* cmdEncoder, MTLAccelerationStructureDescriptor* const* mtlDescs) {
+	MVKDevice* mvkDev = cmdEncoder->getDevice();
+	id<MTLAccelerationStructureCommandEncoder> mtlASEnc = cmdEncoder->getMTLAccelerationStructureEncoder(kMVKCommandUseBuildAccelerationStructures);
+	bool needsAccelerationStructures = !mvkDev->hasResidencySet();
+	for (size_t infoIdx = 0; infoIdx < _buildInfos.size(); infoIdx++) {
+		MTLAccelerationStructureDescriptor* mtlDesc = mtlDescs[infoIdx];
+		if ( !mtlDesc ) { continue; }
+
+		const auto& buildInfo = _buildInfos[infoIdx];
+		if (needsAccelerationStructures && buildInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+			useAccelerationStructures(cmdEncoder, mtlASEnc);
+			needsAccelerationStructures = false;
+		}
+
+		VkDeviceSize scratchOffset = 0;
+		id<MTLBuffer> scratchMTLBuff = nil;
+		if (buildInfo.scratchData.deviceAddress) {
+			scratchMTLBuff = mvkDev->getMTLBufferForDeviceAddress(buildInfo.scratchData.deviceAddress, &scratchOffset);
+		}
+
+		auto* dstAccStruct = (MVKAccelerationStructure*)buildInfo.dstAccelerationStructure;
+		if (buildInfo.mode == VK_BUILD_ACCELERATION_STRUCTURE_MODE_UPDATE_KHR) {
+			// Metal refits in place if the destination is nil.
+			auto* srcAccStruct = (MVKAccelerationStructure*)buildInfo.srcAccelerationStructure;
+			[mtlASEnc refitAccelerationStructure: srcAccStruct->getMTLAccelerationStructure()
+									  descriptor: mtlDesc
+									 destination: srcAccStruct == dstAccStruct ? nil : dstAccStruct->getMTLAccelerationStructure()
+								   scratchBuffer: scratchMTLBuff
+							 scratchBufferOffset: scratchOffset];
+		} else if (scratchMTLBuff) {
+			[mtlASEnc buildAccelerationStructure: dstAccStruct->getMTLAccelerationStructure()
+									  descriptor: mtlDesc
+								   scratchBuffer: scratchMTLBuff
+							 scratchBufferOffset: scratchOffset];
+		} else {
+			cmdEncoder->reportError(VK_ERROR_INVALID_DEVICE_ADDRESS_EXT, "vkCmdBuildAccelerationStructuresKHR(): Acceleration structure scratch data must be held in a buffer created with VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT.");
+		}
+	}
 }
 
 
@@ -375,7 +370,7 @@ void MVKCmdBuildAccelerationStructures::encode(MVKCommandEncoder* cmdEncoder) {
 #pragma mark MVKCmdCopyAccelerationStructure
 
 VkResult MVKCmdCopyAccelerationStructure::setContent(MVKCommandBuffer* cmdBuff,
-                                                     const VkCopyAccelerationStructureInfoKHR* pInfo) {
+													 const VkCopyAccelerationStructureInfoKHR* pInfo) {
 	_src = pInfo->src;
 	_dst = pInfo->dst;
 	_mode = pInfo->mode;
@@ -383,22 +378,43 @@ VkResult MVKCmdCopyAccelerationStructure::setContent(MVKCommandBuffer* cmdBuff,
 }
 
 void MVKCmdCopyAccelerationStructure::encode(MVKCommandEncoder* cmdEncoder) {
-	auto* srcAS = (MVKAccelerationStructure*)_src;
-	auto* dstAS = (MVKAccelerationStructure*)_dst;
+	auto* srcAccStruct = (MVKAccelerationStructure*)_src;
+	auto* dstAccStruct = (MVKAccelerationStructure*)_dst;
 
-	id<MTLCommandBuffer> mtlCmdBuff = cmdEncoder->_mtlCmdBuffer;
-	id<MTLAccelerationStructureCommandEncoder> asEncoder = [mtlCmdBuff accelerationStructureCommandEncoder];
-
+	id<MTLAccelerationStructureCommandEncoder> mtlASEnc = cmdEncoder->getMTLAccelerationStructureEncoder(kMVKCommandUseCopyAccelerationStructure);
 	if (_mode == VK_COPY_ACCELERATION_STRUCTURE_MODE_COMPACT_KHR) {
-		[asEncoder copyAndCompactAccelerationStructure: srcAS->getMTLAccelerationStructure()
-							   toAccelerationStructure: dstAS->getMTLAccelerationStructure()];
+		[mtlASEnc copyAndCompactAccelerationStructure: srcAccStruct->getMTLAccelerationStructure()
+							  toAccelerationStructure: dstAccStruct->getMTLAccelerationStructure()];
 	} else {
-		[asEncoder copyAccelerationStructure: srcAS->getMTLAccelerationStructure()
-					 toAccelerationStructure: dstAS->getMTLAccelerationStructure()];
+		[mtlASEnc copyAccelerationStructure: srcAccStruct->getMTLAccelerationStructure()
+					toAccelerationStructure: dstAccStruct->getMTLAccelerationStructure()];
 	}
-	dstAS->copyRetainedBuffersFrom(srcAS);
 
-	[asEncoder endEncoding];
+	// The instance SBT record offsets of a top-level acceleration structure are held outside the Metal acceleration
+	// structure. Copy them to a buffer of the destination, and write the address of that buffer to its header.
+	id<MTLBuffer> srcSBTOffsetsMTLBuff = srcAccStruct->getInstanceShaderBindingTableOffsetBuffer();
+	if ( !srcSBTOffsetsMTLBuff ) { return; }
+
+	NSUInteger sbtOffsetsLength = srcSBTOffsetsMTLBuff.length;
+	id<MTLBuffer> dstSBTOffsetsMTLBuff = dstAccStruct->getInstanceSBTOffsetsMTLBuffer(uint32_t(sbtOffsetsLength / sizeof(uint32_t)));
+	if ( !dstSBTOffsetsMTLBuff ) {
+		cmdEncoder->reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkCmdCopyAccelerationStructureKHR(): Could not allocate the instance data of an acceleration structure.");
+		return;
+	}
+	uint64_t dstSBTOffsetsAddr = dstSBTOffsetsMTLBuff.gpuAddress;
+	const MVKMTLBufferAllocation* mtlAddrAlloc = cmdEncoder->copyToTempMTLBufferAllocation(&dstSBTOffsetsAddr, sizeof(dstSBTOffsetsAddr));
+
+	id<MTLBlitCommandEncoder> mtlBlitEnc = cmdEncoder->getMTLBlitEncoder(kMVKCommandUseCopyAccelerationStructure);
+	[mtlBlitEnc copyFromBuffer: srcSBTOffsetsMTLBuff
+				  sourceOffset: 0
+					  toBuffer: dstSBTOffsetsMTLBuff
+			 destinationOffset: 0
+						  size: sbtOffsetsLength];
+	[mtlBlitEnc copyFromBuffer: mtlAddrAlloc->_mtlBuffer
+				  sourceOffset: mtlAddrAlloc->_offset
+					  toBuffer: dstAccStruct->getHeaderMTLBuffer()
+			 destinationOffset: dstAccStruct->getHeaderOffset() + offsetof(MVKAccelerationStructureHeader, instanceSBTOffsets)
+						  size: sizeof(dstSBTOffsetsAddr)];
 }
 
 
@@ -406,39 +422,33 @@ void MVKCmdCopyAccelerationStructure::encode(MVKCommandEncoder* cmdEncoder) {
 #pragma mark MVKCmdWriteAccelerationStructuresProperties
 
 VkResult MVKCmdWriteAccelerationStructuresProperties::setContent(MVKCommandBuffer* cmdBuff,
-                                                                  uint32_t accelerationStructureCount,
-                                                                  const VkAccelerationStructureKHR* pAccelerationStructures,
-                                                                  VkQueryType queryType,
-                                                                  VkQueryPool queryPool,
-                                                                  uint32_t firstQuery) {
-	_accelerationStructures.assign(pAccelerationStructures,
-								   pAccelerationStructures + accelerationStructureCount);
-	_queryType = queryType;
+																 uint32_t accelerationStructureCount,
+																 const VkAccelerationStructureKHR* pAccelerationStructures,
+																 VkQueryType queryType,
+																 VkQueryPool queryPool,
+																 uint32_t firstQuery) {
+	_accelerationStructures.assign(pAccelerationStructures, pAccelerationStructures + accelerationStructureCount);
 	_queryPool = queryPool;
 	_firstQuery = firstQuery;
 	return VK_SUCCESS;
 }
 
 void MVKCmdWriteAccelerationStructuresProperties::encode(MVKCommandEncoder* cmdEncoder) {
-	if (_queryType != VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR || !_queryPool) { return; }
+	auto* mvkQryPool = (MVKAccelerationStructureQueryPool*)_queryPool;
+	uint32_t queryCount = (uint32_t)_accelerationStructures.size();
+	id<MTLBuffer> mtlResultsBuff = mvkQryPool->getMTLQueryResultsBuffer();
 
-	auto* mvkQueryPool = reinterpret_cast<MVKQueryPool*>(_queryPool);
-	auto* asQueryPool = dynamic_cast<MVKAccelerationStructureQueryPool*>(mvkQueryPool);
-	if (!asQueryPool || _accelerationStructures.empty()) { return; }
-
-	cmdEncoder->resetQueries(mvkQueryPool, _firstQuery, (uint32_t)_accelerationStructures.size());
-
-	id<MTLCommandBuffer> mtlCmdBuff = cmdEncoder->_mtlCmdBuffer;
-	id<MTLAccelerationStructureCommandEncoder> asEncoder = [mtlCmdBuff accelerationStructureCommandEncoder];
-	for (uint32_t i = 0; i < _accelerationStructures.size(); i++) {
-		auto* mvkAS = (MVKAccelerationStructure*)_accelerationStructures[i];
-		if (mvkAS && mvkAS->getMTLAccelerationStructure()) {
-			NSUInteger offset = asQueryPool->getQueryOffset(_firstQuery + i);
-			[asEncoder writeCompactedAccelerationStructureSize: mvkAS->getMTLAccelerationStructure()
-													  toBuffer: asQueryPool->getMTLQueryResultsBuffer()
-														offset: offset];
-		}
-		mvkQueryPool->endQuery(_firstQuery + i, cmdEncoder);
+	// Compacted size is the only supported acceleration structure query type.
+	cmdEncoder->resetQueries(mvkQryPool, _firstQuery, queryCount);
+	id<MTLAccelerationStructureCommandEncoder> mtlASEnc = cmdEncoder->getMTLAccelerationStructureEncoder(kMVKCommandUseWriteAccelerationStructuresProperties);
+	for (uint32_t asIdx = 0; asIdx < queryCount; asIdx++) {
+		auto* mvkAccStruct = (MVKAccelerationStructure*)_accelerationStructures[asIdx];
+		[mtlASEnc writeCompactedAccelerationStructureSize: mvkAccStruct->getMTLAccelerationStructure()
+												 toBuffer: mtlResultsBuff
+												   offset: mvkQryPool->getQueryOffset(_firstQuery + asIdx)
+											 sizeDataType: MTLDataTypeULong];
 	}
-	[asEncoder endEncoding];
+	for (uint32_t query = _firstQuery; query < _firstQuery + queryCount; query++) {
+		mvkQryPool->endQuery(query, cmdEncoder);
+	}
 }

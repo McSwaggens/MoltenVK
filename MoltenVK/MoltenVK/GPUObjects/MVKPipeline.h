@@ -205,6 +205,7 @@ protected:
 										   const VkPipelineShaderStageCreateInfo* pShaderStage,
 										   spv::ExecutionModel execModel);
 	uint32_t getComputeImplicitBufferIndex(uint32_t bufferIndexOffset);
+	bool usesAccelerationStructureHeaders();
 
 	MVKPipelineLayout* _layout;
 	MVKPipelineCache* _pipelineCache;

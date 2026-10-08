@@ -556,3 +556,106 @@ kernel void cmdTraceRaysIndirectConvertBuffers(const device uint32_t* launchSize
 	}
 }
 )";
+
+
+/**
+ * Static MSL source code for the acceleration structure command shaders. These require MSL 3.1,
+ * and are compiled into a separate library when acceleration structures are first built.
+ */
+static NSString* _MVKStaticAccelerationStructureShaderSource = @R"(
+#include <metal_stdlib>
+#include <metal_raytracing>
+using namespace metal;
+
+typedef struct {
+	MTLResourceID accelerationStructure;
+	ulong instanceSBTOffsets;
+} MVKAccelerationStructureHeader;
+
+typedef struct {
+	float transform[3][4];
+	uint instanceCustomIndexAndMask;
+	uint instanceSBTRecordOffsetAndFlags;
+	ulong accelerationStructureReference;
+} VkAccelerationStructureInstanceKHR;
+
+typedef struct {
+	ulong instances;
+	ulong instanceSBTOffsets;
+	uint arrayOfPointers;
+} MVKAccelerationStructureInstanceParams;
+
+// Converts Vulkan instances to Metal instance descriptors, and writes their SBT record offsets, and the
+// address of those, to the header of the top-level acceleration structure. Each instance references a
+// bottom-level acceleration structure by the device address of its header. A null reference makes the
+// instance inactive. The Vulkan geometry instance flags have the same values as the Metal instance options.
+kernel void cmdConvertAccelerationStructureInstances(constant MVKAccelerationStructureInstanceParams& params [[buffer(0)]],
+                                                     device MTLIndirectAccelerationStructureInstanceDescriptor* mtlInstances [[buffer(1)]],
+                                                     device uint* instanceSBTOffsets [[buffer(2)]],
+                                                     device MVKAccelerationStructureHeader& header [[buffer(3)]],
+                                                     uint idx [[thread_position_in_grid]]) {
+	const device VkAccelerationStructureInstanceKHR& vkInst = params.arrayOfPointers
+		? *reinterpret_cast<const device VkAccelerationStructureInstanceKHR*>(reinterpret_cast<const device ulong*>(params.instances)[idx])
+		: reinterpret_cast<const device VkAccelerationStructureInstanceKHR*>(params.instances)[idx];
+
+	MTLIndirectAccelerationStructureInstanceDescriptor mtlInst;
+	for (uint col = 0; col < 4; col++) {
+		mtlInst.transformationMatrix[col] = packed_float3(vkInst.transform[0][col], vkInst.transform[1][col], vkInst.transform[2][col]);
+	}
+	uint sbtOffset = vkInst.instanceSBTRecordOffsetAndFlags & 0xFFFFFF;
+	ulong blasAddress = vkInst.accelerationStructureReference;
+	mtlInst.options = MTLAccelerationStructureInstanceOptions(vkInst.instanceSBTRecordOffsetAndFlags >> 24);
+	mtlInst.mask = blasAddress ? vkInst.instanceCustomIndexAndMask >> 24 : 0;
+	mtlInst.intersectionFunctionTableOffset = sbtOffset;
+	mtlInst.userID = vkInst.instanceCustomIndexAndMask & 0xFFFFFF;
+	mtlInst.accelerationStructureID = blasAddress ? reinterpret_cast<const device MVKAccelerationStructureHeader*>(blasAddress)->accelerationStructure : MTLResourceID();
+	mtlInstances[idx] = mtlInst;
+
+	instanceSBTOffsets[idx] = sbtOffset;
+	if (idx == 0) { header.instanceSBTOffsets = params.instanceSBTOffsets; }
+}
+
+typedef struct {
+	ulong vertices;
+	uint stride;
+	uint vertexSize;
+} MVKAccelerationStructureVertexParams;
+
+// Copies vertices, read from a device address, to a buffer that Metal can build acceleration structures from.
+kernel void cmdCopyAccelerationStructureVertices(constant MVKAccelerationStructureVertexParams& params [[buffer(0)]],
+                                                 device uchar* dstVertices [[buffer(1)]],
+                                                 uint idx [[thread_position_in_grid]]) {
+	const device uchar* srcVertex = reinterpret_cast<const device uchar*>(params.vertices) + idx * params.stride;
+	device uchar* dstVertex = dstVertices + idx * params.stride;
+	for (uint byteIdx = 0; byteIdx < params.vertexSize; byteIdx++) {
+		dstVertex[byteIdx] = srcVertex[byteIdx];
+	}
+}
+
+typedef struct {
+	ulong boundingBoxes;
+	ulong stride;
+} MVKAccelerationStructureBoundingBoxParams;
+
+// Copies bounding boxes, read from a device address, enlarged by about one ULP, so that rays along their faces intersect them.
+// Bounding boxes with a NaN minimum x coordinate are inactive, and remain so.
+kernel void cmdConvertAccelerationStructureBoundingBoxes(constant MVKAccelerationStructureBoundingBoxParams& params [[buffer(0)]],
+                                                         device packed_float3* dstBoxes [[buffer(1)]],
+                                                         uint idx [[thread_position_in_grid]]) {
+	const device packed_float3* srcBox = reinterpret_cast<const device packed_float3*>(params.boundingBoxes + idx * params.stride);
+	float3 minPos = srcBox[0];
+	float3 maxPos = srcBox[1];
+	dstBoxes[2 * idx] = minPos - (abs(minPos) * 1.2e-7f + 1.0e-30f);
+	dstBoxes[2 * idx + 1] = maxPos + (abs(maxPos) * 1.2e-7f + 1.0e-30f);
+}
+
+// Converts Vulkan row-major 3x4 geometry transforms, read from device addresses, to Metal column-major 4x3 matrices.
+kernel void cmdConvertAccelerationStructureTransforms(constant ulong* vkTransforms [[buffer(0)]],
+                                                      device MTLPackedFloat4x3* mtlTransforms [[buffer(1)]],
+                                                      uint idx [[thread_position_in_grid]]) {
+	const device float* vkTransform = reinterpret_cast<const device float*>(vkTransforms[idx]);
+	for (uint col = 0; col < 4; col++) {
+		mtlTransforms[idx][col] = packed_float3(vkTransform[col], vkTransform[4 + col], vkTransform[8 + col]);
+	}
+}
+)";

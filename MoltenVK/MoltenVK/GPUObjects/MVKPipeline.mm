@@ -2049,6 +2049,7 @@ void MVKGraphicsPipeline::initShaderConversionConfig(SPIRVToMSLConversionConfigu
 	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
 	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)getMetalFeatures().argumentBuffersTier;
 	shaderConfig.options.mslOptions.agx_manual_cube_grad_fixup = mtlFeats.needsCubeGradWorkaround;
+	shaderConfig.options.mslOptions.use_acceleration_structure_headers = usesAccelerationStructureHeaders();
 
 	MVKPipelineLayout* layout = (MVKPipelineLayout*)pCreateInfo->layout;
 	layout->populateShaderConversionConfig(shaderConfig);
@@ -2348,6 +2349,11 @@ MVKGraphicsPipeline::~MVKGraphicsPipeline() {
 #pragma mark -
 #pragma mark MVKComputePipeline
 
+// Shaders access acceleration structures in the representation used by the descriptors of the device.
+bool MVKPipeline::usesAccelerationStructureHeaders() {
+	return getEnabledExtensions().vk_KHR_acceleration_structure.enabled && _device->useAccelerationStructureHeaders();
+}
+
 // Initializes the shader conversion config of a shader stage that runs in a Metal compute pipeline.
 void MVKPipeline::initComputeShaderConversionConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
 													MVKImplicitBufferBindings& implicitBuffers,
@@ -2370,6 +2376,7 @@ void MVKPipeline::initComputeShaderConversionConfig(SPIRVToMSLConversionConfigur
 	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
 	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
 	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)mtlFeats.argumentBuffersTier;
+	shaderConfig.options.mslOptions.use_acceleration_structure_headers = usesAccelerationStructureHeaders();
 
 #if MVK_MACOS
     shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.simdPermute;
@@ -2684,7 +2691,6 @@ bool MVKRayTracingPipeline::compileStages(const VkRayTracingPipelineCreateInfoKH
 		SPIRVToMSLConversionConfiguration shaderConfig;
 		initComputeShaderConversionConfig(shaderConfig, _stageResources.implicitBuffers, pStage, stageInfo.execModel);
 		shaderConfig.options.mslOptions.ray_tracing_visible_function = true;
-		shaderConfig.options.mslOptions.use_acceleration_structure_headers = true;
 		char funcName[64];
 		snprintf(funcName, sizeof(funcName), nameIdx ? "%s_%016zx_%u" : "%s_%016zx", stageInfo.functionName, funcKey.moduleKey.codeHash, nameIdx);
 		shaderConfig.options.mslEntryPointName = funcName;

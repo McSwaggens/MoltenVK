@@ -145,6 +145,18 @@ public:
 	/** Returns a MTLComputePipelineState for converting the launch size of an indirect ray trace to threadgroup counts. */
 	id<MTLComputePipelineState> getCmdTraceRaysIndirectConvertBuffersMTLComputePipelineState();
 
+	/** Returns a MTLComputePipelineState for converting Vulkan acceleration structure instances to Metal instance descriptors. */
+	id<MTLComputePipelineState> getCmdConvertAccelerationStructureInstancesMTLComputePipelineState();
+
+	/** Returns a MTLComputePipelineState for converting Vulkan acceleration structure geometry transforms to Metal matrices. */
+	id<MTLComputePipelineState> getCmdConvertAccelerationStructureTransformsMTLComputePipelineState();
+
+	/** Returns a MTLComputePipelineState for copying acceleration structure vertices to a buffer that Metal can read them from. */
+	id<MTLComputePipelineState> getCmdCopyAccelerationStructureVerticesMTLComputePipelineState();
+
+	/** Returns a MTLComputePipelineState for converting Vulkan acceleration structure bounding boxes for Metal. */
+	id<MTLComputePipelineState> getCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState();
+
 	/** Deletes all the internal resources. */
 	void clear();
 
@@ -188,4 +200,8 @@ protected:
 	id<MTLComputePipelineState> _mtlAccumOcclusionQueryResultsComputePipelineState = nil;
 	id<MTLComputePipelineState> _mtlConvertUint8IndicesComputePipelineState = nil;
 	id<MTLComputePipelineState> _mtlTraceRaysIndirectConvertBuffersComputePipelineState = nil;
+	id<MTLComputePipelineState> _mtlConvertAccelerationStructureInstancesComputePipelineState = nil;
+	id<MTLComputePipelineState> _mtlConvertAccelerationStructureTransformsComputePipelineState = nil;
+	id<MTLComputePipelineState> _mtlCopyAccelerationStructureVerticesComputePipelineState = nil;
+	id<MTLComputePipelineState> _mtlConvertAccelerationStructureBoundingBoxesComputePipelineState = nil;
 };

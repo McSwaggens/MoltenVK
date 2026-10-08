@@ -60,6 +60,9 @@ const char* mvkVkCommandName(MVKCommandUse cmdUse) {
 		case kMVKCommandUseAccumOcclusionQuery:          return "Post-render-pass occlusion query accumulation";
 		case kMVKCommandConvertUint8Indices:             return "Convert Uint8 indices to Uint16";
 		case kMVKCommandUseRecordGPUCounterSample:       return "Record GPU Counter Sample";
+		case kMVKCommandUseBuildAccelerationStructures:  return "vkCmdBuildAccelerationStructuresKHR";
+		case kMVKCommandUseCopyAccelerationStructure:    return "vkCmdCopyAccelerationStructureKHR";
+		case kMVKCommandUseWriteAccelerationStructuresProperties: return "vkCmdWriteAccelerationStructuresPropertiesKHR";
 		default:                                         return "Unknown Vulkan command";
 	}
 }

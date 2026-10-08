@@ -17,186 +17,148 @@
  */
 
 #include "MVKAccelerationStructure.h"
-#include "MVKBuffer.h"
 #include "MVKCommandEncoderState.h"
 
-std::shared_mutex MVKAccelerationStructure::_mtlAccelerationStructureMapLock;
-std::unordered_map<uint64_t, MVKAccelerationStructure*> MVKAccelerationStructure::_mtlAccelerationStructureMap;
+using namespace std;
 
-MVKAccelerationStructure::MVKAccelerationStructure(MVKDevice* device,
-                                                   const VkAccelerationStructureCreateInfoKHR* pCreateInfo)
-	: MVKVulkanAPIDeviceObject(device) {
 
-	_type = pCreateInfo->type;
-	_buffer = pCreateInfo->buffer;
-	_offset = pCreateInfo->offset;
-	_size = pCreateInfo->size;
+// The number of acceleration structure headers held by each MTLBuffer of a header pool.
+static constexpr uint32_t kMVKAccelerationStructureHeadersPerMTLBuffer = 256;
 
-	// Allocate the Metal acceleration structure with the requested size.
-	_mtlAccelerationStructure = [getMTLDevice() newAccelerationStructureWithSize: (NSUInteger)_size];
-	if (_mtlAccelerationStructure) {
-		std::lock_guard<std::shared_mutex> lock(_mtlAccelerationStructureMapLock);
-		_mtlAccelerationStructureMap[_mtlAccelerationStructure.gpuResourceID._impl] = this;
-	}
-}
 
-void MVKAccelerationStructure::setMTLAccelerationStructure(id<MTLAccelerationStructure> mtlAS) {
-	if (_mtlAccelerationStructure == mtlAS) { return; }
+#pragma mark -
+#pragma mark MVKAccelerationStructure
 
-	if (_mtlAccelerationStructure) {
-		std::lock_guard<std::shared_mutex> lock(_mtlAccelerationStructureMapLock);
-		_mtlAccelerationStructureMap.erase(_mtlAccelerationStructure.gpuResourceID._impl);
+id<MTLBuffer> MVKAccelerationStructure::getInstanceSBTOffsetsMTLBuffer(uint32_t instanceCount) {
+	lock_guard<mutex> lock(_lock);
+
+	NSUInteger length = max(instanceCount, 1u) * sizeof(uint32_t);
+	if ( !_instanceSBTOffsetsMTLBuffers.empty() ) {
+		NSUInteger currLength = _instanceSBTOffsetsMTLBuffers.back().length;
+		if (currLength >= length) { return _instanceSBTOffsetsMTLBuffers.back(); }
+		length = max(length, currLength * 2);	// Grow geometrically to limit the number of retained buffers
 	}
 
-	[_mtlAccelerationStructure release];
-	_mtlAccelerationStructure = [mtlAS retain];
+	id<MTLBuffer> mtlBuff = [getMTLDevice() newBufferWithLength: length options: MTLResourceStorageModePrivate];	// retained
+	if ( !mtlBuff ) { return nil; }
 
-	if (_mtlAccelerationStructure) {
-		std::lock_guard<std::shared_mutex> lock(_mtlAccelerationStructureMapLock);
-		_mtlAccelerationStructureMap[_mtlAccelerationStructure.gpuResourceID._impl] = this;
-	}
-}
-
-VkDeviceAddress MVKAccelerationStructure::getDeviceAddress() {
-	if (_mtlAccelerationStructure) {
-		return _mtlAccelerationStructure.gpuResourceID._impl;
-	}
-	return 0;
-}
-
-void MVKAccelerationStructure::setInstanceShaderBindingTableOffsetBuffer(id<MTLBuffer> mtlBuffer) {
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	if (_instanceShaderBindingTableOffsetBuffer == mtlBuffer) { return; }
-	[_instanceShaderBindingTableOffsetBuffer release];
-	_instanceShaderBindingTableOffsetBuffer = [mtlBuffer retain];
+	setMetalObjectLabel(mtlBuff, @"Acceleration Structure Instance SBT Offsets");
+	_device->makeResident(mtlBuff);
+	_instanceSBTOffsetsMTLBuffers.push_back(mtlBuff);
+	return mtlBuff;
 }
 
 id<MTLBuffer> MVKAccelerationStructure::getInstanceShaderBindingTableOffsetBuffer() {
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	return _instanceShaderBindingTableOffsetBuffer;
+	lock_guard<mutex> lock(_lock);
+	return _instanceSBTOffsetsMTLBuffers.empty() ? nil : _instanceSBTOffsetsMTLBuffers.back();
 }
 
-void MVKAccelerationStructure::setInstanceFlagsBuffer(id<MTLBuffer> mtlBuffer) {
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	if (_instanceFlagsBuffer == mtlBuffer) { return; }
-	[_instanceFlagsBuffer release];
-	_instanceFlagsBuffer = [mtlBuffer retain];
-}
+void MVKAccelerationStructure::encodeResourceUsage(MVKUseResourceHelper& rez, MVKResourceUsageStages stage) {
+	rez.add(_mtlAccelerationStructure, stage, false);
 
-id<MTLBuffer> MVKAccelerationStructure::getInstanceFlagsBuffer() {
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	return _instanceFlagsBuffer;
-}
-
-MVKAccelerationStructure* MVKAccelerationStructure::getMVKAccelerationStructure(id<MTLAccelerationStructure> mtlAS) {
-	if (!mtlAS) { return nullptr; }
-	return getMVKAccelerationStructure(mtlAS.gpuResourceID._impl);
-}
-
-MVKAccelerationStructure* MVKAccelerationStructure::getMVKAccelerationStructure(VkDeviceAddress deviceAddress) {
-	if (!deviceAddress) { return nullptr; }
-	std::shared_lock<std::shared_mutex> lock(_mtlAccelerationStructureMapLock);
-	auto it = _mtlAccelerationStructureMap.find(deviceAddress);
-	return it == _mtlAccelerationStructureMap.end() ? nullptr : it->second;
-}
-
-void MVKAccelerationStructure::encodeAccelerationStructures(MVKDevice* device, MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
-	std::shared_lock<std::shared_mutex> lock(_mtlAccelerationStructureMapLock);
-	for (auto& entry : _mtlAccelerationStructureMap) {
-		MVKAccelerationStructure* mvkAS = entry.second;
-		if (mvkAS->getDevice() != device) { continue; }
-		resources.add(mvkAS->_mtlAccelerationStructure, stage, false);
-		if (mvkAS->_instanceShaderBindingTableOffsetBuffer) { resources.add(mvkAS->_instanceShaderBindingTableOffsetBuffer, stage, false); }
+	lock_guard<mutex> lock(_lock);
+	for (id<MTLBuffer> mtlBuff : _instanceSBTOffsetsMTLBuffers) {
+		rez.add(mtlBuff, stage, false);
 	}
 }
 
-void MVKAccelerationStructure::retainBuffer(id<MTLBuffer> mtlBuffer) {
-	if (!mtlBuffer) { return; }
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	[mtlBuffer retain];
-	_retainedMTLBuffers.push_back(mtlBuffer);
+void MVKAccelerationStructure::propagateDebugName() {
+	setMetalObjectLabel(_mtlAccelerationStructure, _debugName);
 }
 
-void MVKAccelerationStructure::clearRetainedBuffers() {
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	for (auto& mtlBuffer : _retainedMTLBuffers) {
-		[mtlBuffer release];
-	}
-	_retainedMTLBuffers.clear();
-	for (auto& blas : _referencedBLASes) {
-		[blas release];
-	}
-	_referencedBLASes.clear();
-	[_instanceShaderBindingTableOffsetBuffer release];
-	_instanceShaderBindingTableOffsetBuffer = nil;
-	[_instanceFlagsBuffer release];
-	_instanceFlagsBuffer = nil;
-}
 
-void MVKAccelerationStructure::setReferencedBLASes(NSArray<id<MTLAccelerationStructure>>* blasArray) {
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	for (auto& blas : _referencedBLASes) {
-		[blas release];
-	}
-	_referencedBLASes.clear();
-	_referencedBLASes.reserve(blasArray.count);
-	for (id<MTLAccelerationStructure> blas in blasArray) {
-		[blas retain];
-		_referencedBLASes.push_back(blas);
-	}
-}
+#pragma mark Construction
 
-void MVKAccelerationStructure::encodeResourceUsage(id<MTLComputeCommandEncoder> mtlEncoder) {
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	if (_mtlAccelerationStructure) {
-		[mtlEncoder useResource: _mtlAccelerationStructure usage: MTLResourceUsageRead];
-	}
-	for (auto& blas : _referencedBLASes) {
-		[mtlEncoder useResource: blas usage: MTLResourceUsageRead];
-	}
-}
+MVKAccelerationStructure::MVKAccelerationStructure(MVKDevice* device,
+												   const VkAccelerationStructureCreateInfoKHR* pCreateInfo) : MVKVulkanAPIDeviceObject(device) {
 
-void MVKAccelerationStructure::copyRetainedBuffersFrom(MVKAccelerationStructure* srcAS) {
-	if (srcAS == this) { return; }
-
-	std::vector<id<MTLBuffer>> retainedBuffers;
-	std::vector<id<MTLAccelerationStructure>> referencedBLASes;
-	id<MTLBuffer> sbtOffsetBuffer = nil;
-	id<MTLBuffer> instanceFlagsBuffer = nil;
-	if (srcAS) {
-		std::lock_guard<std::mutex> srcLock(srcAS->_metadataLock);
-		retainedBuffers.reserve(srcAS->_retainedMTLBuffers.size());
-		for (auto& mtlBuffer : srcAS->_retainedMTLBuffers) {
-			retainedBuffers.push_back([mtlBuffer retain]);
-		}
-		referencedBLASes.reserve(srcAS->_referencedBLASes.size());
-		for (auto& blas : srcAS->_referencedBLASes) {
-			referencedBLASes.push_back([blas retain]);
-		}
-		sbtOffsetBuffer = [srcAS->_instanceShaderBindingTableOffsetBuffer retain];
-		instanceFlagsBuffer = [srcAS->_instanceFlagsBuffer retain];
+	// Metal allocates the memory of acceleration structures, so the buffer provided by the app is not used.
+	_mtlAccelerationStructure = [getMTLDevice() newAccelerationStructureWithSize: pCreateInfo->size];	// retained
+	if ( !_mtlAccelerationStructure ) {
+		setConfigurationResult(reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY,
+										   "vkCreateAccelerationStructureKHR(): Could not allocate a Metal acceleration structure of %llu bytes.",
+										   pCreateInfo->size));
+		return;
 	}
-
-	std::lock_guard<std::mutex> lock(_metadataLock);
-	for (auto& mtlBuffer : _retainedMTLBuffers) {
-		[mtlBuffer release];
-	}
-	for (auto& blas : _referencedBLASes) {
-		[blas release];
-	}
-	[_instanceShaderBindingTableOffsetBuffer release];
-	[_instanceFlagsBuffer release];
-	_retainedMTLBuffers = std::move(retainedBuffers);
-	_referencedBLASes = std::move(referencedBLASes);
-	_instanceShaderBindingTableOffsetBuffer = sbtOffsetBuffer;
-	_instanceFlagsBuffer = instanceFlagsBuffer;
+	_device->makeResident(_mtlAccelerationStructure);
+	setConfigurationResult(_device->getAccelerationStructureHeaderPool()->addAccelerationStructure(this));
 }
 
 MVKAccelerationStructure::~MVKAccelerationStructure() {
-	clearRetainedBuffers();
-	if (_mtlAccelerationStructure) {
-		std::lock_guard<std::shared_mutex> lock(_mtlAccelerationStructureMapLock);
-		_mtlAccelerationStructureMap.erase(_mtlAccelerationStructure.gpuResourceID._impl);
+	if (_headerMTLBuffer) { _device->getAccelerationStructureHeaderPool()->removeAccelerationStructure(this); }
+	for (id<MTLBuffer> mtlBuff : _instanceSBTOffsetsMTLBuffers) {
+		_device->removeResidency(mtlBuff);
+		[mtlBuff release];
 	}
-	[_mtlAccelerationStructure release];
+	if (_mtlAccelerationStructure) {
+		_device->removeResidency(_mtlAccelerationStructure);
+		[_mtlAccelerationStructure release];
+	}
+}
+
+
+#pragma mark -
+#pragma mark MVKAccelerationStructureHeaderPool
+
+VkResult MVKAccelerationStructureHeaderPool::addAccelerationStructure(MVKAccelerationStructure* mvkAccStruct) {
+	lock_guard<mutex> lock(_lock);
+
+	if (_freeHeaderIndices.empty()) {
+		id<MTLBuffer> mtlBuff = [getMTLDevice() newBufferWithLength: kMVKAccelerationStructureHeadersPerMTLBuffer * sizeof(MVKAccelerationStructureHeader)
+															options: MTLResourceStorageModeShared];	// retained
+		if ( !mtlBuff ) {
+			return reportError(VK_ERROR_OUT_OF_DEVICE_MEMORY, "vkCreateAccelerationStructureKHR(): Could not allocate acceleration structure headers.");
+		}
+		[mtlBuff setLabel: @"Acceleration Structure Headers"];
+		_device->makeResident(mtlBuff);
+		_mtlBuffers.push_back(mtlBuff);
+
+		// Push in reverse, so lower header indices are allocated first.
+		uint32_t endHdrIdx = (uint32_t)_accelerationStructures.size() + kMVKAccelerationStructureHeadersPerMTLBuffer;
+		_accelerationStructures.resize(endHdrIdx, nullptr);
+		for (uint32_t i = 0; i < kMVKAccelerationStructureHeadersPerMTLBuffer; i++) {
+			_freeHeaderIndices.push_back(endHdrIdx - i - 1);
+		}
+	}
+
+	uint32_t hdrIdx = _freeHeaderIndices.back();
+	_freeHeaderIndices.pop_back();
+	_accelerationStructures[hdrIdx] = mvkAccStruct;
+
+	mvkAccStruct->_headerIndex = hdrIdx;
+	mvkAccStruct->_headerMTLBuffer = _mtlBuffers[hdrIdx / kMVKAccelerationStructureHeadersPerMTLBuffer];
+	mvkAccStruct->_headerOffset = (hdrIdx % kMVKAccelerationStructureHeadersPerMTLBuffer) * sizeof(MVKAccelerationStructureHeader);
+
+	auto* pHeader = (MVKAccelerationStructureHeader*)((uintptr_t)mvkAccStruct->_headerMTLBuffer.contents + mvkAccStruct->_headerOffset);
+	*pHeader = { mvkAccStruct->_mtlAccelerationStructure.gpuResourceID, 0 };
+
+	return VK_SUCCESS;
+}
+
+void MVKAccelerationStructureHeaderPool::removeAccelerationStructure(MVKAccelerationStructure* mvkAccStruct) {
+	lock_guard<mutex> lock(_lock);
+
+	auto* pHeader = (MVKAccelerationStructureHeader*)((uintptr_t)mvkAccStruct->_headerMTLBuffer.contents + mvkAccStruct->_headerOffset);
+	*pHeader = {};
+
+	_accelerationStructures[mvkAccStruct->_headerIndex] = nullptr;
+	_freeHeaderIndices.push_back(mvkAccStruct->_headerIndex);
+}
+
+void MVKAccelerationStructureHeaderPool::encodeResourceUsage(MVKUseResourceHelper& rez, MVKResourceUsageStages stage) {
+	lock_guard<mutex> lock(_lock);
+
+	for (id<MTLBuffer> mtlBuff : _mtlBuffers) {
+		rez.add(mtlBuff, stage, false);
+	}
+	for (MVKAccelerationStructure* mvkAccStruct : _accelerationStructures) {
+		if (mvkAccStruct) { mvkAccStruct->encodeResourceUsage(rez, stage); }
+	}
+}
+
+MVKAccelerationStructureHeaderPool::~MVKAccelerationStructureHeaderPool() {
+	for (id<MTLBuffer> mtlBuff : _mtlBuffers) {
+		_device->removeResidency(mtlBuff);
+		[mtlBuff release];
+	}
 }
