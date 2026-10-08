@@ -34,6 +34,8 @@ typedef struct {
 	uint64_t instanceSBTOffsets;			/**< For a TLAS, the GPU address of the SBT record offsets of its instances. */
 } MVKAccelerationStructureHeader;
 
+static_assert(sizeof(MVKAccelerationStructureHeader) == 16, "MVKAccelerationStructureHeader must match spvAccelerationStructure.");
+
 
 #pragma mark -
 #pragma mark MVKAccelerationStructure

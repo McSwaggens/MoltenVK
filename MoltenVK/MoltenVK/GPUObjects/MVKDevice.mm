@@ -4397,12 +4397,11 @@ void MVKDevice::getAccelerationStructureBuildSizes(const VkAccelerationStructure
 												   const uint32_t* pMaxPrimitiveCounts,
 												   VkAccelerationStructureBuildSizesInfoKHR* pSizeInfo) {
 	@autoreleasepool {
-		uint32_t geoCnt = pBuildInfo->geometryCount;
-		VkAccelerationStructureBuildRangeInfoKHR rangeInfos[geoCnt];
-		for (uint32_t geoIdx = 0; geoIdx < geoCnt; geoIdx++) {
-			rangeInfos[geoIdx] = { .primitiveCount = pMaxPrimitiveCounts[geoIdx] };
+		MVKSmallVector<VkAccelerationStructureBuildRangeInfoKHR, 4> rangeInfos;
+		for (uint32_t geoIdx = 0; geoIdx < pBuildInfo->geometryCount; geoIdx++) {
+			rangeInfos.push_back({ .primitiveCount = pMaxPrimitiveCounts[geoIdx] });
 		}
-		MTLAccelerationStructureDescriptor* mtlDesc = getMTLAccelerationStructureDescriptor(*pBuildInfo, rangeInfos, false);
+		MTLAccelerationStructureDescriptor* mtlDesc = getMTLAccelerationStructureDescriptor(*pBuildInfo, rangeInfos.data(), false);
 		MTLAccelerationStructureSizes mtlSizes = [_physicalDevice->getMTLDevice() accelerationStructureSizesWithDescriptor: mtlDesc];
 		pSizeInfo->accelerationStructureSize = mtlSizes.accelerationStructureSize;
 		// Metal may not need scratch memory, but Vulkan buffers cannot be empty.
