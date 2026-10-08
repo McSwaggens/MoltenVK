@@ -1479,7 +1479,6 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse) {
         case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults BlitEncoder";
 		case kMVKCommandUseRecordGPUCounterSample:          return @"Record GPU Counter Sample BlitEncoder";
 		case kMVKCommandUseCopyAccelerationStructure:       return @"vkCmdCopyAccelerationStructureKHR BlitEncoder";
-		case kMVKCommandUseWriteAccelerationStructuresProperties: return @"vkCmdWriteAccelerationStructuresPropertiesKHR BlitEncoder";
         default:                                            return @"Unknown Use BlitEncoder";
     }
 }

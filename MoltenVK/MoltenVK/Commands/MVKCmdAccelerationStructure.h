@@ -108,7 +108,6 @@ protected:
 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 
 	MVKSmallVector<VkAccelerationStructureKHR, 1> _accelerationStructures;
-	VkQueryType _queryType;
 	VkQueryPool _queryPool;
 	uint32_t _firstQuery;
 };

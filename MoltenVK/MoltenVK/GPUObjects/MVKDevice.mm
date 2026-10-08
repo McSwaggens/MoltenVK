@@ -4451,6 +4451,8 @@ MTLAccelerationStructureDescriptor* MVKDevice::getMTLAccelerationStructureDescri
 		auto* mtlInstDesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
 		mtlInstDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeIndirect;
 		mtlInstDesc.instanceCount = buildInfo.geometryCount ? pRangeInfos[0].primitiveCount : 0;
+		// Metal requires an instance buffer even without instances, but does not access its content.
+		if (resolveBuffers && !mtlInstDesc.instanceCount) { mtlInstDesc.instanceDescriptorBuffer = getDummyBlitMTLBuffer(); }
 		mtlDesc = mtlInstDesc;
 	} else {
 		auto* mtlGeoDescs = [NSMutableArray arrayWithCapacity: buildInfo.geometryCount];
@@ -4573,7 +4575,6 @@ MVKQueryPool* MVKDevice::createQueryPool(const VkQueryPoolCreateInfo* pCreateInf
 			case VK_QUERY_TYPE_TIMESTAMP:
 				return new MVKTimestampQueryPool(this, pCreateInfo);
 			case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
-			case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
 				return new MVKAccelerationStructureQueryPool(this, pCreateInfo);
 			case VK_QUERY_TYPE_PIPELINE_STATISTICS:
 				return new MVKPipelineStatisticsQueryPool(this, pCreateInfo);
