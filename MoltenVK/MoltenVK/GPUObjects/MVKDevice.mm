@@ -3677,6 +3677,12 @@ void MVKPhysicalDevice::initExtensions() {
 														   _gpuCapabilities.supportsFunctionPointers &&
 														   _isUsingMetalArgumentBuffers);
 
+	// Only ray tracing pipelines support pipeline libraries.
+	pWritableExtns->vk_KHR_pipeline_library.enabled = (pWritableExtns->vk_KHR_pipeline_library.enabled &&
+													   pWritableExtns->vk_KHR_ray_tracing_pipeline.enabled);
+	pWritableExtns->vk_EXT_pipeline_library_group_handles.enabled = (pWritableExtns->vk_EXT_pipeline_library_group_handles.enabled &&
+																	 pWritableExtns->vk_KHR_pipeline_library.enabled);
+
 	if (!_gpuCapabilities.isAppleGPU) {
 		pWritableExtns->vk_AMD_shader_image_load_store_lod.enabled = false;
 		pWritableExtns->vk_IMG_format_pvrtc.enabled = false;
