@@ -488,6 +488,7 @@ static constexpr uint32_t kMVKRayTracingMaxRecursionDepth = 31;
  * Each shader stage is compiled into a visible function, and all stage functions are linked into a Metal compute
  * pipeline, whose kernel is a small trampoline that calls the ray generation shader of the dispatch. Shaders call
  * each other through a visible function table, whose entries are indexed by the shader group table of the pipeline.
+ * A pipeline library only compiles its shader stages, and the pipelines that link it link them with their own.
  */
 class MVKRayTracingPipeline : public MVKPipeline {
 
