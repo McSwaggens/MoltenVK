@@ -2555,13 +2555,43 @@ static MVKRayTracingStageInfo getRayTracingStageInfo(VkShaderStageFlagBits stage
 	}
 }
 
-static bool areEqual(const VkSpecializationInfo* pSpecInfo1, const VkSpecializationInfo* pSpecInfo2) {
-	if (pSpecInfo1 == pSpecInfo2) { return true; }
-	if ( !pSpecInfo1 || !pSpecInfo2 ) { return false; }
-	return (pSpecInfo1->mapEntryCount == pSpecInfo2->mapEntryCount &&
-			pSpecInfo1->dataSize == pSpecInfo2->dataSize &&
-			( !pSpecInfo1->mapEntryCount || memcmp(pSpecInfo1->pMapEntries, pSpecInfo2->pMapEntries, pSpecInfo1->mapEntryCount * sizeof(VkSpecializationMapEntry)) == 0) &&
-			( !pSpecInfo1->dataSize || memcmp(pSpecInfo1->pData, pSpecInfo2->pData, pSpecInfo1->dataSize) == 0));
+// All functions linked into a pipeline need unique names. The name of the function compiled from a shader stage
+// identifies the shader stage, so identical shader stages, also from pipeline libraries, can share a function.
+static std::string getRayTracingFunctionName(const MVKRayTracingStageInfo& stageInfo,
+											 MVKShaderModule* shaderModule,
+											 const VkPipelineShaderStageCreateInfo* pStage) {
+	size_t hash = mvkHash((const uint8_t*)pStage->pName, strlen(pStage->pName), shaderModule->getKey().codeHash);
+	hash = mvkHash((const uint8_t*)&pStage->flags, sizeof(pStage->flags), hash);
+	if (const VkSpecializationInfo* pSpecInfo = pStage->pSpecializationInfo) {
+		hash = mvkHash((const uint8_t*)pSpecInfo->pMapEntries, pSpecInfo->mapEntryCount * sizeof(VkSpecializationMapEntry), hash);
+		hash = mvkHash((const uint8_t*)pSpecInfo->pData, pSpecInfo->dataSize, hash);
+	}
+	char funcName[64];
+	snprintf(funcName, sizeof(funcName), "%s_%016zx", stageInfo.functionName, hash);
+	return funcName;
+}
+
+// Marks the resource bindings of the compute stage used, that the specified stage of the source configuration uses.
+static void addUsedResourceBindings(SPIRVToMSLConversionConfiguration& dstConfig,
+									const SPIRVToMSLConversionConfiguration& srcConfig,
+									spv::ExecutionModel srcStage) {
+	for (const auto& srcRB : srcConfig.resourceBindings) {
+		if (srcRB.resourceBinding.stage != srcStage || !srcRB.outIsUsedByShader) { continue; }
+		for (auto& dstRB : dstConfig.resourceBindings) {
+			if (dstRB.resourceBinding.stage == spv::ExecutionModelGLCompute &&
+				dstRB.resourceBinding.desc_set == srcRB.resourceBinding.desc_set &&
+				dstRB.resourceBinding.binding == srcRB.resourceBinding.binding) {
+				dstRB.outIsUsedByShader = true;
+			}
+		}
+	}
+}
+
+// Adds the implicit buffers that the source shader conversion results need to the destination results.
+static void addImplicitBufferNeeds(SPIRVToMSLConversionResultInfo& dstResults, const SPIRVToMSLConversionResultInfo& srcResults) {
+	dstResults.needsSwizzleBuffer |= srcResults.needsSwizzleBuffer;
+	dstResults.needsBufferSizeBuffer |= srcResults.needsBufferSizeBuffer;
+	dstResults.needsDynamicOffsetBuffer |= srcResults.needsDynamicOffsetBuffer;
 }
 
 MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
@@ -2570,7 +2600,6 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 											 const VkRayTracingPipelineCreateInfoKHR* pCreateInfo) :
 	MVKPipeline(device, pipelineCache, (MVKPipelineLayout*)pCreateInfo->layout, getPipelineCreateFlags(pCreateInfo), parent) {
 
-	_groupCount = pCreateInfo->groupCount;
 	_maxRecursionDepth = pCreateInfo->maxPipelineRayRecursionDepth;
 	if (mvkIsAnyFlagEnabled(_flags, VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR)) { mvkEnableFlags(_rayFlags, spv::RayFlagsSkipTrianglesKHRMask); }
 	if (mvkIsAnyFlagEnabled(_flags, VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)) { mvkEnableFlags(_rayFlags, spv::RayFlagsSkipAABBsKHRMask); }
@@ -2604,12 +2633,15 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 		pipelineStart = mvkGetTimestamp();
 	}
 
-	MVKSmallVector<MVKMTLFunction> functions;
-	MVKSmallVector<uint32_t> stageFunctionIndices;
-	_hasValidMTLPipelineStates = (validateLayout() &&
-								  compileStages(pCreateInfo, pFeedbackInfo, functions, stageFunctionIndices) &&
-								  initMTLPipelineState(functions));
-	if (_hasValidMTLPipelineStates) { initGroupTable(pCreateInfo, stageFunctionIndices); }
+	_hasValidMTLPipelineStates = validateLayout() && compileStages(pCreateInfo, pFeedbackInfo);
+	if (_hasValidMTLPipelineStates) {
+		addShaderGroups(pCreateInfo);
+		// A pipeline library only provides its shader stages and shader groups to the pipelines that link it.
+		if ( !mvkIsAnyFlagEnabled(_flags, VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR) ) {
+			_hasValidMTLPipelineStates = initResourceUsage() && initMTLPipelineState();
+			if (_hasValidMTLPipelineStates) { initGroupTable(); }
+		}
+	}
 
 	if (pPipelineFB) {
 		if (_hasValidMTLPipelineStates) { mvkEnableFlags(pPipelineFB->flags, VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT); }
@@ -2637,26 +2669,12 @@ bool MVKRayTracingPipeline::validateLayout() {
 	return true;
 }
 
-// Compiles each distinct shader stage into a visible function, and populates the
-// index of the function compiled for each shader stage, and the resources used by all shader stages.
+// Compiles each distinct shader stage into a visible function, and populates the index of the function
+// compiled for each shader stage. The resource usage of all shader stages is accumulated in the compute stage.
 bool MVKRayTracingPipeline::compileStages(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
-										  const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo,
-										  MVKSmallVector<MVKMTLFunction>& functions,
-										  MVKSmallVector<uint32_t>& stageFunctionIndices) {
-
-	// Identical shader stages share a function, and all functions linked into the pipeline need unique names.
-	struct FunctionKey {
-		MVKShaderModuleKey moduleKey;
-		VkShaderStageFlagBits stage;
-		VkPipelineShaderStageCreateFlags flags;
-		const char* pName;
-		const VkSpecializationInfo* pSpecializationInfo;
-	};
-	MVKSmallVector<FunctionKey> functionKeys;
-
-	// All shader stages run in the Metal compute stage, so their resource usage is accumulated in the compute stage.
-	SPIRVToMSLConversionConfiguration resourceConfig;
-	SPIRVToMSLConversionResultInfo resourceResults;
+										  const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo) {
+	_resourceConfig.options.mslOptions.argument_buffers = isUsingMetalArgumentBuffers();
+	_layout->populateShaderConversionConfig(_resourceConfig);
 
 	for (uint32_t stageIdx = 0; stageIdx < pCreateInfo->stageCount; stageIdx++) {
 		const VkPipelineShaderStageCreateInfo* pStage = &pCreateInfo->pStages[stageIdx];
@@ -2670,31 +2688,18 @@ bool MVKRayTracingPipeline::compileStages(const VkRayTracingPipelineCreateInfoKH
 
 		warnIfUnsupportedRobustnessEnabled(this, pStage);
 
-		FunctionKey funcKey = { module->getKey(), pStage->stage, pStage->flags, pStage->pName, pStage->pSpecializationInfo };
-		uint32_t funcIdx = 0;
-		uint32_t nameIdx = 0;
-		for (const auto& fk : functionKeys) {
-			if (fk.moduleKey == funcKey.moduleKey && fk.stage == funcKey.stage) {
-				if (fk.flags == funcKey.flags && strcmp(fk.pName, funcKey.pName) == 0 &&
-					areEqual(fk.pSpecializationInfo, funcKey.pSpecializationInfo)) { break; }
-				nameIdx++;
-			}
-			funcIdx++;
-		}
-		stageFunctionIndices.push_back(funcIdx);
-		if (funcIdx < functionKeys.size()) {
+		std::string funcName = getRayTracingFunctionName(stageInfo, module, pStage);
+		uint32_t funcIdx = findFunction(funcName);
+		if (funcIdx < _functions.size()) {
+			_stageFunctionIndices.push_back(funcIdx);
 			if (pStageFB) { mvkEnableFlags(pStageFB->flags, VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT); }
 			continue;
 		}
-		functionKeys.push_back(funcKey);
 
 		SPIRVToMSLConversionConfiguration shaderConfig;
 		initComputeShaderConversionConfig(shaderConfig, _stageResources.implicitBuffers, pStage, stageInfo.execModel);
 		shaderConfig.options.mslOptions.ray_tracing_visible_function = true;
-		char funcName[64];
-		snprintf(funcName, sizeof(funcName), nameIdx ? "%s_%016zx_%u" : "%s_%016zx", stageInfo.functionName, funcKey.moduleKey.codeHash, nameIdx);
 		shaderConfig.options.mslEntryPointName = funcName;
-		if (functions.empty()) { resourceConfig = shaderConfig; }
 
 		// Ray tracing shaders use the resource bindings of the compute stage.
 		for (auto& rb : shaderConfig.resourceBindings) {
@@ -2713,20 +2718,83 @@ bool MVKRayTracingPipeline::compileStages(const VkRayTracingPipelineCreateInfoKH
 			}
 			return false;
 		}
-		functions.push_back(func);
+		_stageFunctionIndices.push_back(uint32_t(_functions.size()));
+		_functions.push_back(func);
+		addUsedResourceBindings(_resourceConfig, shaderConfig, stageInfo.execModel);
+		addImplicitBufferNeeds(_resourceResults, func.shaderConversionResults);
+	}
+	return true;
+}
 
-		assert(shaderConfig.resourceBindings.size() == resourceConfig.resourceBindings.size());
-		for (size_t rbIdx = 0; rbIdx < shaderConfig.resourceBindings.size(); rbIdx++) {
-			resourceConfig.resourceBindings[rbIdx].outIsUsedByShader |= shaderConfig.resourceBindings[rbIdx].outIsUsedByShader;
-		}
-		auto& funcRslts = func.shaderConversionResults;
-		resourceResults.needsSwizzleBuffer |= funcRslts.needsSwizzleBuffer;
-		resourceResults.needsBufferSizeBuffer |= funcRslts.needsBufferSizeBuffer;
-		resourceResults.needsDynamicOffsetBuffer |= funcRslts.needsDynamicOffsetBuffer;
+// Returns the index of the function with the specified name, or the function count if there is none.
+uint32_t MVKRayTracingPipeline::findFunction(const std::string& funcName) {
+	uint32_t funcCnt = uint32_t(_functions.size());
+	for (uint32_t funcIdx = 0; funcIdx < funcCnt; funcIdx++) {
+		if (funcName == _functions[funcIdx].shaderConversionResults.entryPoint.mtlFunctionName) { return funcIdx; }
+	}
+	return funcCnt;
+}
+
+// Adds the shader groups of this pipeline, followed by the shader groups of the linked pipeline libraries, which
+// keep their handles. The group handles of pipeline libraries, and of pipelines that link them, are unique on the device.
+// The shader groups of this pipeline may use the shader stages of the libraries, which follow the stages of this pipeline.
+void MVKRayTracingPipeline::addShaderGroups(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo) {
+	const VkPipelineLibraryCreateInfoKHR* pLibraryInfo = pCreateInfo->pLibraryInfo;
+	uint32_t libCount = pLibraryInfo ? pLibraryInfo->libraryCount : 0;
+	if (libCount || mvkIsAnyFlagEnabled(_flags, VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR)) {
+		_reservedGroupHandleCount = pCreateInfo->groupCount;
+		_firstReservedGroupHandle = _device->reserveRayTracingShaderGroupHandles(_reservedGroupHandleCount);
+	} else {
+		_firstReservedGroupHandle = 1;
 	}
 
-	populateResourceUsage(_stageResources, resourceConfig, resourceResults, spv::ExecutionModelGLCompute);
-	_layout->populateBindOperations(_stageResources.bindScript, resourceConfig, spv::ExecutionModelGLCompute);
+	// Identical functions of different pipeline libraries are shared.
+	MVKSmallVector<MVKSmallVector<uint32_t>, 4> libFunctionIndices;
+	libFunctionIndices.resize(libCount);
+	for (uint32_t libIdx = 0; libIdx < libCount; libIdx++) {
+		auto* library = (MVKRayTracingPipeline*)pLibraryInfo->pLibraries[libIdx];
+		for (auto& libFunc : library->_functions) {
+			uint32_t funcIdx = findFunction(libFunc.shaderConversionResults.entryPoint.mtlFunctionName);
+			if (funcIdx == _functions.size()) { _functions.push_back(libFunc); }
+			libFunctionIndices[libIdx].push_back(funcIdx);
+		}
+		for (uint32_t libFuncIdx : library->_stageFunctionIndices) {
+			_stageFunctionIndices.push_back(libFunctionIndices[libIdx][libFuncIdx]);
+		}
+		addUsedResourceBindings(_resourceConfig, library->_resourceConfig, spv::ExecutionModelGLCompute);
+		addImplicitBufferNeeds(_resourceResults, library->_resourceResults);
+	}
+
+	// The index of an unused shader is VK_SHADER_UNUSED_KHR, which is also the null function index.
+	auto getFunctionIndex = [&](uint32_t stageIdx) {
+		return stageIdx == VK_SHADER_UNUSED_KHR ? VK_SHADER_UNUSED_KHR : _stageFunctionIndices[stageIdx];
+	};
+	for (uint32_t grpIdx = 0; grpIdx < pCreateInfo->groupCount; grpIdx++) {
+		const VkRayTracingShaderGroupCreateInfoKHR& group = pCreateInfo->pGroups[grpIdx];
+		bool isGeneral = group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+		bool isProcedural = group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR;
+		_shaderGroups.push_back({ _firstReservedGroupHandle + grpIdx,
+								  { getFunctionIndex(isGeneral ? group.generalShader : group.closestHitShader),
+									getFunctionIndex(isGeneral ? VK_SHADER_UNUSED_KHR : group.anyHitShader),
+									getFunctionIndex(isProcedural ? group.intersectionShader : VK_SHADER_UNUSED_KHR) },
+								  group.type });
+	}
+
+	for (uint32_t libIdx = 0; libIdx < libCount; libIdx++) {
+		auto* library = (MVKRayTracingPipeline*)pLibraryInfo->pLibraries[libIdx];
+		for (auto libGroup : library->_shaderGroups) {
+			for (uint32_t& funcIdx : libGroup.functions) {
+				if (funcIdx != VK_SHADER_UNUSED_KHR) { funcIdx = libFunctionIndices[libIdx][funcIdx]; }
+			}
+			_shaderGroups.push_back(libGroup);
+		}
+	}
+}
+
+// Determines the resources used by all shader stages, and the Metal buffer indices of the implicit buffers.
+bool MVKRayTracingPipeline::initResourceUsage() {
+	populateResourceUsage(_stageResources, _resourceConfig, _resourceResults, spv::ExecutionModelGLCompute);
+	_layout->populateBindOperations(_stageResources.bindScript, _resourceConfig, spv::ExecutionModelGLCompute);
 
 	// Shaders read the shader binding tables through device addresses, and trace rays through any acceleration structure.
 	_stageResources.usesPhysicalStorageBufferAddresses = true;
@@ -2810,12 +2878,12 @@ std::string MVKRayTracingPipeline::getKernelMSL() {
 }
 
 // Links the shader stage functions into a Metal compute pipeline, and populates the function table with them.
-bool MVKRayTracingPipeline::initMTLPipelineState(MVKSmallVector<MVKMTLFunction>& functions) {
+bool MVKRayTracingPipeline::initMTLPipelineState() {
 	id<MTLFunction> mtlKernelFunc = _device->getGeneratedMTLFunction(getKernelMSL(), "spvRTMain", this);
 	if ( !mtlKernelFunc ) { return false; }
 
-	NSMutableArray<id<MTLFunction>>* mtlFuncs = [NSMutableArray arrayWithCapacity: functions.size()];
-	for (auto& func : functions) { [mtlFuncs addObject: func.getMTLFunction()]; }
+	NSMutableArray<id<MTLFunction>>* mtlFuncs = [NSMutableArray arrayWithCapacity: _functions.size()];
+	for (auto& func : _functions) { [mtlFuncs addObject: func.getMTLFunction()]; }
 	MTLLinkedFunctions* mtlLinkedFuncs = [MTLLinkedFunctions linkedFunctions];
 	mtlLinkedFuncs.functions = mtlFuncs;
 
@@ -2839,7 +2907,7 @@ bool MVKRayTracingPipeline::initMTLPipelineState(MVKSmallVector<MVKMTLFunction>&
 	if ( !_mtlPipelineState ) { return false; }
 
 	MTLVisibleFunctionTableDescriptor* vftDesc = [MTLVisibleFunctionTableDescriptor new];	// temp retain
-	vftDesc.functionCount = functions.size();
+	vftDesc.functionCount = mtlFuncs.count;
 	_mtlFunctionTable = [_mtlPipelineState newVisibleFunctionTableWithDescriptor: vftDesc];	// retained
 	[vftDesc release];																			// temp release
 	for (NSUInteger funcIdx = 0; funcIdx < mtlFuncs.count; funcIdx++) {
@@ -2855,26 +2923,18 @@ bool MVKRayTracingPipeline::initMTLPipelineState(MVKSmallVector<MVKMTLFunction>&
 	return true;
 }
 
-// Populates the group table, holding the function table indices of the shaders of each shader group.
-// The index of an unused shader is VK_SHADER_UNUSED_KHR, which is also the null function index of the shaders.
-void MVKRayTracingPipeline::initGroupTable(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
-										   const MVKSmallVector<uint32_t>& stageFunctionIndices) {
-	auto getFunctionIndex = [&](uint32_t stageIdx) {
-		return stageIdx == VK_SHADER_UNUSED_KHR ? VK_SHADER_UNUSED_KHR : stageFunctionIndices[stageIdx];
-	};
+// Populates the group table, holding the function table indices of the shaders of each shader group,
+// at the index of the shader group handle. The table has no entries for unused handles.
+void MVKRayTracingPipeline::initGroupTable() {
+	uint32_t tableSize = 1;
+	for (auto& group : _shaderGroups) { tableSize = std::max(tableSize, group.handle); }
 
-	MVKSmallVector<uint32_t> groupTable;
-	groupTable.reserve(std::max(_groupCount, 1u) * 4);
-	for (uint32_t grpIdx = 0; grpIdx < _groupCount; grpIdx++) {
-		const VkRayTracingShaderGroupCreateInfoKHR& group = pCreateInfo->pGroups[grpIdx];
-		bool isGeneral = group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
-		bool isProcedural = group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR;
-		groupTable.push_back(getFunctionIndex(isGeneral ? group.generalShader : group.closestHitShader));
-		groupTable.push_back(getFunctionIndex(isGeneral ? VK_SHADER_UNUSED_KHR : group.anyHitShader));
-		groupTable.push_back(getFunctionIndex(isProcedural ? group.intersectionShader : VK_SHADER_UNUSED_KHR));
-		groupTable.push_back(group.type);
+	MVKSmallVector<uint32_t> groupTable(tableSize * 4, VK_SHADER_UNUSED_KHR);
+	for (auto& group : _shaderGroups) {
+		uint32_t* pEntry = &groupTable[(group.handle - 1) * 4];
+		mvkCopy(pEntry, group.functions, std::size(group.functions));
+		pEntry[3] = group.type;
 	}
-	if (groupTable.empty()) { groupTable.resize(4, VK_SHADER_UNUSED_KHR); }
 
 	_mtlGroupTable = [getMTLDevice() newBufferWithBytes: groupTable.data()
 												 length: groupTable.size() * sizeof(uint32_t)
@@ -2889,19 +2949,19 @@ MTLSize MVKRayTracingPipeline::getThreadgroupSize(MTLSize launchSize) const {
 	return _mtlThreadgroupSize;
 }
 
-// Each shader group handle holds the index of its shader group plus one, so a zeroed shader binding table record is a null record.
+// A shader group handle holds the index of the shader group in the group table plus one, so a zeroed record is a null record.
 VkResult MVKRayTracingPipeline::getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void* pData) {
-	uint32_t handleCount = std::min({groupCount, _groupCount - std::min(firstGroup, _groupCount), uint32_t(dataSize / kMVKRayTracingShaderGroupHandleSize)});
+	uint32_t pipelineGroupCount = uint32_t(_shaderGroups.size());
+	uint32_t handleCount = std::min({groupCount, pipelineGroupCount - std::min(firstGroup, pipelineGroupCount), uint32_t(dataSize / kMVKRayTracingShaderGroupHandleSize)});
 	if (handleCount < groupCount) {
 		reportWarning(VK_ERROR_VALIDATION_FAILED_EXT, "vkGetRayTracingShaderGroupHandlesKHR(): Shader group range [%u, %u) and data size %zu do not match the %u shader groups of the pipeline.",
-					  firstGroup, firstGroup + groupCount, dataSize, _groupCount);
+					  firstGroup, firstGroup + groupCount, dataSize, pipelineGroupCount);
 	}
 	auto* pHandles = (uint8_t*)pData;
 	for (uint32_t handleIdx = 0; handleIdx < handleCount; handleIdx++) {
 		uint8_t* pHandle = pHandles + handleIdx * kMVKRayTracingShaderGroupHandleSize;
-		uint32_t handleValue = firstGroup + handleIdx + 1;
 		mvkClear(pHandle, kMVKRayTracingShaderGroupHandleSize);
-		memcpy(pHandle, &handleValue, sizeof(handleValue));
+		memcpy(pHandle, &_shaderGroups[firstGroup + handleIdx].handle, sizeof(uint32_t));
 	}
 	return VK_SUCCESS;
 }
@@ -2913,6 +2973,7 @@ VkDeviceSize MVKRayTracingPipeline::getShaderGroupStackSize(uint32_t group, VkSh
 }
 
 MVKRayTracingPipeline::~MVKRayTracingPipeline() {
+	if (_reservedGroupHandleCount) { _device->releaseRayTracingShaderGroupHandles(_firstReservedGroupHandle, _reservedGroupHandleCount); }
 	@synchronized (getMTLDevice()) {
 		[_mtlPipelineState release];
 		[_mtlFunctionTable release];

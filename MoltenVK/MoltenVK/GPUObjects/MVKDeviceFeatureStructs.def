@@ -111,6 +111,7 @@ MVK_DEVICE_FEATURE_EXTN(LegacyDithering,                  LEGACY_DITHERING,     
 MVK_DEVICE_FEATURE_EXTN(MultiDraw,                        MULTI_DRAW,                           EXT,   1)
 MVK_DEVICE_FEATURE_EXTN(NestedCommandBuffer,              NESTED_COMMAND_BUFFER,                EXT,   3)
 MVK_DEVICE_FEATURE_EXTN(NonSeamlessCubeMap,               NON_SEAMLESS_CUBE_MAP,                EXT,   1)
+MVK_DEVICE_FEATURE_EXTN(PipelineLibraryGroupHandles,      PIPELINE_LIBRARY_GROUP_HANDLES,       EXT,   1)
 MVK_DEVICE_FEATURE_EXTN(PrimitiveTopologyListRestart,     PRIMITIVE_TOPOLOGY_LIST_RESTART,      EXT,   2)
 MVK_DEVICE_FEATURE_EXTN(ProvokingVertex,                  PROVOKING_VERTEX,                     EXT,   2)
 MVK_DEVICE_FEATURE_EXTN(ShaderAtomicFloat,                SHADER_ATOMIC_FLOAT,                  EXT,  12)

@@ -803,6 +803,12 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 				nonSeamlessFeatures->nonSeamlessCubeMap = getMVKConfig().useMetalPrivateAPI;
 				break;
 			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PIPELINE_LIBRARY_GROUP_HANDLES_FEATURES_EXT: {
+				// Ray tracing pipeline libraries keep the shader group handles of their shader groups when linked.
+				auto* groupHandlesFeatures = (VkPhysicalDevicePipelineLibraryGroupHandlesFeaturesEXT*)next;
+				groupHandlesFeatures->pipelineLibraryGroupHandles = _supportedExtensions.vk_KHR_ray_tracing_pipeline.enabled;
+				break;
+			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRIMITIVE_TOPOLOGY_LIST_RESTART_FEATURES_EXT: {
 				auto* listRestartFeatures = (VkPhysicalDevicePrimitiveTopologyListRestartFeaturesEXT*)next;
 				listRestartFeatures->primitiveTopologyListRestart = getMVKConfig().useMetalPrivateAPI;
@@ -4974,6 +4980,29 @@ id<MTLFunction> MVKDevice::getGeneratedMTLFunction(const string& msl, const char
 	auto rslt = _generatedMTLFunctions.emplace(msl, mtlFunc);
 	if ( !rslt.second ) { [mtlFunc release]; }		// Another thread compiled it first.
 	return rslt.first->second;
+}
+
+// Handle values index the group tables of pipelines, so the lowest free range is reserved, to keep them compact.
+// The reserved ranges are sorted by their first handle value. Zero is the null handle value.
+uint32_t MVKDevice::reserveRayTracingShaderGroupHandles(uint32_t count) {
+	lock_guard<mutex> lock(_rayTracingShaderGroupHandleRangesLock);
+	uint32_t firstHandle = 1;
+	auto iter = _rayTracingShaderGroupHandleRanges.begin();
+	for (; iter != _rayTracingShaderGroupHandleRanges.end() && firstHandle + count > iter->first; iter++) {
+		firstHandle = iter->first + iter->second;
+	}
+	_rayTracingShaderGroupHandleRanges.insert(iter, std::make_pair(firstHandle, count));
+	return firstHandle;
+}
+
+void MVKDevice::releaseRayTracingShaderGroupHandles(uint32_t firstHandle, uint32_t count) {
+	lock_guard<mutex> lock(_rayTracingShaderGroupHandleRangesLock);
+	for (auto iter = _rayTracingShaderGroupHandleRanges.begin(); iter != _rayTracingShaderGroupHandleRanges.end(); iter++) {
+		if (iter->first == firstHandle && iter->second == count) {
+			_rayTracingShaderGroupHandleRanges.erase(iter);
+			return;
+		}
+	}
 }
 
 MVKImage* MVKDevice::addImage(MVKImage* mvkImg) {

@@ -911,6 +911,16 @@ public:
 	id<MTLFunction> getGeneratedMTLFunction(const std::string& msl, const char* funcName, MVKVulkanAPIDeviceObject* owner);
 
 	/**
+	 * Reserves a range of handle values for the shader groups of a ray tracing pipeline library, or of a
+	 * ray tracing pipeline that links pipeline libraries, and returns the first handle value of the range.
+	 * Linked shader groups keep their handles, so these handles are unique among all such live pipelines.
+	 */
+	uint32_t reserveRayTracingShaderGroupHandles(uint32_t count);
+
+	/** Releases a range of handle values reserved by reserveRayTracingShaderGroupHandles(). */
+	void releaseRayTracingShaderGroupHandles(uint32_t firstHandle, uint32_t count);
+
+	/**
 	 * Returns the MTLBuffer of the GPU-addressable buffer containing the specified device address, along with
 	 * the offset of the address within that MTLBuffer via the pOffset output parameter. Returns nil if not found.
 	 */
@@ -1176,6 +1186,8 @@ protected:
 	MVKLiveResourceSet _liveResources;
 	std::unordered_map<std::string, id<MTLFunction>> _generatedMTLFunctions;
 	std::mutex _generatedMTLFunctionsLock;
+	MVKSmallVector<std::pair<uint32_t, uint32_t>> _rayTracingShaderGroupHandleRanges;
+	std::mutex _rayTracingShaderGroupHandleRangesLock;
 	std::mutex _rezLock;
 	std::mutex _sem4Lock;
     std::mutex _perfLock;

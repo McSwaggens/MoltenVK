@@ -532,22 +532,36 @@ public:
 	~MVKRayTracingPipeline() override;
 
 protected:
+	/** A shader group, and the function table indices of its shaders. */
+	struct ShaderGroup {
+		uint32_t handle;					/**< The value of the shader group handle, which is the group table index plus one. */
+		uint32_t functions[3];				/**< General or closest hit, any hit, and intersection functions, or VK_SHADER_UNUSED_KHR. */
+		VkRayTracingShaderGroupTypeKHR type;
+	};
+
 	bool validateLayout();
 	bool compileStages(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
-					   const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo,
-					   MVKSmallVector<MVKMTLFunction>& functions,
-					   MVKSmallVector<uint32_t>& stageFunctionIndices);
+					   const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo);
+	uint32_t findFunction(const std::string& funcName);
+	void addShaderGroups(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo);
+	bool initResourceUsage();
 	std::string getKernelMSL();
-	bool initMTLPipelineState(MVKSmallVector<MVKMTLFunction>& functions);
-	void initGroupTable(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo, const MVKSmallVector<uint32_t>& stageFunctionIndices);
+	bool initMTLPipelineState();
+	void initGroupTable();
 
 	id<MTLComputePipelineState> _mtlPipelineState = nil;
 	id<MTLVisibleFunctionTable> _mtlFunctionTable = nil;
 	id<MTLBuffer> _mtlGroupTable = nil;
 	MVKPipelineStageResourceInfo _stageResources = {};
+	MVKSmallVector<MVKMTLFunction> _functions;
+	MVKSmallVector<uint32_t> _stageFunctionIndices;
+	MVKSmallVector<ShaderGroup> _shaderGroups;
+	mvk::SPIRVToMSLConversionConfiguration _resourceConfig;
+	mvk::SPIRVToMSLConversionResultInfo _resourceResults;
 	MVKSmallVector<MVKShaderModule*> _ownedModules;
 	MTLSize _mtlThreadgroupSize = MTLSizeMake(1, 1, 1);
-	uint32_t _groupCount = 0;
+	uint32_t _firstReservedGroupHandle = 0;
+	uint32_t _reservedGroupHandleCount = 0;
 	uint32_t _maxRecursionDepth = 0;
 	uint32_t _rayFlags = 0;
 };
