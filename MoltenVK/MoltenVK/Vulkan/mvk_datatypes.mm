@@ -776,11 +776,7 @@ MVK_PUBLIC_SYMBOL VkShaderStageFlagBits mvkVkShaderStageFlagBitsFromMVKShaderSta
 
 VkShaderStageFlags mvkVkShaderStageFlagsBoundToMVKShaderStage(MVKShaderStage mvkStage) {
 	VkShaderStageFlags vkStages = mvkVkShaderStageFlagBitsFromMVKShaderStage(mvkStage);
-	if (mvkStage == kMVKShaderStageCompute) {
-		mvkEnableFlags(vkStages, (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
-								  VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-								  VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR));
-	}
+	if (mvkStage == kMVKShaderStageCompute) { mvkEnableFlags(vkStages, kMVKRayTracingShaderStageFlags); }
 	return vkStages;
 }
 

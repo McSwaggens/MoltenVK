@@ -1935,21 +1935,47 @@ MVKVulkanCommonEncoderState* MVKCommandEncoderState::getVkEncoderState(VkPipelin
 	}
 }
 
-void MVKCommandEncoderState::pushDescriptorSet(VkPipelineBindPoint bindPoint, MVKPipelineLayout* layout, uint32_t set, uint32_t writeCount, const VkWriteDescriptorSet* writes) {
+// Ray tracing shaders read the push descriptor set from an argument buffer. Previously encoded work may still read
+// the current argument buffer, so the push descriptor set moves to a new one, and the Metal binding is invalidated.
+// Returns the push descriptor set, laid out by its argument buffer layout, or null if it has no argument buffer.
+const MVKDescriptorSet* MVKCommandEncoderState::preparePushDescriptorArgumentBuffer(MVKCommandEncoder& mvkEncoder, VkPipelineBindPoint bindPoint,
+																				  MVKDescriptorSetLayout* dsl, uint32_t set) {
+	const MVKDescriptorSetLayout* argBufLayout = dsl->getArgumentBufferLayout();
+	if (bindPoint != VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR || !argBufLayout) { return nullptr; }
+
+	MVKDescriptorSet& pushSet = _vkRayTracing._pushDescriptor;
+	const MVKMTLBufferAllocation* mtlBuffAlloc = mvkEncoder.getTempMTLBuffer(argBufLayout->gpuSize());
+	mvkMovePushDescriptorArgumentBuffer(pushSet, argBufLayout, mtlBuffAlloc->_mtlBuffer, mtlBuffAlloc->_offset);
+	applyToActiveMTLState(bindPoint, [set](auto& mtl){
+		for (MVKStageResourceBits& exists : mtl.exists()) {
+			exists.descriptorSetData.clear(set);
+		}
+	});
+	return &pushSet;
+}
+
+void MVKCommandEncoderState::pushDescriptorSet(MVKCommandEncoder& mvkEncoder, VkPipelineBindPoint bindPoint, MVKPipelineLayout* layout, uint32_t set, uint32_t writeCount, const VkWriteDescriptorSet* writes) {
 	assert(layout->pushDescriptor() == set);
 	if (MVKVulkanCommonEncoderState* state = getVkEncoderState(bindPoint)) [[likely]] {
 		MVKDescriptorSetLayout* dsl = layout->getDescriptorSetLayout(set);
 		state->ensurePushDescriptorSize(dsl->cpuSize());
 		mvkPushDescriptorSet(state->_pushDescriptor.cpuBuffer, dsl, writeCount, writes);
+		if (const MVKDescriptorSet* argBufSet = preparePushDescriptorArgumentBuffer(mvkEncoder, bindPoint, dsl, set)) {
+			mvkPushDescriptorArgumentBuffer(*argBufSet, writeCount, writes);
+		}
 	}
 }
 
-void MVKCommandEncoderState::pushDescriptorSet(MVKDescriptorUpdateTemplate* updateTemplate, MVKPipelineLayout* layout, uint32_t set, const void* data) {
+void MVKCommandEncoderState::pushDescriptorSet(MVKCommandEncoder& mvkEncoder, MVKDescriptorUpdateTemplate* updateTemplate, MVKPipelineLayout* layout, uint32_t set, const void* data) {
 	assert(layout->pushDescriptor() == set);
-	if (MVKVulkanCommonEncoderState* state = getVkEncoderState(updateTemplate->getBindPoint())) [[likely]] {
+	VkPipelineBindPoint bindPoint = updateTemplate->getBindPoint();
+	if (MVKVulkanCommonEncoderState* state = getVkEncoderState(bindPoint)) [[likely]] {
 		MVKDescriptorSetLayout* dsl = layout->getDescriptorSetLayout(set);
 		state->ensurePushDescriptorSize(dsl->cpuSize());
 		mvkPushDescriptorSetTemplate(state->_pushDescriptor.cpuBuffer, dsl, updateTemplate, data);
+		if (const MVKDescriptorSet* argBufSet = preparePushDescriptorArgumentBuffer(mvkEncoder, bindPoint, dsl, set)) {
+			mvkPushDescriptorArgumentBufferTemplate(*argBufSet, updateTemplate, data);
+		}
 	}
 }
 

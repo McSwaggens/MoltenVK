@@ -750,7 +750,31 @@ MVKDescriptorSetLayout* MVKDescriptorSetLayout::Create(MVKDevice* device, const 
 		}
 	}
 
+	// Ray tracing shaders read every descriptor set, including push descriptor sets, from an argument buffer.
+	// The resources of its descriptors are read from the CPU buffer of the push descriptor set, which therefore
+	// must have the same CPU layout, and inline uniform blocks are only held in the CPU buffer without argument buffers.
+	bool isUsedByRayTracing = false;
+	bool hasSameCPULayout = true;
+	for (const auto& binding : ret->_bindings) {
+		isUsedByRayTracing |= mvkIsAnyFlagEnabled(binding.stageFlags, kMVKRayTracingShaderStageFlags);
+		hasSameCPULayout &= binding.descriptorType != VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK;
+	}
+	if (isPush && isUsedByRayTracing && hasSameCPULayout && pickArgumentBufferMode(device) == MVKArgumentBufferMode::Metal3) {
+		VkDescriptorSetLayoutCreateInfo argBufCreateInfo = *pCreateInfo;
+		mvkDisableFlags(argBufCreateInfo.flags, VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT);
+		MVKDescriptorSetLayout* argBufLayout = Create(device, &argBufCreateInfo);
+		if (argBufLayout->argBufMode() == MVKArgumentBufferMode::Metal3) {
+			ret->_argumentBufferLayout = argBufLayout;
+		} else {
+			argBufLayout->destroy();
+		}
+	}
+
 	return ret;
+}
+
+MVKDescriptorSetLayout::~MVKDescriptorSetLayout() {
+	if (_argumentBufferLayout) { _argumentBufferLayout->destroy(); }
 }
 
 uint32_t MVKDescriptorSetLayout::getBindingIndex(uint32_t binding) const {
@@ -1939,6 +1963,64 @@ void mvkPushDescriptorSetTemplate(void* dst, MVKDescriptorSetLayout* layout, MVK
 	}
 }
 
+/** Writes the GPU addresses of the aux buffers of a Metal 3 argument buffer, and its immutable samplers, to the argument buffer. */
+static void initArgumentBufferMetal3(const MVKDescriptorSetLayout* layout, char* base, uint64_t gpuAddress, const uint32_t* auxIndices, uint32_t gpuAuxBase) {
+	if (layout->needsSizeBuf())
+		*reinterpret_cast<uint64_t*>(base) = gpuAddress + gpuAuxBase;
+	for (const auto& binding : layout->bindings()) {
+		if (binding.gpuLayout == MVKDescriptorGPULayout::OutlinedData)
+			*reinterpret_cast<uint64_t*>(base + binding.gpuOffset) = gpuAddress + auxIndices[binding.auxIndex];
+		if (binding.hasImmutableSamplers()) {
+			// SPIRV-Cross doesn't use constexpr samplers with argument buffers, so we need to bind them.
+			uint32_t count = binding.descriptorCount;
+			MTLResourceID* write = reinterpret_cast<MTLResourceID*>(base + binding.gpuOffset) + descriptorTextureCount(binding.gpuLayout) * count;
+			MVKSampler*const* samp = &layout->immutableSamplers()[binding.immSamplerIndex];
+			for (uint32_t i = 0; i < count; i++)
+				write[i] = samp[i]->getMTLSamplerState().gpuResourceID;
+		}
+	}
+}
+
+void mvkMovePushDescriptorArgumentBuffer(MVKDescriptorSet& set, const MVKDescriptorSetLayout* layout, id<MTLBuffer> mtlBuffer, NSUInteger offset) {
+	assert(layout->argBufMode() == MVKArgumentBufferMode::Metal3 && !layout->isGPUAllocationVariable());
+	uint32_t gpuSize = layout->gpuSize();
+	char* gpuBuffer = static_cast<char*>(mtlBuffer.contents) + offset;
+	if (set.layout == layout && set.gpuBuffer) {
+		memcpy(gpuBuffer, set.gpuBuffer, gpuSize);
+	} else {
+		memset(gpuBuffer, 0, gpuSize);
+	}
+	set.layout = layout;
+	set.setGPUBuffer(mtlBuffer, mtlBuffer.contents, offset, gpuSize);
+	set.auxIndices = layout->auxOffsets();
+	initArgumentBufferMetal3(layout, set.gpuBuffer, mtlBuffer.gpuAddress + offset, set.auxIndices, layout->gpuAuxBase());
+}
+
+void mvkPushDescriptorArgumentBuffer(const MVKDescriptorSet& set, uint32_t writeCount, const VkWriteDescriptorSet* pDescriptorWrites) {
+	for (uint32_t i = 0; i < writeCount; i++) {
+		const VkWriteDescriptorSet& write = pDescriptorWrites[i];
+		MVKDescriptorUpdateSourceType type = getDescriptorUpdateSourceType(write.descriptorType);
+		uint32_t stride = getDescriptorUpdateStride(type);
+		const void* src = getDescriptorWriteSource(write, type);
+		if (!src)
+			continue;
+
+		const MVKDescriptorBinding* binding = set.layout->getBinding(write.dstBinding);
+		writeDescriptorSetGPUBuffer<MVKArgumentBufferMode::Metal3>(binding, &set, src, stride, type, nil, write.dstArrayElement, write.descriptorCount);
+	}
+}
+
+void mvkPushDescriptorArgumentBufferTemplate(const MVKDescriptorSet& set, MVKDescriptorUpdateTemplate* updateTemplate, const void* pData) {
+	for (uint32_t i = 0; i < updateTemplate->getNumberOfEntries(); i++) {
+		const VkDescriptorUpdateTemplateEntry* pEntry = updateTemplate->getEntry(i);
+		const char* pCurData = static_cast<const char*>(pData) + pEntry->offset;
+
+		const MVKDescriptorBinding* binding = set.layout->getBinding(pEntry->dstBinding);
+		MVKDescriptorUpdateSourceType type = getDescriptorUpdateSourceType(pEntry->descriptorType);
+		writeDescriptorSetGPUBuffer<MVKArgumentBufferMode::Metal3>(binding, &set, pCurData, pEntry->stride, type, nil, pEntry->dstArrayElement, pEntry->descriptorCount);
+	}
+}
+
 #pragma mark - MVKDescriptorPoolFreeList
 
 void MVKDescriptorPoolFreeList::add(size_t item, size_t size) {
@@ -2263,25 +2345,9 @@ VkResult MVKDescriptorPool::initDescriptorSet(MVKDescriptorSetLayout* mvkDSL, ui
 				}
 				break;
 			}
-			case MVKArgumentBufferMode::Metal3: {
-				uint64_t buffer = _gpuBufferGPUAddress + baseOffset;
-				char* base = set->gpuBuffer;
-				if (mvkDSL->needsSizeBuf())
-					*reinterpret_cast<uint64_t*>(base) = buffer + gpuBase;
-				for (const auto& binding : mvkDSL->bindings()) {
-					if (binding.gpuLayout == MVKDescriptorGPULayout::OutlinedData)
-						*reinterpret_cast<uint64_t*>(base + binding.gpuOffset) = buffer + indices[binding.auxIndex];
-					if (binding.hasImmutableSamplers()) {
-						// SPIRV-Cross doesn't use constexpr samplers with argument buffers, so we need to bind them.
-						uint32_t count = binding.descriptorCount;
-						MTLResourceID* write = reinterpret_cast<MTLResourceID*>(base + binding.gpuOffset) + descriptorTextureCount(binding.gpuLayout) * count;
-						MVKSampler*const* samp = &mvkDSL->immutableSamplers()[binding.immSamplerIndex];
-						for (uint32_t i = 0; i < count; i++)
-							write[i] = samp[i]->getMTLSamplerState().gpuResourceID;
-					}
-				}
+			case MVKArgumentBufferMode::Metal3:
+				initArgumentBufferMetal3(mvkDSL, set->gpuBuffer, _gpuBufferGPUAddress + baseOffset, indices, gpuBase);
 				break;
-			}
 			case MVKArgumentBufferMode::Off: {
 				assert(mvkDSL->numAuxOffsets() == 0); // Should not need aux offsets if there's no GPU buffers
 				break;

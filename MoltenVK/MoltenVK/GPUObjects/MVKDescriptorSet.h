@@ -309,6 +309,12 @@ public:
 	/** Returns whether this layout was created with `VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR`. */
 	bool isPushDescriptorSetLayout() const { return _flags.has(Flag::IsPushDescriptorSetLayout); }
 
+	/**
+	 * Returns the layout of a Metal argument buffer holding this push descriptor set, for ray tracing shaders,
+	 * which read every descriptor set from an argument buffer, or null if ray tracing shaders don't use this layout.
+	 */
+	const MVKDescriptorSetLayout* getArgumentBufferLayout() const { return _argumentBufferLayout; }
+
 	/** Returns the argument encoder.  Returns null if you should be using direct writes. */
 	MVKMTLArgumentEncoder* mtlArgumentEncoder() { return _mtlArgumentEncoder.get(); }
 
@@ -400,6 +406,8 @@ private:
 	MVKInlinePointer<MVKMTLArgumentEncoder> _mtlArgumentEncoder;
 	/** Argument encoders for encoding variable argument buffers. */
 	MVKInlinePointer<MVKMTLArgumentEncoderVariable> _mtlArgumentEncoderVariable;
+	/** The layout of an argument buffer holding this push descriptor set. */
+	MVKDescriptorSetLayout* _argumentBufferLayout = nullptr;
 	/** Offsets into aux buffers, available on non-variable descriptor sets only.  Variable descriptor sets need a different one per variable descriptor count. */
 	uint32_t* _auxOffsets;
 	/** The number of aux offsets needed. */
@@ -432,6 +440,7 @@ private:
 	MVKFlagList<Flag> _flags;
 	friend class MVKInlineObjectConstructor<MVKDescriptorSetLayout>;
 	MVKDescriptorSetLayout(MVKDevice* device);
+	~MVKDescriptorSetLayout() override;
 	void propagateDebugName() override {}
 };
 
@@ -630,3 +639,15 @@ void mvkPushDescriptorSet(void* dst, MVKDescriptorSetLayout* layout,
 /** Updates the resource bindings in the given descriptor set with the given template. */
 void mvkPushDescriptorSetTemplate(void* dst, MVKDescriptorSetLayout* layout,
                                   MVKDescriptorUpdateTemplate* updateTemplate, const void* pData);
+
+/**
+ * Moves the argument buffer of the push descriptor set to the specified Metal buffer memory, keeping its descriptors
+ * if the push descriptor set already uses the specified layout, which is the argument buffer layout of a push descriptor set layout.
+ */
+void mvkMovePushDescriptorArgumentBuffer(MVKDescriptorSet& set, const MVKDescriptorSetLayout* layout, id<MTLBuffer> mtlBuffer, NSUInteger offset);
+
+/** Updates the argument buffer of the push descriptor set with the given writes, ignoring their dstSet parameter. */
+void mvkPushDescriptorArgumentBuffer(const MVKDescriptorSet& set, uint32_t writeCount, const VkWriteDescriptorSet* pDescriptorWrites);
+
+/** Updates the argument buffer of the push descriptor set with the given template. */
+void mvkPushDescriptorArgumentBufferTemplate(const MVKDescriptorSet& set, MVKDescriptorUpdateTemplate* updateTemplate, const void* pData);

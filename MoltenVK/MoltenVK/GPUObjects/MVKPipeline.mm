@@ -159,7 +159,13 @@ static void addResourceBindingToShaderConfig(SPIRVToMSLConversionConfiguration& 
 	}
 }
 
-void MVKPipelineLayout::populateShaderConversionConfig(SPIRVToMSLConversionConfiguration& shaderConfig) const {
+// Returns the layout of a descriptor set, as read by shaders.
+const MVKDescriptorSetLayout* MVKPipelineLayout::getShaderDescriptorSetLayout(size_t descSetIndex, bool isRayTracing) const {
+	const MVKDescriptorSetLayout* layout = _descriptorSetLayouts[descSetIndex];
+	return isRayTracing && layout->getArgumentBufferLayout() ? layout->getArgumentBufferLayout() : layout;
+}
+
+void MVKPipelineLayout::populateShaderConversionConfig(SPIRVToMSLConversionConfiguration& shaderConfig, bool isRayTracing) const {
 	shaderConfig.resourceBindings.clear();
 	shaderConfig.discreteDescriptorSets.clear();
 	shaderConfig.dynamicBufferDescriptors.clear();
@@ -175,7 +181,7 @@ void MVKPipelineLayout::populateShaderConversionConfig(SPIRVToMSLConversionConfi
 	}
 
 	for (uint32_t dslIdx = 0; dslIdx < _descriptorSetLayouts.size(); dslIdx++) {
-		MVKDescriptorSetLayout* layout = _descriptorSetLayouts[dslIdx];
+		const MVKDescriptorSetLayout* layout = getShaderDescriptorSetLayout(dslIdx, isRayTracing);
 		MVKShaderResourceBinding binding = _resourceIndexOffsets[dslIdx];
 		uint32_t argBufResIdx = 0;
 		bool argbuf = layout->argBufMode() != MVKArgumentBufferMode::Off;
@@ -268,7 +274,7 @@ bool MVKPipelineLayout::boundsCheckBindOp(uint32_t bind, uint32_t count, uint32_
 	return true;
 }
 
-void MVKPipelineLayout::populateBindOperations(MVKPipelineBindScript& script, const SPIRVToMSLConversionConfiguration& shaderConfig, spv::ExecutionModel execModel) {
+void MVKPipelineLayout::populateBindOperations(MVKPipelineBindScript& script, const SPIRVToMSLConversionConfiguration& shaderConfig, spv::ExecutionModel execModel, bool isRayTracing) {
 	assert(script.ops.empty());
 
 	for (const auto& mslBinding : shaderConfig.resourceBindings) {
@@ -278,7 +284,7 @@ void MVKPipelineLayout::populateBindOperations(MVKPipelineBindScript& script, co
 		if (set >= _descriptorSetLayouts.size()) { assert(set == kPushConstDescSet); continue; }
 		// Aux buffers are always allocated out of the same buffer as the descriptor set itself, so they'll already be resident
 		if (binding == kBufferSizeBufferBinding) { continue; }
-		MVKDescriptorSetLayout* layout = _descriptorSetLayouts[set];
+		const MVKDescriptorSetLayout* layout = getShaderDescriptorSetLayout(set, isRayTracing);
 		uint32_t descIdx = layout->getBindingIndex(binding);
 		if (descIdx >= layout->bindings().size()) { assert(!"Binding missing from layout"); continue; }
 		const MVKDescriptorBinding& desc = layout->bindings()[descIdx];
@@ -374,7 +380,7 @@ MVKPipelineLayout* MVKPipelineLayout::Create(MVKDevice* device, const VkPipeline
 
 	// If we are using Metal argument buffers, consume a fixed number of buffer indices for the Metal argument buffers themselves.
 	for (const MVKDescriptorSetLayout* layout : layouts) {
-		if (layout->argBufMode() != MVKArgumentBufferMode::Off) {
+		if (layout->argBufMode() != MVKArgumentBufferMode::Off || layout->getArgumentBufferLayout()) {
 			ret->_mtlResourceCounts.addArgumentBuffers(kMVKMaxDescriptorSetCount);
 			break;
 		}
@@ -2385,7 +2391,7 @@ void MVKPipeline::initComputeShaderConversionConfig(SPIRVToMSLConversionConfigur
     shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
 #endif
 
-	_layout->populateShaderConversionConfig(shaderConfig);
+	_layout->populateShaderConversionConfig(shaderConfig, execModel != spv::ExecutionModelGLCompute);
 
 	// Set implicit buffer indices
 	// FIXME: Many of these are optional. We shouldn't set the ones that aren't
@@ -2521,11 +2527,6 @@ MVKComputePipeline::~MVKComputePipeline() {
 #pragma mark -
 #pragma mark MVKRayTracingPipeline
 
-/** The Vulkan shader stages of a ray tracing pipeline. */
-static constexpr VkShaderStageFlags kMVKRayTracingShaderStages = (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
-																   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
-																   VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR);
-
 /**
  * The depth of nested callable shader calls that the call stack of a ray tracing pipeline accommodates,
  * in addition to the shaders invoked by ray traversal. This is generous compared to the two levels of
@@ -2657,11 +2658,10 @@ bool MVKRayTracingPipeline::validateLayout() {
 	}
 	for (uint32_t dslIdx = 0; dslIdx < _layout->getDescriptorSetCount(); dslIdx++) {
 		const MVKDescriptorSetLayout* dsl = _layout->getDescriptorSetLayout(dslIdx);
-		if (dsl->argBufMode() != MVKArgumentBufferMode::Off) { continue; }
+		if (dsl->argBufMode() != MVKArgumentBufferMode::Off || dsl->getArgumentBufferLayout()) { continue; }
 		for (const MVKDescriptorBinding& binding : dsl->bindings()) {
-			if (mvkIsAnyFlagEnabled(binding.stageFlags, kMVKRayTracingShaderStages)) {
-				setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Ray tracing shaders cannot use descriptor set %u, because %s.", dslIdx,
-												   dsl->isPushDescriptorSetLayout() ? "it is a push descriptor set" : "it cannot be held in a Metal argument buffer"));
+			if (mvkIsAnyFlagEnabled(binding.stageFlags, kMVKRayTracingShaderStageFlags)) {
+				setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Ray tracing shaders cannot use descriptor set %u, because it cannot be held in a Metal argument buffer.", dslIdx));
 				return false;
 			}
 		}
@@ -2674,7 +2674,7 @@ bool MVKRayTracingPipeline::validateLayout() {
 bool MVKRayTracingPipeline::compileStages(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
 										  const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo) {
 	_resourceConfig.options.mslOptions.argument_buffers = isUsingMetalArgumentBuffers();
-	_layout->populateShaderConversionConfig(_resourceConfig);
+	_layout->populateShaderConversionConfig(_resourceConfig, true);
 
 	for (uint32_t stageIdx = 0; stageIdx < pCreateInfo->stageCount; stageIdx++) {
 		const VkPipelineShaderStageCreateInfo* pStage = &pCreateInfo->pStages[stageIdx];
@@ -2794,7 +2794,7 @@ void MVKRayTracingPipeline::addShaderGroups(const VkRayTracingPipelineCreateInfo
 // Determines the resources used by all shader stages, and the Metal buffer indices of the implicit buffers.
 bool MVKRayTracingPipeline::initResourceUsage() {
 	populateResourceUsage(_stageResources, _resourceConfig, _resourceResults, spv::ExecutionModelGLCompute);
-	_layout->populateBindOperations(_stageResources.bindScript, _resourceConfig, spv::ExecutionModelGLCompute);
+	_layout->populateBindOperations(_stageResources.bindScript, _resourceConfig, spv::ExecutionModelGLCompute, true);
 
 	// Shaders read the shader binding tables through device addresses, and trace rays through any acceleration structure.
 	_stageResources.usesPhysicalStorageBufferAddresses = true;

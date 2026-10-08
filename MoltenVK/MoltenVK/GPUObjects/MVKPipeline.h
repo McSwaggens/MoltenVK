@@ -109,10 +109,13 @@ public:
 	uint32_t getPushConstantResourceIndex(MVKShaderStage stage) const { return _pushConstantResourceIndices[stage]; }
 	/** Check whether the given stage uses push constants. */
 	bool stageUsesPushConstants(MVKShaderStage stage) const;
-	/** Populates the specified shader conversion config. */
-	void populateShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig) const;
+	/**
+	 * Populates the specified shader conversion config. Ray tracing shaders read push descriptor sets from argument buffers,
+	 * laid out by the argument buffer layouts of the push descriptor set layouts.
+	 */
+	void populateShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig, bool isRayTracing = false) const;
 	/** Adds all used bindings to the given bind script. */
-	void populateBindOperations(MVKPipelineBindScript& script, const mvk::SPIRVToMSLConversionConfiguration& shaderConfig, spv::ExecutionModel execModel);
+	void populateBindOperations(MVKPipelineBindScript& script, const mvk::SPIRVToMSLConversionConfiguration& shaderConfig, spv::ExecutionModel execModel, bool isRayTracing = false);
 	/** Does this pipeline layout have a push descriptor? */
 	bool hasPushDescriptor() const { return _pushDescriptor >= 0; }
 	/** If this pipeline layout has a push descriptor, returns the set ID of that descriptor. */
@@ -124,6 +127,7 @@ public:
 
 private:
 	bool boundsCheckBindOp(uint32_t bind, uint32_t count, uint32_t limit, const char *type);
+	const MVKDescriptorSetLayout* getShaderDescriptorSetLayout(size_t descSetIndex, bool isRayTracing) const;
 	MVKInlineArray<MVKDescriptorSetLayout*> _descriptorSetLayouts;
 	MVKInlineArray<MVKShaderResourceBinding> _resourceIndexOffsets;
 	uint32_t _pushConstantsLength = 0;

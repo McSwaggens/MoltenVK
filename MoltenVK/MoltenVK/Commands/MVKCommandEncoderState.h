@@ -469,6 +469,8 @@ class MVKCommandEncoderState {
 
 	/** Get the encoder state associated with the given bind point, or nullptr if the bindPoint isn't supported. */
 	MVKVulkanCommonEncoderState* getVkEncoderState(VkPipelineBindPoint bindPoint);
+	const MVKDescriptorSet* preparePushDescriptorArgumentBuffer(MVKCommandEncoder& mvkEncoder, VkPipelineBindPoint bindPoint,
+																MVKDescriptorSetLayout* dsl, uint32_t set);
 
 public:
 	/** Get a reference to the Vulkan state shared between graphics and compute.  Read-only, use methods on this class (which will invalidate associated Metal state) to modify. */
@@ -538,9 +540,9 @@ public:
 	                        uint32_t dynamicOffsetCount,
 	                        const uint32_t* dynamicOffsets);
 	/** Applies the given descriptor set writes to the push descriptor set on bindPoint. */
-	void pushDescriptorSet(VkPipelineBindPoint bindPoint, MVKPipelineLayout* layout, uint32_t set, uint32_t writeCount, const VkWriteDescriptorSet* writes);
+	void pushDescriptorSet(MVKCommandEncoder& mvkEncoder, VkPipelineBindPoint bindPoint, MVKPipelineLayout* layout, uint32_t set, uint32_t writeCount, const VkWriteDescriptorSet* writes);
 	/** Applies the given descriptor update template to the push descriptor to its specified bindPoint. */
-	void pushDescriptorSet(MVKDescriptorUpdateTemplate* updateTemplate, MVKPipelineLayout* layout, uint32_t set, const void* data);
+	void pushDescriptorSet(MVKCommandEncoder& mvkEncoder, MVKDescriptorUpdateTemplate* updateTemplate, MVKPipelineLayout* layout, uint32_t set, const void* data);
 	/** Binds the given vertex buffers to the Vulkan state, invalidating any necessary resources. */
 	void bindVertexBuffers(uint32_t firstBinding, MVKArrayRef<const MVKVertexMTLBufferBinding> buffers);
 	/** Binds the given index buffer to the Vulkan state, invalidating any necessary resources. */
