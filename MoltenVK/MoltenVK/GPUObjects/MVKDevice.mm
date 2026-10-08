@@ -4537,6 +4537,19 @@ MTLAccelerationStructureGeometryDescriptor* MVKDevice::getMTLAccelerationStructu
 				mtlTriDesc.vertexBuffer = getMTLBufferForDeviceAddress(vtxAddr, &vtxOffset);
 				mtlTriDesc.vertexBufferOffset = vtxOffset;
 				if ( !mtlTriDesc.vertexBuffer ) { return nil; }
+#if MVK_XCODE_16 && MVK_MACOS_OR_IOS
+				// Where Metal can read Vulkan's row-major transforms, use them directly.
+				// Otherwise, the build converts them to the default column-major layout.
+				if (triangles.transformData.deviceAddress) {
+					if (@available(macOS 15.0, iOS 18.0, *)) {
+						VkDeviceSize xfmOffset = 0;
+						mtlTriDesc.transformationMatrixBuffer = getMTLBufferForDeviceAddress(triangles.transformData.deviceAddress + rangeInfo.transformOffset, &xfmOffset);
+						mtlTriDesc.transformationMatrixBufferOffset = xfmOffset;
+						mtlTriDesc.transformationMatrixLayout = MTLMatrixLayoutRowMajor;
+						if ( !mtlTriDesc.transformationMatrixBuffer ) { return nil; }
+					}
+				}
+#endif
 			}
 			mtlGeoDesc = mtlTriDesc;
 			break;
@@ -4947,11 +4960,12 @@ void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVK
 	}
 }
 
-void MVKDevice::encodeAccelerationStructures(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
+void MVKDevice::encodeAccelerationStructures(id<MTLCommandEncoder> mtlEncoder, MVKUseMTLResourceFunction useResource,
+											 MVKUseResourceHelper& resources, MVKResourceUsageStages stages) {
 	// Acceleration structures, their headers and instance data are added to the residency set when created.
 	if (hasResidencySet()) { return; }
 
-	_accelerationStructureHeaderPool->encodeResourceUsage(resources, stage);
+	_accelerationStructureHeaderPool->useResources(mtlEncoder, useResource, resources, stages);
 }
 
 id<MTLFunction> MVKDevice::getGeneratedMTLFunction(const string& msl, const char* funcName, MVKVulkanAPIDeviceObject* owner) {

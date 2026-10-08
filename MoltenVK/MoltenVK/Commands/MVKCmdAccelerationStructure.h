@@ -41,20 +41,20 @@ public:
 protected:
 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 	const VkAccelerationStructureBuildRangeInfoKHR* getRangeInfos(const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo);
-	void encodeInputConversions(MVKCommandEncoder* cmdEncoder, MTLAccelerationStructureDescriptor* const* mtlDescs);
-	void encodeInstanceConversion(MVKCommandEncoder* cmdEncoder,
+	void encodeInputConversions(MVKCommandEncoder* cmdEncoder, MTLAccelerationStructureDescriptor** mtlDescs);
+	bool encodeInstanceConversion(MVKCommandEncoder* cmdEncoder,
 								  id<MTLComputeCommandEncoder> mtlComputeEnc,
 								  const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
 								  MTLInstanceAccelerationStructureDescriptor* mtlInstDesc);
-	void encodeTransformConversion(MVKCommandEncoder* cmdEncoder,
+	bool encodeTransformConversion(MVKCommandEncoder* cmdEncoder,
 								   id<MTLComputeCommandEncoder> mtlComputeEnc,
 								   const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
 								   MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
-	void encodeVertexAlignment(MVKCommandEncoder* cmdEncoder,
+	bool encodeVertexAlignment(MVKCommandEncoder* cmdEncoder,
 							   id<MTLComputeCommandEncoder> mtlComputeEnc,
 							   const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
 							   MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
-	void encodeBoundingBoxConversion(MVKCommandEncoder* cmdEncoder,
+	bool encodeBoundingBoxConversion(MVKCommandEncoder* cmdEncoder,
 									 id<MTLComputeCommandEncoder> mtlComputeEnc,
 									 const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
 									 MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
@@ -81,6 +81,7 @@ public:
 
 protected:
 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+	void encodeInstanceDataCopy(MVKCommandEncoder* cmdEncoder);
 
 	VkAccelerationStructureKHR _src;
 	VkAccelerationStructureKHR _dst;

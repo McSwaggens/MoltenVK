@@ -77,6 +77,10 @@ class MVKPrivateDataSlot;
 struct MVKUseResourceHelper;
 enum class MVKResourceUsageStages : uint8_t;
 
+/** A function that encodes the use of a resource in the specified stages of a Metal render or compute encoder. */
+typedef void (*MVKUseMTLResourceFunction)(id<MTLCommandEncoder> mtlEncoder, id<MTLResource> mtlResource,
+										  MTLResourceUsage usage, MVKResourceUsageStages stages);
+
 
 /** The buffer index to use for vertex content. */
 static constexpr uint32_t kMVKVertexContentBufferIndex = 0;
@@ -792,9 +796,9 @@ public:
 	/**
 	 * Returns an autoreleased Metal descriptor for building an acceleration structure from the build info and
 	 * the build ranges of its geometries. When encoding a build, resolveBuffers must be true, so that the input
-	 * buffers of the geometries are resolved from their device addresses. The buffers of TLAS instances and of
-	 * geometry transforms are not resolved, because Metal requires these in different layouts than Vulkan.
-	 * Returns nil if an input buffer cannot be found.
+	 * buffers of the geometries are resolved from their device addresses. The buffers of TLAS instances are not
+	 * resolved, because Metal requires them in a different layout than Vulkan. Neither are the buffers of geometry
+	 * transforms, unless Metal supports their Vulkan layout. Returns nil if an input buffer cannot be found.
 	 */
 	MTLAccelerationStructureDescriptor* getMTLAccelerationStructureDescriptor(const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
 																			  const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfos,
@@ -928,10 +932,18 @@ public:
 
 	/**
 	 * Tell the GPU to be ready to use any of the acceleration structures, and the headers and instance data
-	 * that shaders access through them. Because top-level acceleration structures reference bottom-level
-	 * acceleration structures by device address, any live acceleration structure may be accessed.
+	 * that shaders access through them, in the specified stages of the render or compute encoder. Because
+	 * top-level acceleration structures reference bottom-level acceleration structures by device address,
+	 * any live acceleration structure may be accessed.
+	 *
+	 * Does nothing if this device has a residency set, to which all of these are added when they are created.
+	 * Otherwise, uses the Metal acceleration structures and instance data immediately, through the useResource
+	 * function, because other threads may destroy them once this function returns, and adds the header
+	 * buffers, which live as long as this device, to the resource helper. The stages should accumulate
+	 * all stages previously passed for the same encoder.
 	 */
-	void encodeAccelerationStructures(MVKUseResourceHelper& resources, MVKResourceUsageStages stage);
+	void encodeAccelerationStructures(id<MTLCommandEncoder> mtlEncoder, MVKUseMTLResourceFunction useResource,
+									  MVKUseResourceHelper& resources, MVKResourceUsageStages stages);
 
 	/** Returns the pool that allocates the headers of the acceleration structures of this device. */
 	MVKAccelerationStructureHeaderPool* getAccelerationStructureHeaderPool() { return _accelerationStructureHeaderPool; }

@@ -192,6 +192,10 @@ id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdConvertAccelerationStr
 	MVK_ENC_REZ_ACCESS(_mtlConvertAccelerationStructureBoundingBoxesComputePipelineState, newCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState(_commandPool));
 }
 
+id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdCopyAccelerationStructureInstanceDataMTLComputePipelineState() {
+	MVK_ENC_REZ_ACCESS(_mtlCopyAccelerationStructureInstanceDataComputePipelineState, newCmdCopyAccelerationStructureInstanceDataMTLComputePipelineState(_commandPool));
+}
+
 void MVKCommandEncodingPool::clear() {
 	lock_guard<mutex> lock(_lock);
 	destroyMetalResources();
@@ -307,4 +311,7 @@ void MVKCommandEncodingPool::destroyMetalResources() {
 
 	[_mtlConvertAccelerationStructureBoundingBoxesComputePipelineState release];
 	_mtlConvertAccelerationStructureBoundingBoxesComputePipelineState = nil;
+
+	[_mtlCopyAccelerationStructureInstanceDataComputePipelineState release];
+	_mtlCopyAccelerationStructureInstanceDataComputePipelineState = nil;
 }

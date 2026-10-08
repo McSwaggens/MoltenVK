@@ -261,7 +261,7 @@ struct MVKMetalSharedCommandEncoderState {
 	/** Which GPU addressable resources have been added to `_useResource`. */
 	MVKResourceUsageStages _gpuAddressableResourceStages;
 
-	/** Which acceleration structure resources have been added to `_useResource`. */
+	/** Which stages acceleration structure resources have been used for, in the current Metal encoder. */
 	MVKResourceUsageStages _accelerationStructureStages;
 
 	void reset() {
