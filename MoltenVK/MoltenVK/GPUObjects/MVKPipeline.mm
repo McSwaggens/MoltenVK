@@ -2692,7 +2692,8 @@ bool MVKRayTracingPipeline::validateLayout() {
 		const MVKDescriptorSetLayout* dsl = _layout->getDescriptorSetLayout(dslIdx);
 		if (dsl->argBufMode() != MVKArgumentBufferMode::Off || dsl->getArgumentBufferLayout()) { continue; }
 		for (const MVKDescriptorBinding& binding : dsl->bindings()) {
-			if (mvkIsAnyFlagEnabled(binding.stageFlags, kMVKRayTracingShaderStageFlags)) {
+			// A set whose bindings are all empty has no argument buffer, and nothing to read from it.
+			if (binding.descriptorCount && mvkIsAnyFlagEnabled(binding.stageFlags, kMVKRayTracingShaderStageFlags)) {
 				setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Ray tracing shaders cannot use descriptor set %u, because it cannot be held in a Metal argument buffer.", dslIdx));
 				return false;
 			}
