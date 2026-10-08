@@ -2526,6 +2526,9 @@ static constexpr VkShaderStageFlags kMVKRayTracingShaderStages = (VK_SHADER_STAG
  */
 static constexpr uint32_t kMVKRayTracingMaxCallableDepth = 16;
 
+/** The nominal stack size in bytes of a ray tracing shader. */
+static constexpr VkDeviceSize kMVKRayTracingShaderStackSize = 256;
+
 /** Describes a ray tracing shader stage. */
 struct MVKRayTracingStageInfo {
 	spv::ExecutionModel execModel;
@@ -2562,6 +2565,8 @@ MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
 
 	_groupCount = pCreateInfo->groupCount;
 	_maxRecursionDepth = pCreateInfo->maxPipelineRayRecursionDepth;
+	if (mvkIsAnyFlagEnabled(_flags, VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_TRIANGLES_BIT_KHR)) { mvkEnableFlags(_rayFlags, spv::RayFlagsSkipTrianglesKHRMask); }
+	if (mvkIsAnyFlagEnabled(_flags, VK_PIPELINE_CREATE_2_RAY_TRACING_SKIP_AABBS_BIT_KHR)) { mvkEnableFlags(_rayFlags, spv::RayFlagsSkipAABBsKHRMask); }
 
 	const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo = nullptr;
 	for (const auto* next = (VkBaseInStructure*)pCreateInfo->pNext; next; next = next->pNext) {
@@ -2767,13 +2772,11 @@ std::string MVKRayTracingPipeline::getKernelMSL() {
 	msl << "    spvShared.functions = spvFunctions;\n";
 	msl << "    spvShared.params = &spvParams;\n";
 	msl << "    spvShared.groups = spvGroups;\n";
-	for (uint32_t dsIdx = 0; dsIdx < kMVKMaxDescriptorSetCount; dsIdx++) {
-		msl << "    spvShared.descriptorSets[" << dsIdx << "] = ";
-		if (_stageResources.resources.descriptorSetData.get(dsIdx)) {
-			msl << "reinterpret_cast<ulong>(spvDescriptorSet" << dsIdx << ");\n";
-		} else {
-			msl << "0;\n";
-		}
+	msl << "    for (uint i = 0; i < SPV_RT_MAX_DESCRIPTOR_SETS; i++)\n";
+	msl << "        spvShared.descriptorSets[i] = 0;\n";
+	for (size_t dsIdx : _stageResources.resources.descriptorSetData) {
+		msl << "    static_assert(" << dsIdx << " < SPV_RT_MAX_DESCRIPTOR_SETS, \"Descriptor set index exceeds SPV_RT_MAX_DESCRIPTOR_SETS.\");\n";
+		msl << "    spvShared.descriptorSets[" << dsIdx << "] = reinterpret_cast<ulong>(spvDescriptorSet" << dsIdx << ");\n";
 	}
 	auto setImplicitBuffer = [&](MVKImplicitBuffer buffer, const char* member, const char* name) {
 		msl << "    spvShared." << member << " = " << (implicitBuffers.needed.has(buffer) ? name : "nullptr") << ";\n";
@@ -2897,9 +2900,10 @@ VkResult MVKRayTracingPipeline::getShaderGroupHandles(uint32_t firstGroup, uint3
 	return VK_SUCCESS;
 }
 
-// Metal sizes the call stack of the pipeline itself, so shaders don't use any of the Vulkan pipeline stack.
+// Metal sizes the call stack of the pipeline when the pipeline is created, so the stack size of each shader
+// is only a nominal value, which apps may use to calculate a pipeline stack size that has no effect.
 VkDeviceSize MVKRayTracingPipeline::getShaderGroupStackSize(uint32_t group, VkShaderGroupShaderKHR groupShader) {
-	return 0;
+	return kMVKRayTracingShaderStackSize;
 }
 
 MVKRayTracingPipeline::~MVKRayTracingPipeline() {
@@ -3547,18 +3551,18 @@ static size_t mvkValidateCerealArchiveSize(size_t padByteCnt = 0) {
 
 void mvkValidateCeralArchiveDefinitions() {
 	[[maybe_unused]] size_t missingBytes = 0;
-	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(6);
+	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::CompilerMSL::Options>(8);
 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLShaderInterfaceVariable>();
 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLResourceBinding>();
 	missingBytes += mvkValidateCerealArchiveSize<SPIRV_CROSS_NAMESPACE::MSLConstexprSampler>();
 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVWorkgroupSizeDimension>(3);
 	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVEntryPoint>(20);						// Contains string
-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(24);			// Contains string
+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionOptions>(46);			// Contains strings
 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLShaderInterfaceVariable>(3);
 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLResourceBinding>(2);
 	missingBytes += mvkValidateCerealArchiveSize<mvk::DescriptorBinding>();
-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(104);	// Contains collection
-	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(39);		// Contains collection
+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionConfiguration>(126);	// Contains collection
+	missingBytes += mvkValidateCerealArchiveSize<mvk::SPIRVToMSLConversionResultInfo>(38);		// Contains collection
 	missingBytes += mvkValidateCerealArchiveSize<mvk::MSLSpecializationMacroInfo>(22);			// Contains string
 	missingBytes += mvkValidateCerealArchiveSize<MVKShaderModuleKey>();
 	missingBytes += mvkValidateCerealArchiveSize<MVKCompressor<std::string>>(20);				// Contains collection

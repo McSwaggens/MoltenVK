@@ -4777,6 +4777,18 @@ id<MTLFunction> MVKDevice::getGeneratedMTLFunction(const string& msl, const char
 		if (iter != _generatedMTLFunctions.end()) { return iter->second; }
 	}
 
+	const char* dumpDir = getMVKConfig().shaderDumpDir;
+	if (dumpDir && *dumpDir) {
+		char path[PATH_MAX];
+		mkdir(dumpDir, 0755);
+		snprintf(path, sizeof(path), "%s/%s-%016zx.metal", dumpDir, funcName, std::hash<string>()(msl));
+		FILE* file = fopen(path, "wb");
+		if (file) {
+			fwrite(msl.data(), 1, msl.size(), file);
+			fclose(file);
+		}
+	}
+
 	// Compile outside the lock, so other functions can be compiled concurrently.
 	MVKShaderLibraryCompiler* slc = new MVKShaderLibraryCompiler(owner);
 	NSString* nsSrc = [[NSString alloc] initWithUTF8String: msl.c_str()];	// temp retained

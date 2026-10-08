@@ -47,6 +47,7 @@ static MVKRayTracingPipeline* bindDispatchParams(MVKCommandEncoder* cmdEncoder,
 	MVKRayTracingPipeline* pipeline = cmdEncoder->getRayTracingPipeline();
 	MVKRayTracingDispatchParams params = cmdParams;
 	params.maxRecursionDepth = pipeline->getMaxRecursionDepth();
+	params.pipelineRayFlags = pipeline->getRayFlags();
 	cmdEncoder->setComputeBytes(mtlEncoder, &params, sizeof(params),
 								pipeline->getStageResources().implicitBuffers.ids[MVKImplicitBuffer::RayTracingDispatchParams]);
 	return pipeline;

@@ -438,6 +438,12 @@ bool MVKShaderModule::convert(SPIRVToMSLConversionConfiguration* pShaderConfig,
 			case spv::ExecutionModelTaskNV:                 type = "-ts"; break;
 			case spv::ExecutionModelMeshNV:                 type = "-ms"; break;
 			case spv::ExecutionModelGLCompute:              type = "-cs"; break;
+			case spv::ExecutionModelRayGenerationKHR:       type = "-rgen"; break;
+			case spv::ExecutionModelIntersectionKHR:        type = "-rint"; break;
+			case spv::ExecutionModelAnyHitKHR:              type = "-rahit"; break;
+			case spv::ExecutionModelClosestHitKHR:          type = "-rchit"; break;
+			case spv::ExecutionModelMissKHR:                type = "-rmiss"; break;
+			case spv::ExecutionModelCallableKHR:            type = "-rcall"; break;
 			default:                                        type = "";    break;
 		}
 		mkdir(dumpDir, 0755);

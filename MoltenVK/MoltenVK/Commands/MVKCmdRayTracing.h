@@ -42,10 +42,11 @@ struct MVKRayTracingDispatchParams {
 	uint32_t launchDepth;
 	uint32_t maxRecursionDepth;
 	uint64_t indirectLaunchAddress;		/**< Address of the VkTraceRaysIndirectCommandKHR, or zero for a direct dispatch. */
+	uint32_t pipelineRayFlags;			/**< Ray flags the pipeline adds to the traversal of every ray. */
 };
 static_assert(offsetof(MVKRayTracingDispatchParams, launchWidth) == 64, "MVKRayTracingDispatchParams must match spvRTDispatchParams.");
 static_assert(offsetof(MVKRayTracingDispatchParams, indirectLaunchAddress) == 80, "MVKRayTracingDispatchParams must match spvRTDispatchParams.");
-static_assert(sizeof(MVKRayTracingDispatchParams) == 88, "MVKRayTracingDispatchParams must match spvRTDispatchParams.");
+static_assert(sizeof(MVKRayTracingDispatchParams) == 96, "MVKRayTracingDispatchParams must match spvRTDispatchParams.");
 
 
 #pragma mark -

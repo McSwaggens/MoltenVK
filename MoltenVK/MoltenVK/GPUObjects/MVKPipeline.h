@@ -513,6 +513,9 @@ public:
 	/** Returns the maximum recursion depth of the rays traced by this pipeline. */
 	uint32_t getMaxRecursionDepth() const { return _maxRecursionDepth; }
 
+	/** Returns the SPIR-V ray flags that this pipeline adds to the traversal of every ray. */
+	uint32_t getRayFlags() const { return _rayFlags; }
+
 	/** Populates the specified memory with the handles of the specified shader groups. */
 	VkResult getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void* pData);
 
@@ -545,6 +548,7 @@ protected:
 	MTLSize _mtlThreadgroupSize = MTLSizeMake(1, 1, 1);
 	uint32_t _groupCount = 0;
 	uint32_t _maxRecursionDepth = 0;
+	uint32_t _rayFlags = 0;
 };
 
 
