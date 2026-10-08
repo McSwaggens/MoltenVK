@@ -3538,7 +3538,7 @@ MVK_PUBLIC_VULKAN_SYMBOL VkResult vkGetRayTracingCaptureReplayShaderGroupHandles
 
 	MVKTraceVulkanCallStart();
 	MVKDevice* mvkDev = MVKDevice::getMVKDevice(device);
-	VkResult rslt = mvkDev->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkGetRayTracingCaptureReplayShaderGroupHandlesKHR: Capture replay is not supported.");
+	VkResult rslt = mvkDev->reportError(VK_ERROR_VALIDATION_FAILED, "vkGetRayTracingCaptureReplayShaderGroupHandlesKHR(): The rayTracingPipelineShaderGroupHandleCaptureReplay feature is not supported.");
 	MVKTraceVulkanCallEnd();
 	return rslt;
 }
