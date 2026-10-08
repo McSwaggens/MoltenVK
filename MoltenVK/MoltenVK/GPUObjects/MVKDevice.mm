@@ -4385,15 +4385,146 @@ void MVKDevice::destroyDeferredOperation(MVKDeferredOperation* mvkDeferredOperat
 
 MVKAccelerationStructure* MVKDevice::createAccelerationStructure(const VkAccelerationStructureCreateInfoKHR* pCreateInfo,
 																 const VkAllocationCallbacks* pAllocator) {
-	auto* mvkAS = new MVKAccelerationStructure(this, pCreateInfo);
-	return mvkAS;
+	return new MVKAccelerationStructure(this, pCreateInfo);
 }
 
 void MVKDevice::destroyAccelerationStructure(MVKAccelerationStructure* mvkAccStruct,
 											 const VkAllocationCallbacks* pAllocator) {
-	if (mvkAccStruct) {
-		mvkAccStruct->destroy();
+	if (mvkAccStruct) { mvkAccStruct->destroy(); }
+}
+
+void MVKDevice::getAccelerationStructureBuildSizes(const VkAccelerationStructureBuildGeometryInfoKHR* pBuildInfo,
+												   const uint32_t* pMaxPrimitiveCounts,
+												   VkAccelerationStructureBuildSizesInfoKHR* pSizeInfo) {
+	@autoreleasepool {
+		uint32_t geoCnt = pBuildInfo->geometryCount;
+		VkAccelerationStructureBuildRangeInfoKHR rangeInfos[geoCnt];
+		for (uint32_t geoIdx = 0; geoIdx < geoCnt; geoIdx++) {
+			rangeInfos[geoIdx] = { .primitiveCount = pMaxPrimitiveCounts[geoIdx] };
+		}
+		MTLAccelerationStructureDescriptor* mtlDesc = getMTLAccelerationStructureDescriptor(*pBuildInfo, rangeInfos, false);
+		MTLAccelerationStructureSizes mtlSizes = [_physicalDevice->getMTLDevice() accelerationStructureSizesWithDescriptor: mtlDesc];
+		pSizeInfo->accelerationStructureSize = mtlSizes.accelerationStructureSize;
+		pSizeInfo->buildScratchSize = mtlSizes.buildScratchBufferSize;
+		pSizeInfo->updateScratchSize = mtlSizes.refitScratchBufferSize;
 	}
+}
+
+// Unless a Metal acceleration structure is built with MTLAccelerationStructureUsageExtendedLimits, it may contain
+// at most 2^28 primitives. Extended limits also require shaders to use the extended_limits intersection tag,
+// so they are only used when Vulkan permits more primitives than this.
+static constexpr uint64_t kMVKMaxMTLAccelerationStructurePrimitiveCount = 1ull << 28;
+
+static MTLAccelerationStructureUsage getMTLAccelerationStructureUsage(VkBuildAccelerationStructureFlagsKHR flags,
+																	  uint64_t primitiveCount) {
+	MTLAccelerationStructureUsage mtlUsage = MTLAccelerationStructureUsageNone;
+	if (mvkIsAnyFlagEnabled(flags, VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR)) {
+		mtlUsage |= MTLAccelerationStructureUsageRefit;
+	}
+	if (mvkIsAnyFlagEnabled(flags, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_BUILD_BIT_KHR)) {
+		mtlUsage |= MTLAccelerationStructureUsagePreferFastBuild;
+	}
+#if MVK_XCODE_26
+	if (@available(macOS 26.0, iOS 26.0, tvOS 26.0, *)) {
+		if (mvkIsAnyFlagEnabled(flags, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR)) {
+			mtlUsage |= MTLAccelerationStructureUsagePreferFastIntersection;
+		}
+		if (mvkIsAnyFlagEnabled(flags, VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR)) {
+			mtlUsage |= MTLAccelerationStructureUsageMinimizeMemory;
+		}
+	}
+#endif
+	if (primitiveCount > kMVKMaxMTLAccelerationStructurePrimitiveCount) {
+		mtlUsage |= MTLAccelerationStructureUsageExtendedLimits;
+	}
+	return mtlUsage;
+}
+
+MTLAccelerationStructureDescriptor* MVKDevice::getMTLAccelerationStructureDescriptor(const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+																					 const VkAccelerationStructureBuildRangeInfoKHR* pRangeInfos,
+																					 bool resolveBuffers) {
+	MTLAccelerationStructureDescriptor* mtlDesc = nil;
+	uint64_t primitiveCount = 0;
+	if (buildInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR) {
+		// Instances reference their acceleration structures by resource ID, which is read from their headers on the GPU.
+		auto* mtlInstDesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
+		mtlInstDesc.instanceDescriptorType = MTLAccelerationStructureInstanceDescriptorTypeIndirect;
+		mtlInstDesc.instanceCount = buildInfo.geometryCount ? pRangeInfos[0].primitiveCount : 0;
+		mtlDesc = mtlInstDesc;
+	} else {
+		auto* mtlGeoDescs = [NSMutableArray arrayWithCapacity: buildInfo.geometryCount];
+		for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
+			auto* mtlGeoDesc = getMTLAccelerationStructureGeometryDescriptor(MVKAccelerationStructure::getGeometry(buildInfo, geoIdx),
+																			 pRangeInfos[geoIdx], resolveBuffers);
+			if ( !mtlGeoDesc ) { return nil; }
+			mtlGeoDesc.intersectionFunctionTableOffset = geoIdx;
+			[mtlGeoDescs addObject: mtlGeoDesc];
+			primitiveCount += pRangeInfos[geoIdx].primitiveCount;
+		}
+		auto* mtlPrimDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
+		mtlPrimDesc.geometryDescriptors = mtlGeoDescs;
+		mtlDesc = mtlPrimDesc;
+	}
+	mtlDesc.usage = getMTLAccelerationStructureUsage(buildInfo.flags, primitiveCount);
+	return mtlDesc;
+}
+
+// Returns an autoreleased Metal descriptor for the geometry, or nil if one of its buffers cannot be found.
+MTLAccelerationStructureGeometryDescriptor* MVKDevice::getMTLAccelerationStructureGeometryDescriptor(const VkAccelerationStructureGeometryKHR& geometry,
+																									 const VkAccelerationStructureBuildRangeInfoKHR& rangeInfo,
+																									 bool resolveBuffers) {
+	// Buffers are not needed, and their addresses may be null, if there are no primitives.
+	resolveBuffers = resolveBuffers && rangeInfo.primitiveCount;
+
+	MTLAccelerationStructureGeometryDescriptor* mtlGeoDesc = nil;
+	switch (geometry.geometryType) {
+		case VK_GEOMETRY_TYPE_TRIANGLES_KHR: {
+			const auto& triangles = geometry.geometry.triangles;
+			auto* mtlTriDesc = [MTLAccelerationStructureTriangleGeometryDescriptor descriptor];
+			mtlTriDesc.triangleCount = rangeInfo.primitiveCount;
+			mtlTriDesc.vertexFormat = (MTLAttributeFormat)_physicalDevice->_pixelFormats.getMTLVertexFormat(triangles.vertexFormat);
+			mtlTriDesc.vertexStride = triangles.vertexStride;
+			mtlTriDesc.indexType = triangles.indexType == VK_INDEX_TYPE_UINT16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+			if (resolveBuffers) {
+				// Adding firstVertex to each index is equivalent to offsetting the vertex data.
+				VkDeviceAddress vtxAddr = triangles.vertexData.deviceAddress + rangeInfo.firstVertex * triangles.vertexStride;
+				if (triangles.indexType == VK_INDEX_TYPE_NONE_KHR) {
+					vtxAddr += rangeInfo.primitiveOffset;
+				} else {
+					VkDeviceSize idxOffset = 0;
+					mtlTriDesc.indexBuffer = getMTLBufferForDeviceAddress(triangles.indexData.deviceAddress + rangeInfo.primitiveOffset, &idxOffset);
+					mtlTriDesc.indexBufferOffset = idxOffset;
+					if ( !mtlTriDesc.indexBuffer ) { return nil; }
+				}
+				VkDeviceSize vtxOffset = 0;
+				mtlTriDesc.vertexBuffer = getMTLBufferForDeviceAddress(vtxAddr, &vtxOffset);
+				mtlTriDesc.vertexBufferOffset = vtxOffset;
+				if ( !mtlTriDesc.vertexBuffer ) { return nil; }
+			}
+			mtlGeoDesc = mtlTriDesc;
+			break;
+		}
+		case VK_GEOMETRY_TYPE_AABBS_KHR: {
+			const auto& aabbs = geometry.geometry.aabbs;
+			auto* mtlBoxDesc = [MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
+			mtlBoxDesc.boundingBoxCount = rangeInfo.primitiveCount;
+			mtlBoxDesc.boundingBoxStride = aabbs.stride;
+			if (resolveBuffers) {
+				VkDeviceSize boxOffset = 0;
+				mtlBoxDesc.boundingBoxBuffer = getMTLBufferForDeviceAddress(aabbs.data.deviceAddress + rangeInfo.primitiveOffset, &boxOffset);
+				mtlBoxDesc.boundingBoxBufferOffset = boxOffset;
+				if ( !mtlBoxDesc.boundingBoxBuffer ) { return nil; }
+			}
+			mtlGeoDesc = mtlBoxDesc;
+			break;
+		}
+		default:
+			return nil;
+	}
+
+	mtlGeoDesc.opaque = mvkIsAnyFlagEnabled(geometry.flags, VK_GEOMETRY_OPAQUE_BIT_KHR);
+	mtlGeoDesc.allowDuplicateIntersectionFunctionInvocation = !mvkIsAnyFlagEnabled(geometry.flags, VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR);
+	return mtlGeoDesc;
 }
 
 MVKEvent* MVKDevice::createEvent(const VkEventCreateInfo* pCreateInfo,
@@ -4429,6 +4560,7 @@ MVKQueryPool* MVKDevice::createQueryPool(const VkQueryPoolCreateInfo* pCreateInf
 			case VK_QUERY_TYPE_TIMESTAMP:
 				return new MVKTimestampQueryPool(this, pCreateInfo);
 			case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_COMPACTED_SIZE_KHR:
+			case VK_QUERY_TYPE_ACCELERATION_STRUCTURE_SERIALIZATION_SIZE_KHR:
 				return new MVKAccelerationStructureQueryPool(this, pCreateInfo);
 			case VK_QUERY_TYPE_PIPELINE_STATISTICS:
 				return new MVKPipelineStatisticsQueryPool(this, pCreateInfo);
@@ -4721,33 +4853,54 @@ MVKBuffer* MVKDevice::removeBuffer(MVKBuffer* mvkBuff) {
 	mvkRemoveFirstOccurance(_resources, mvkBuff);
 	if (mvkIsAnyFlagEnabled(mvkBuff->getUsage(), VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT)) {
 		mvkRemoveFirstOccurance(_gpuAddressableBuffers, mvkBuff);
+		_gpuAddressRanges.clear();
 	}
 	return mvkBuff;
 }
 
 id<MTLBuffer> MVKDevice::getMTLBufferForDeviceAddress(VkDeviceAddress address, VkDeviceSize* pOffset) {
 	lock_guard<mutex> lock(_rezLock);
-	id<MTLBuffer> bestMtlBuf = nil;
-	uint64_t bestSize = 0;
-	for (auto* buff : _gpuAddressableBuffers) {
-		id<MTLBuffer> mtlBuf = buff->getMTLBuffer();
-		if (!mtlBuf) continue;
-		uint64_t bufStart = mtlBuf.gpuAddress + buff->getMTLBufferOffset();
-		uint64_t bufEnd = bufStart + buff->getByteCount();
-		if (address >= bufStart && address < bufEnd) {
-			uint64_t size = bufEnd - bufStart;
-			if (size > bestSize) {
-				bestSize = size;
-				bestMtlBuf = mtlBuf;
-			}
+	MVKBuffer* mvkBuff = getGPUAddressableBuffer(address);
+	if ( !mvkBuff ) {
+		// Buffers may have been created or bound to memory since the address ranges were last gathered.
+		updateGPUAddressRanges();
+		mvkBuff = getGPUAddressableBuffer(address);
+	}
+	id<MTLBuffer> mtlBuff = mvkBuff ? mvkBuff->getMTLBuffer() : nil;
+	if (pOffset) { *pOffset = mtlBuff ? address - mtlBuff.gpuAddress : 0; }
+	return mtlBuff;
+}
+
+// Returns the bound GPU-addressable buffer whose address range contains the address, or null if not found.
+// The ranges are sorted by start address, and each holds the furthest end, and its buffer, of all ranges
+// starting at or before it, so only the closest range starting at or before the address must be checked.
+MVKBuffer* MVKDevice::getGPUAddressableBuffer(VkDeviceAddress address) {
+	auto iter = std::upper_bound(_gpuAddressRanges.begin(), _gpuAddressRanges.end(), address,
+								 [](VkDeviceAddress addr, const MVKGPUAddressRange& range) { return addr < range.start; });
+	if (iter == _gpuAddressRanges.begin()) { return nullptr; }
+
+	const MVKGPUAddressRange& range = *(--iter);
+	return (address < range.end && range.buffer->getMTLBuffer()) ? range.buffer : nullptr;
+}
+
+void MVKDevice::updateGPUAddressRanges() {
+	_gpuAddressRanges.clear();
+	for (MVKBuffer* mvkBuff : _gpuAddressableBuffers) {
+		if (id<MTLBuffer> mtlBuff = mvkBuff->getMTLBuffer()) {
+			uint64_t start = mtlBuff.gpuAddress + mvkBuff->getMTLBufferOffset();
+			_gpuAddressRanges.push_back({ start, start + mvkBuff->getByteCount(), mvkBuff });
 		}
 	}
-	if (bestMtlBuf) {
-		if (pOffset) { *pOffset = address - bestMtlBuf.gpuAddress; }
-		return bestMtlBuf;
+	std::sort(_gpuAddressRanges.begin(), _gpuAddressRanges.end(),
+			  [](const MVKGPUAddressRange& a, const MVKGPUAddressRange& b) { return a.start < b.start; });
+	for (size_t rngIdx = 1; rngIdx < _gpuAddressRanges.size(); rngIdx++) {
+		MVKGPUAddressRange& prevRange = _gpuAddressRanges[rngIdx - 1];
+		MVKGPUAddressRange& range = _gpuAddressRanges[rngIdx];
+		if (prevRange.end > range.end) {
+			range.end = prevRange.end;
+			range.buffer = prevRange.buffer;
+		}
 	}
-	if (pOffset) { *pOffset = 0; }
-	return nil;
 }
 
 void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
@@ -4755,6 +4908,13 @@ void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVK
 	for (auto& buff : _gpuAddressableBuffers) {
 		resources.add(buff->getMTLBuffer(), stage, true);
 	}
+}
+
+void MVKDevice::encodeAccelerationStructures(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
+	// Acceleration structures, their headers and instance data are added to the residency set when created.
+	if (hasResidencySet()) { return; }
+
+	_accelerationStructureHeaderPool->encodeResourceUsage(resources, stage);
 }
 
 MVKImage* MVKDevice::addImage(MVKImage* mvkImg) {
@@ -5331,6 +5491,7 @@ MVKDevice::MVKDevice(MVKPhysicalDevice* physicalDevice, const VkDeviceCreateInfo
 																? "Metal argument buffers" : "Metal3 argument buffers") : "discrete resource indexes");
 
 	_commandResourceFactory = new MVKCommandResourceFactory(this);
+	_accelerationStructureHeaderPool = new MVKAccelerationStructureHeaderPool(this);
 
 	startAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_DEVICE, _physicalDevice->_mtlDevice);
 
@@ -5699,6 +5860,7 @@ MVKDevice::~MVKDevice() {
 	}
 
 	if (_commandResourceFactory) { _commandResourceFactory->destroy(); }
+	if (_accelerationStructureHeaderPool) { _accelerationStructureHeaderPool->destroy(); }
 
 	for (auto &fences: _barrierFences) for (auto fence: fences) [fence release];
 

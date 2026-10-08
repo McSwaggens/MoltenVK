@@ -19,88 +19,123 @@
 #pragma once
 
 #include "MVKDevice.h"
+#include "MVKSmallVector.h"
 #include <mutex>
-#include <shared_mutex>
-#include <unordered_map>
-#include <vector>
 
 #import <Metal/Metal.h>
 
-/** Per-primitive metadata carried through Metal intersection results. */
-struct MVKRTPrimitiveData {
-	uint32_t geometryIndex;
-	uint32_t primitiveIndex;
-	uint32_t geometryFlags;
-};
+
+/**
+ * The device-memory representation of a Vulkan acceleration structure, whose GPU address is the
+ * VkDeviceAddress of the acceleration structure. Shaders see it as struct spvAccelerationStructure.
+ */
+typedef struct {
+	MTLResourceID accelerationStructure;	/**< The Metal acceleration structure. */
+	uint64_t instanceSBTOffsets;			/**< For a TLAS, the GPU address of the SBT record offsets of its instances. */
+} MVKAccelerationStructureHeader;
 
 
 #pragma mark -
 #pragma mark MVKAccelerationStructure
 
+/** Represents a Vulkan acceleration structure. */
 class MVKAccelerationStructure : public MVKVulkanAPIDeviceObject {
 
 public:
 
+	/** Returns the Vulkan type of this object. */
 	VkObjectType getVkObjectType() override { return VK_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR; }
 
+	/** Returns the debug report object type of this object. */
 	VkDebugReportObjectTypeEXT getVkDebugReportObjectType() override { return VK_DEBUG_REPORT_OBJECT_TYPE_ACCELERATION_STRUCTURE_KHR_EXT; }
 
-	/** Returns the Metal acceleration structure. May be nil if not yet built. */
+	/** Returns the Metal acceleration structure. */
 	id<MTLAccelerationStructure> getMTLAccelerationStructure() { return _mtlAccelerationStructure; }
 
-	/** Sets the Metal acceleration structure (called during build). */
-	void setMTLAccelerationStructure(id<MTLAccelerationStructure> mtlAS);
+	/** Returns the MTLBuffer holding the header of this acceleration structure. */
+	id<MTLBuffer> getHeaderMTLBuffer() { return _headerMTLBuffer; }
 
-	/** Retains a Metal buffer that must remain alive for this acceleration structure. */
-	void retainBuffer(id<MTLBuffer> mtlBuffer);
+	/** Returns the offset of the header of this acceleration structure within its MTLBuffer. */
+	NSUInteger getHeaderOffset() { return _headerOffset; }
 
-	/** Releases all retained Metal buffers owned by this acceleration structure. */
-	void clearRetainedBuffers();
+	/** Returns the device address of this acceleration structure, which is the GPU address of its header. */
+	uint64_t getDeviceAddress() { return _headerMTLBuffer.gpuAddress + _headerOffset; }
 
-	/** Shares retained Metal buffers from another acceleration structure copy source. */
-	void copyRetainedBuffersFrom(MVKAccelerationStructure* srcAS);
+	/**
+	 * Returns a buffer that can hold the shader binding table record offsets of the specified number of
+	 * instances, to be written by a build of, or a copy to, this top-level acceleration structure.
+	 *
+	 * The GPU stores the address of the buffer in the header, after writing the buffer. A buffer that is too
+	 * small is replaced by a larger one, but is retained until this acceleration structure is destroyed,
+	 * because previously encoded GPU work may still access it through the header.
+	 */
+	id<MTLBuffer> getInstanceSBTOffsetsMTLBuffer(uint32_t instanceCount);
 
-	/** Returns the device address for this acceleration structure. */
-	VkDeviceAddress getDeviceAddress();
-
-	/** Returns the acceleration structure type (top-level or bottom-level). */
-	VkAccelerationStructureTypeKHR getType() { return _type; }
-
-	/** Returns the size of this acceleration structure. */
-	VkDeviceSize getSize() { return _size; }
-
+	/** Returns the buffer holding the instance SBT record offsets of the most recently encoded build or copy, or nil. */
 	id<MTLBuffer> getInstanceShaderBindingTableOffsetBuffer();
-	void setInstanceShaderBindingTableOffsetBuffer(id<MTLBuffer> mtlBuffer);
-	id<MTLBuffer> getInstanceFlagsBuffer();
-	void setInstanceFlagsBuffer(id<MTLBuffer> mtlBuffer);
 
-	/** Marks this acceleration structure and its referenced BLASes as resident. */
-	void encodeResourceUsage(id<MTLComputeCommandEncoder> mtlEncoder);
+	/** Adds the Metal acceleration structure and the instance SBT record offset buffers to the resource usage helper. */
+	void encodeResourceUsage(MVKUseResourceHelper& rez, MVKResourceUsageStages stage);
 
-	/** Sets the BLASes referenced by this TLAS. Retains each. */
-	void setReferencedBLASes(NSArray<id<MTLAccelerationStructure>>* blasArray);
+	/** Returns the specified geometry of the build info, which may be held in either an array or an array of pointers. */
+	static const VkAccelerationStructureGeometryKHR& getGeometry(const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+																 uint32_t geometryIndex) {
+		return buildInfo.pGeometries ? buildInfo.pGeometries[geometryIndex] : *buildInfo.ppGeometries[geometryIndex];
+	}
 
-	static MVKAccelerationStructure* getMVKAccelerationStructure(id<MTLAccelerationStructure> mtlAS);
-	static MVKAccelerationStructure* getMVKAccelerationStructure(VkDeviceAddress deviceAddress);
+#pragma mark Construction
 
 	MVKAccelerationStructure(MVKDevice* device, const VkAccelerationStructureCreateInfoKHR* pCreateInfo);
 
 	~MVKAccelerationStructure() override;
 
 protected:
-	void propagateDebugName() override {}
+	friend class MVKAccelerationStructureHeaderPool;
+
+	void propagateDebugName() override;
 
 	id<MTLAccelerationStructure> _mtlAccelerationStructure = nil;
-	id<MTLBuffer> _instanceShaderBindingTableOffsetBuffer = nil;
-	id<MTLBuffer> _instanceFlagsBuffer = nil;
-	VkAccelerationStructureTypeKHR _type;
-	VkBuffer _buffer;
-	VkDeviceSize _offset;
-	VkDeviceSize _size;
-	std::vector<id<MTLBuffer>> _retainedMTLBuffers;
-	std::vector<id<MTLAccelerationStructure>> _referencedBLASes;
-	std::mutex _metadataLock;
+	id<MTLBuffer> _headerMTLBuffer = nil;
+	NSUInteger _headerOffset = 0;
+	uint32_t _headerIndex = 0;
+	MVKSmallVector<id<MTLBuffer>, 1> _instanceSBTOffsetsMTLBuffers;		// Most recent last
+	std::mutex _lock;
+};
 
-	static std::shared_mutex _mtlAccelerationStructureMapLock;
-	static std::unordered_map<uint64_t, MVKAccelerationStructure*> _mtlAccelerationStructureMap;
+
+#pragma mark -
+#pragma mark MVKAccelerationStructureHeaderPool
+
+/**
+ * Tracks the live acceleration structures of a device, and allocates their headers
+ * from MTLBuffers that are owned by this pool and remain resident for its lifetime.
+ */
+class MVKAccelerationStructureHeaderPool : public MVKBaseDeviceObject {
+
+public:
+
+	/** Returns the Vulkan API opaque object controlling this object. */
+	MVKVulkanAPIObject* getVulkanAPIObject() override { return _device; };
+
+	/** Allocates a header for the acceleration structure, and writes its Metal acceleration structure to it. */
+	VkResult addAccelerationStructure(MVKAccelerationStructure* mvkAccStruct);
+
+	/** Clears and frees the header of the acceleration structure. */
+	void removeAccelerationStructure(MVKAccelerationStructure* mvkAccStruct);
+
+	/** Adds the header buffers and the resources of all live acceleration structures to the resource usage helper. */
+	void encodeResourceUsage(MVKUseResourceHelper& rez, MVKResourceUsageStages stage);
+
+	/** Returns the live acceleration structure using the Metal acceleration structure, or null if there is none. */
+	MVKAccelerationStructure* getAccelerationStructure(id<MTLAccelerationStructure> mtlAccStruct);
+
+	MVKAccelerationStructureHeaderPool(MVKDevice* device) : MVKBaseDeviceObject(device) {}
+
+	~MVKAccelerationStructureHeaderPool() override;
+
+protected:
+	MVKSmallVector<id<MTLBuffer>> _mtlBuffers;
+	MVKSmallVector<MVKAccelerationStructure*> _accelerationStructures;	// Indexed by header index, null if free
+	MVKSmallVector<uint32_t> _freeHeaderIndices;
+	std::mutex _lock;
 };

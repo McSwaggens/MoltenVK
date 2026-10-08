@@ -633,15 +633,23 @@ id<MTLComputePipelineState> MVKCommandResourceFactory::newConvertUint8IndicesMTL
 	return newMTLComputePipelineState("convertUint8Indices", owner);
 }
 
+id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdConvertAccelerationStructureInstancesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
+	return newMTLComputePipelineState("cmdConvertAccelerationStructureInstances", owner, getAccelerationStructureMTLLibrary());
+}
+
+id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdConvertAccelerationStructureTransformsMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
+	return newMTLComputePipelineState("cmdConvertAccelerationStructureTransforms", owner, getAccelerationStructureMTLLibrary());
+}
+
 
 #pragma mark Support methods
 
-// Returns the retained MTLFunction with the name.
+// Returns the retained MTLFunction with the name, from the library, or from the command shader library if nil.
 // The caller is responsible for releasing the returned function object.
-id<MTLFunction> MVKCommandResourceFactory::newFunctionNamed(const char* funcName) {
+id<MTLFunction> MVKCommandResourceFactory::newFunctionNamed(const char* funcName, id<MTLLibrary> mtlLibrary) {
 	uint64_t startTime = getPerformanceTimestamp();
 	NSString* nsFuncName = [[NSString alloc] initWithUTF8String: funcName];		// temp retained
-	id<MTLFunction> mtlFunc = [_mtlLibrary newFunctionWithName: nsFuncName];	// retained
+	id<MTLFunction> mtlFunc = [(mtlLibrary ? mtlLibrary : _mtlLibrary) newFunctionWithName: nsFuncName];	// retained
 	[nsFuncName release];														// temp release
 	addPerformanceInterval(getPerformanceStats().shaderCompilation.functionRetrieval, startTime);
 	return mtlFunc;
@@ -683,8 +691,9 @@ id<MTLRenderPipelineState> MVKCommandResourceFactory::newMTLRenderPipelineState(
 }
 
 id<MTLComputePipelineState> MVKCommandResourceFactory::newMTLComputePipelineState(const char* funcName,
-																				  MVKVulkanAPIDeviceObject* owner) {
-	id<MTLFunction> mtlFunc = newFunctionNamed(funcName);							// temp retain
+																				  MVKVulkanAPIDeviceObject* owner,
+																				  id<MTLLibrary> mtlLibrary) {
+	id<MTLFunction> mtlFunc = newFunctionNamed(funcName, mtlLibrary);				// temp retain
 	// Providing a function directly may cause issues with Metal shader validation layer object
 	// management for some reason, so create a temporary pipeline descriptor to provide instead.
 	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];		// temp retain
@@ -718,6 +727,27 @@ void MVKCommandResourceFactory::initMTLLibrary() {
     }
 }
 
+// The acceleration structure command shaders require MSL 3.1, which is available wherever
+// acceleration structures are supported, so they are compiled when first used.
+id<MTLLibrary> MVKCommandResourceFactory::getAccelerationStructureMTLLibrary() {
+	lock_guard<mutex> lock(_accelerationStructureLibraryLock);
+	if ( !_mtlAccelerationStructureLibrary ) {
+		@autoreleasepool {
+			NSError* err = nil;
+			uint64_t startTime = getPerformanceTimestamp();
+			_mtlAccelerationStructureLibrary = [getMTLDevice() newLibraryWithSource: _MVKStaticAccelerationStructureShaderSource
+																			options: getDevice()->getMTLCompileOptions()
+																			  error: &err];    // retained
+			if (err) {
+				reportError(VK_ERROR_INITIALIZATION_FAILED, "Could not compile acceleration structure command shaders (Error code %li):\n%s",
+							(long)err.code, err.localizedDescription.UTF8String);
+			}
+			addPerformanceInterval(getPerformanceStats().shaderCompilation.mslCompile, startTime);
+		}
+	}
+	return _mtlAccelerationStructureLibrary;
+}
+
 // Initializes the empty device memory used to back temporary VkImages.
 void MVKCommandResourceFactory::initImageDeviceMemory() {
 	VkMemoryAllocateInfo allocInfo = {
@@ -732,5 +762,7 @@ void MVKCommandResourceFactory::initImageDeviceMemory() {
 MVKCommandResourceFactory::~MVKCommandResourceFactory() {
 	[_mtlLibrary release];
 	_mtlLibrary = nil;
+	[_mtlAccelerationStructureLibrary release];
+	_mtlAccelerationStructureLibrary = nil;
 	if (_transferImageMemory) { _transferImageMemory->destroy(); }
 }

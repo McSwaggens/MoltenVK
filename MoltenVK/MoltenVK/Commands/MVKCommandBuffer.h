@@ -377,8 +377,17 @@ public:
 	id<MTLBlitCommandEncoder> getMTLBlitEncoder(MVKCommandUse cmdUse);
 
 	/**
-	 * Returns the current Metal encoder, which may be any of the Metal render,
-	 * compute, or Blit encoders, or nil if no encoding is currently occurring.
+	 * Returns the current Metal acceleration structure encoder for the specified use,
+	 * which determines the label assigned to the returned encoder.
+	 *
+	 * If the current encoder is not an acceleration structure encoder, this function
+	 * ends the current encoder before beginning acceleration structure encoding.
+	 */
+	id<MTLAccelerationStructureCommandEncoder> getMTLAccelerationStructureEncoder(MVKCommandUse cmdUse);
+
+	/**
+	 * Returns the current Metal encoder, which may be any of the Metal render, compute,
+	 * Blit, or acceleration structure encoders, or nil if no encoding is currently occurring.
 	 */
 	id<MTLCommandEncoder> getMTLEncoder();
 
@@ -466,11 +475,13 @@ public:
 	void barrierWait(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages beforeStages);
 	void barrierWait(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder);
 	void barrierWait(MVKBarrierStage stage, id<MTLComputeCommandEncoder> mtlEncoder);
+	void barrierWait(MVKBarrierStage stage, id<MTLAccelerationStructureCommandEncoder> mtlEncoder);
 
 	/** Encode update for a specific stage in given encoder. */
 	void barrierUpdate(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages afterStages);
 	void barrierUpdate(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder);
 	void barrierUpdate(MVKBarrierStage stage, id<MTLComputeCommandEncoder> mtlEncoder);
+	void barrierUpdate(MVKBarrierStage stage, id<MTLAccelerationStructureCommandEncoder> mtlEncoder);
 
 #pragma mark Queries
 
@@ -551,6 +562,7 @@ protected:
 	MVKSmallVector<MVKImageView*, kMVKDefaultAttachmentCount> _attachments;
 	id<MTLComputeCommandEncoder> _mtlComputeEncoder;
 	id<MTLBlitCommandEncoder> _mtlBlitEncoder;
+	id<MTLAccelerationStructureCommandEncoder> _mtlAccelerationStructureEncoder;
 	id<MTLFence> _stageCountersMTLFence;
 	MVKRayTracingPipeline* _rtPipeline = nullptr;
 	MVKPrefillMetalCommandBuffersStyle _prefillStyle;
@@ -561,6 +573,7 @@ protected:
 	MVKCommandUse _mtlComputeEncoderUse;
 	uint32_t _mtlComputeEncoderStages;
 	MVKCommandUse _mtlBlitEncoderUse;
+	MVKCommandUse _mtlAccelerationStructureEncoderUse;
 	bool _isRenderingEntireAttachment;
 	bool _hasMTLRenderEncoderVisibilityResultBuffer;
 };
@@ -577,3 +590,6 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse);
 
 /** Returns a name, suitable for use as a MTLComputeCommandEncoder label, based on the MVKCommandUse. */
 NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse);
+
+/** Returns a name, suitable for use as a MTLAccelerationStructureCommandEncoder label, based on the MVKCommandUse. */
+NSString* mvkMTLAccelerationStructureCommandEncoderLabel(MVKCommandUse cmdUse);

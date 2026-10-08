@@ -172,6 +172,14 @@ id<MTLComputePipelineState> MVKCommandEncodingPool::getConvertUint8IndicesMTLCom
 	MVK_ENC_REZ_ACCESS(_mtlConvertUint8IndicesComputePipelineState, newConvertUint8IndicesMTLComputePipelineState(_commandPool));
 }
 
+id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdConvertAccelerationStructureInstancesMTLComputePipelineState() {
+	MVK_ENC_REZ_ACCESS(_mtlConvertAccelerationStructureInstancesComputePipelineState, newCmdConvertAccelerationStructureInstancesMTLComputePipelineState(_commandPool));
+}
+
+id<MTLComputePipelineState> MVKCommandEncodingPool::getCmdConvertAccelerationStructureTransformsMTLComputePipelineState() {
+	MVK_ENC_REZ_ACCESS(_mtlConvertAccelerationStructureTransformsComputePipelineState, newCmdConvertAccelerationStructureTransformsMTLComputePipelineState(_commandPool));
+}
+
 void MVKCommandEncodingPool::clear() {
 	lock_guard<mutex> lock(_lock);
 	destroyMetalResources();
@@ -272,4 +280,10 @@ void MVKCommandEncodingPool::destroyMetalResources() {
 
     [_mtlConvertUint8IndicesComputePipelineState release];
     _mtlConvertUint8IndicesComputePipelineState = nil;
+
+	[_mtlConvertAccelerationStructureInstancesComputePipelineState release];
+	_mtlConvertAccelerationStructureInstancesComputePipelineState = nil;
+
+	[_mtlConvertAccelerationStructureTransformsComputePipelineState release];
+	_mtlConvertAccelerationStructureTransformsComputePipelineState = nil;
 }

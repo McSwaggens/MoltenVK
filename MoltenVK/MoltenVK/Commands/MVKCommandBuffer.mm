@@ -645,6 +645,9 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
 	case kMVKCommandUseAccumOcclusionQuery:          return kMVKBarrierStageNone; /**< Any command terminating a Metal render pass with active visibility buffer. */
 	case kMVKCommandConvertUint8Indices:             return kMVKBarrierStageCopy; /**< Converting a Uint8 index buffer to Uint16. */
 	case kMVKCommandUseRecordGPUCounterSample:       return kMVKBarrierStageNone; /**< Any command triggering the recording of a GPU counter sample. */
+	case kMVKCommandUseBuildAccelerationStructures:  return kMVKBarrierStageCopy; /**< vkCmdBuildAccelerationStructuresKHR. */
+	case kMVKCommandUseCopyAccelerationStructure:    return kMVKBarrierStageCopy; /**< vkCmdCopyAccelerationStructureKHR. */
+	case kMVKCommandUseWriteAccelerationStructuresProperties: return kMVKBarrierStageCopy; /**< vkCmdWriteAccelerationStructuresPropertiesKHR. */
 	}
 }
 
@@ -677,6 +680,15 @@ void MVKCommandEncoder::barrierWait(MVKBarrierStage stage, id<MTLComputeCommandE
 	}
 }
 
+void MVKCommandEncoder::barrierWait(MVKBarrierStage stage, id<MTLAccelerationStructureCommandEncoder> mtlEncoder) {
+	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
+	for (int i = 0; i < kMVKBarrierStageCount; ++i) {
+		auto fenceIndex = _pEncodingContext->fenceSlots.wait[stage][i];
+		auto fence = _device->getFence((MVKBarrierStage)i, fenceIndex);
+		[mtlEncoder waitForFence:fence];
+	}
+}
+
 void MVKCommandEncoder::barrierUpdate(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages afterStages) {
 	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
 	auto fence = getBarrierStageFence(stage);
@@ -690,6 +702,12 @@ void MVKCommandEncoder::barrierUpdate(MVKBarrierStage stage, id<MTLBlitCommandEn
 }
 
 void MVKCommandEncoder::barrierUpdate(MVKBarrierStage stage, id<MTLComputeCommandEncoder> mtlEncoder) {
+	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
+	auto fence = getBarrierStageFence(stage);
+	[mtlEncoder updateFence:fence];
+}
+
+void MVKCommandEncoder::barrierUpdate(MVKBarrierStage stage, id<MTLAccelerationStructureCommandEncoder> mtlEncoder) {
 	if (!isUsingMetalArgumentBuffers() || !getDevice()->hasResidencySet()) return;
 	auto fence = getBarrierStageFence(stage);
 	[mtlEncoder updateFence:fence];
@@ -742,6 +760,12 @@ void MVKCommandEncoder::encodeBarrierWaits(MVKCommandUse use) {
 			barrierWait(stage, _mtlBlitEncoder);
 		}
 	}
+	if (_mtlAccelerationStructureEncoder) {
+		auto stage = commandUseToBarrierStage(use);
+		if (stage != kMVKBarrierStageNone) {
+			barrierWait(stage, _mtlAccelerationStructureEncoder);
+		}
+	}
 }
 
 void MVKCommandEncoder::encodeBarrierUpdates() {
@@ -762,6 +786,13 @@ void MVKCommandEncoder::encodeBarrierUpdates() {
 		MVKBarrierStage stage = commandUseToBarrierStage(_mtlBlitEncoderUse);
 		if (stage != kMVKBarrierStageNone) {
 			barrierUpdate(stage, _mtlBlitEncoder);
+		}
+	}
+
+	if (_mtlAccelerationStructureEncoder) {
+		MVKBarrierStage stage = commandUseToBarrierStage(_mtlAccelerationStructureEncoderUse);
+		if (stage != kMVKBarrierStageNone) {
+			barrierUpdate(stage, _mtlAccelerationStructureEncoder);
 		}
 	}
 }
@@ -1078,6 +1109,10 @@ void MVKCommandEncoder::endCurrentMetalEncoding() {
 	endMetalEncoding(_mtlBlitEncoder);
     _mtlBlitEncoderUse = kMVKCommandUseNone;
 
+	if (_mtlAccelerationStructureEncoder && _cmdBuffer->_hasStageCounterTimestampCommand) { [_mtlAccelerationStructureEncoder updateFence: getStageCountersMTLFence()]; }
+	endMetalEncoding(_mtlAccelerationStructureEncoder);
+	_mtlAccelerationStructureEncoderUse = kMVKCommandUseNone;
+
 	encodeTimestampStageCounterSamples();
 }
 
@@ -1150,10 +1185,30 @@ id<MTLBlitCommandEncoder> MVKCommandEncoder::getMTLBlitEncoder(MVKCommandUse cmd
 	return _mtlBlitEncoder;
 }
 
+id<MTLAccelerationStructureCommandEncoder> MVKCommandEncoder::getMTLAccelerationStructureEncoder(MVKCommandUse cmdUse) {
+	bool needWaits = false;
+	if ( !_mtlAccelerationStructureEncoder ) {
+		needWaits = true;
+		endCurrentMetalEncoding();
+		_mtlAccelerationStructureEncoder = [_mtlCmdBuffer accelerationStructureCommandEncoder];
+		retainIfImmediatelyEncoding(_mtlAccelerationStructureEncoder);
+	}
+	if (_mtlAccelerationStructureEncoderUse != cmdUse) {
+		needWaits = true;
+		_mtlAccelerationStructureEncoderUse = cmdUse;
+		_cmdBuffer->setMetalObjectLabel(_mtlAccelerationStructureEncoder, mvkMTLAccelerationStructureCommandEncoderLabel(cmdUse));
+	}
+	if (needWaits) {
+		encodeBarrierWaits(cmdUse);
+	}
+	return _mtlAccelerationStructureEncoder;
+}
+
 id<MTLCommandEncoder> MVKCommandEncoder::getMTLEncoder(){
 	if (_mtlRenderEncoder) { return _mtlRenderEncoder; }
 	if (_mtlComputeEncoder) { return _mtlComputeEncoder; }
 	if (_mtlBlitEncoder) { return _mtlBlitEncoder; }
+	if (_mtlAccelerationStructureEncoder) { return _mtlAccelerationStructureEncoder; }
 	return nil;
 }
 
@@ -1375,6 +1430,8 @@ MVKCommandEncoder::MVKCommandEncoder(MVKCommandBuffer* cmdBuffer, MVKPrefillMeta
 	_mtlComputeEncoderStages = 0;
 	_mtlBlitEncoder = nil;
 	_mtlBlitEncoderUse = kMVKCommandUseNone;
+	_mtlAccelerationStructureEncoder = nil;
+	_mtlAccelerationStructureEncoderUse = kMVKCommandUseNone;
 	_pEncodingContext = nullptr;
 	_stageCountersMTLFence = nil;
 	_flushCount = 0;
@@ -1384,6 +1441,7 @@ MVKCommandEncoder::~MVKCommandEncoder() {
 	[_mtlRenderEncoder release];
 	[_mtlComputeEncoder release];
 	[_mtlBlitEncoder release];
+	[_mtlAccelerationStructureEncoder release];
 	// _stageCountersMTLFence is released after Metal command buffer completion
 }
 
@@ -1420,6 +1478,8 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse) {
         case kMVKCommandUseResetQueryPool:                  return @"vkCmdResetQueryPool BlitEncoder";
         case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults BlitEncoder";
 		case kMVKCommandUseRecordGPUCounterSample:          return @"Record GPU Counter Sample BlitEncoder";
+		case kMVKCommandUseCopyAccelerationStructure:       return @"vkCmdCopyAccelerationStructureKHR BlitEncoder";
+		case kMVKCommandUseWriteAccelerationStructuresProperties: return @"vkCmdWriteAccelerationStructuresPropertiesKHR BlitEncoder";
         default:                                            return @"Unknown Use BlitEncoder";
     }
 }
@@ -1438,6 +1498,16 @@ NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse) {
         case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults ComputeEncoder";
         case kMVKCommandUseAccumOcclusionQuery:             return @"Post-render-pass occlusion query accumulation ComputeEncoder";
         case kMVKCommandConvertUint8Indices:                return @"Convert Uint8 indices to Uint16 ComputeEncoder";
+		case kMVKCommandUseBuildAccelerationStructures:     return @"vkCmdBuildAccelerationStructuresKHR ComputeEncoder";
         default:                                            return @"Unknown Use ComputeEncoder";
     }
+}
+
+NSString* mvkMTLAccelerationStructureCommandEncoderLabel(MVKCommandUse cmdUse) {
+	switch (cmdUse) {
+		case kMVKCommandUseBuildAccelerationStructures:            return @"vkCmdBuildAccelerationStructuresKHR AccelerationStructureEncoder";
+		case kMVKCommandUseCopyAccelerationStructure:              return @"vkCmdCopyAccelerationStructureKHR AccelerationStructureEncoder";
+		case kMVKCommandUseWriteAccelerationStructuresProperties:  return @"vkCmdWriteAccelerationStructuresPropertiesKHR AccelerationStructureEncoder";
+		default:                                                   return @"Unknown Use AccelerationStructureEncoder";
+	}
 }

@@ -98,8 +98,12 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 		hitGroupIndices = mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _hitSBT);
 	}
 
+	// Top-level acceleration structures reference bottom-level acceleration structures by device address.
+	MVKUseResourceHelper& rez = cmdEncoder->getState().mtlShared()._useResource;
+	cmdEncoder->getDevice()->encodeAccelerationStructures(rez, MVKResourceUsageStages::Compute);
+	rez.bindAndResetCompute(mtlEncoder);
+
 	id<MTLBuffer> instanceSBTOffsetBuffer = nil;
-	id<MTLBuffer> instanceFlagsBuffer = nil;
 	auto& vk = cmdEncoder->getState().vkCompute();
 	// Collect descriptor set GPU buffers in a single pass for later IFT binding.
 	struct DescSetInfo { id<MTLBuffer> gpuBuffer; NSUInteger gpuOffset; };
@@ -116,33 +120,29 @@ void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 			if (!set || !setLayout || !set->cpuBuffer) { continue; }
 
 			for (const auto& binding : setLayout->bindings()) {
-				if (binding.descriptorType != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR ||
-					binding.cpuLayout != MVKDescriptorCPULayout::OneID ||
-					!binding.descriptorCount) {
+				if (binding.descriptorType != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR || !binding.descriptorCount) {
 					continue;
 				}
 
-				auto* desc = reinterpret_cast<id<MTLAccelerationStructure>*>(set->cpuBuffer + binding.cpuOffset);
+				auto* desc = reinterpret_cast<const MVKCPUDescriptorOneID2Meta*>(set->cpuBuffer + binding.cpuOffset);
 				uint32_t descriptorCount = binding.getDescriptorCount(set->variableDescriptorCount);
-				for (uint32_t i = 0; i < descriptorCount; i++) {
-					if (auto* mvkAS = MVKAccelerationStructure::getMVKAccelerationStructure(desc[i])) {
-						mvkAS->encodeResourceUsage(mtlEncoder);
-						if (!instanceSBTOffsetBuffer) {
-							instanceSBTOffsetBuffer = mvkAS->getInstanceShaderBindingTableOffsetBuffer();
-						}
-						if (!instanceFlagsBuffer) {
-							instanceFlagsBuffer = mvkAS->getInstanceFlagsBuffer();
-						}
+				for (uint32_t i = 0; i < descriptorCount && !instanceSBTOffsetBuffer; i++) {
+					if (auto* mvkAS = cmdEncoder->getDevice()->getAccelerationStructureHeaderPool()->getAccelerationStructure(desc[i].a)) {
+						instanceSBTOffsetBuffer = mvkAS->getInstanceShaderBindingTableOffsetBuffer();
 					}
 				}
 			}
 		}
 	}
-	[mtlEncoder setBuffer: instanceSBTOffsetBuffer
-				   offset: 0
+	// Metal applies the instance flags, so the pipeline sees none. Without instances, it sees no SBT offsets either.
+	NSUInteger instanceDataLength = instanceSBTOffsetBuffer ? instanceSBTOffsetBuffer.length : sizeof(uint32_t);
+	const MVKMTLBufferAllocation* zeroInstanceDataAlloc = cmdEncoder->getTempMTLBuffer(instanceDataLength);
+	mvkClear((uint8_t*)zeroInstanceDataAlloc->getContents(), instanceDataLength);
+	[mtlEncoder setBuffer: instanceSBTOffsetBuffer ? instanceSBTOffsetBuffer : zeroInstanceDataAlloc->_mtlBuffer
+				   offset: instanceSBTOffsetBuffer ? 0 : zeroInstanceDataAlloc->_offset
 				  atIndex: MVKRayTracingPipeline::kInstanceSBTOffsetBufferIndex];
-	[mtlEncoder setBuffer: instanceFlagsBuffer
-				   offset: 0
+	[mtlEncoder setBuffer: zeroInstanceDataAlloc->_mtlBuffer
+				   offset: zeroInstanceDataAlloc->_offset
 				  atIndex: MVKRayTracingPipeline::kInstanceFlagsBufferIndex];
 
 	// Bind the intersection function table if present (for AABB geometry).
