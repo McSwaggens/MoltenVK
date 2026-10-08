@@ -200,6 +200,11 @@ public:
 
 protected:
 	void propagateDebugName() override {}
+	void initComputeShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig,
+										   MVKImplicitBufferBindings& implicitBuffers,
+										   const VkPipelineShaderStageCreateInfo* pShaderStage,
+										   spv::ExecutionModel execModel);
+	uint32_t getComputeImplicitBufferIndex(uint32_t bufferIndexOffset);
 
 	MVKPipelineLayout* _layout;
 	MVKPipelineCache* _pipelineCache;
@@ -233,6 +238,7 @@ struct MVKPipelineStageResourceInfo {
 	MVKPipelineBindScript bindScript;
 	MVKImplicitBufferBindings implicitBuffers;
 	bool usesPhysicalStorageBufferAddresses;
+	bool usesAccelerationStructures;
 	MVKStageResourceBits resources;
 };
 
@@ -452,7 +458,6 @@ public:
 protected:
     MVKMTLFunction getMTLFunction(const VkComputePipelineCreateInfo* pCreateInfo,
 								  VkPipelineCreationFeedback* pStageFB);
-	uint32_t getImplicitBufferIndex(uint32_t bufferIndexOffset);
 
     id<MTLComputePipelineState> _mtlPipelineState;
 	MVKPipelineStageResourceInfo _stageResources = {};
@@ -467,37 +472,51 @@ protected:
 #pragma mark -
 #pragma mark MVKRayTracingPipeline
 
-/** Represents a Vulkan ray tracing pipeline. */
+/** The size in bytes of a ray tracing shader group handle. */
+static constexpr uint32_t kMVKRayTracingShaderGroupHandleSize = 32;
+
+/** The maximum size in bytes of the hit attributes of a ray tracing intersection. */
+static constexpr uint32_t kMVKRayTracingMaxHitAttributeSize = 32;
+
+/** The maximum recursion depth of the rays traced by a ray tracing pipeline. */
+static constexpr uint32_t kMVKRayTracingMaxRecursionDepth = 31;
+
+/**
+ * Represents a Vulkan ray tracing pipeline.
+ *
+ * Each shader stage is compiled into a visible function, and all stage functions are linked into a Metal compute
+ * pipeline, whose kernel is a small trampoline that calls the ray generation shader of the dispatch. Shaders call
+ * each other through a visible function table, whose entries are indexed by the shader group table of the pipeline.
+ */
 class MVKRayTracingPipeline : public MVKPipeline {
 
 public:
-	static constexpr uint32_t kInstanceFlagsBufferIndex = 25;
-	static constexpr uint32_t kMissSBTBufferIndex = 26;
-	static constexpr uint32_t kHitSBTBufferIndex = 27;
-	static constexpr uint32_t kCallableSBTBufferIndex = 28;
-	static constexpr uint32_t kInstanceSBTOffsetBufferIndex = 29;
-	static constexpr uint32_t kIntersectionFunctionTableBufferIndex = 30;
 
-	/** Returns the compiled Metal compute pipeline state for the ray generation shader. */
-	id<MTLComputePipelineState> getMTLComputePipelineState() { return _mtlPipelineState; }
+	/** Returns the Metal compute pipeline state of this pipeline. */
+	id<MTLComputePipelineState> getPipelineState() const { return _mtlPipelineState; }
 
-	/** Returns the intersection function table, or nil if no intersection shader. */
-	id<MTLIntersectionFunctionTable> getMTLIntersectionFunctionTable() { return _mtlIntersectionFunctionTable; }
-	bool usesIntersectionFunctionTable() const { return _mtlIntersectionFunctionHandle != nil; }
-	void updateMTLIntersectionFunctionTable(const std::vector<uint32_t>& hitGroupIndices);
+	/** Returns the visible function table holding the shader stage functions of this pipeline. */
+	id<MTLVisibleFunctionTable> getMTLFunctionTable() const { return _mtlFunctionTable; }
 
-	/** Returns the threadgroup size for dispatch. */
-	const MTLSize& getThreadgroupSize() const { return _mtlThreadgroupSize; }
+	/** Returns the buffer holding the function table indices of the shaders of each shader group. */
+	id<MTLBuffer> getMTLGroupTable() const { return _mtlGroupTable; }
 
-	bool needsMissShaderBindingTable() const { return _needsMissShaderBindingTable; }
-	bool needsHitShaderBindingTable() const { return _needsHitShaderBindingTable; }
-	bool needsCallableShaderBindingTable() const { return _needsCallableShaderBindingTable; }
+	/** Returns info about the resources used by the shader stages of this pipeline, which all run in the Metal compute stage. */
+	const MVKPipelineStageResourceInfo& getStageResources() const { return _stageResources; }
 
-	/** Returns the shader group handles for this pipeline. */
-	VkResult getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount,
-								   size_t dataSize, void* pData);
+	/** Returns the threadgroup size of an indirect dispatch. */
+	MTLSize getThreadgroupSize() const { return _mtlThreadgroupSize; }
 
-	/** Returns the stack size for the given shader group. */
+	/** Returns the threadgroup size of a dispatch with the given launch size. */
+	MTLSize getThreadgroupSize(MTLSize launchSize) const;
+
+	/** Returns the maximum recursion depth of the rays traced by this pipeline. */
+	uint32_t getMaxRecursionDepth() const { return _maxRecursionDepth; }
+
+	/** Populates the specified memory with the handles of the specified shader groups. */
+	VkResult getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void* pData);
+
+	/** Returns the stack size of the specified shader of the specified shader group. */
 	VkDeviceSize getShaderGroupStackSize(uint32_t group, VkShaderGroupShaderKHR groupShader);
 
 	/** Constructs an instance for the device and parent (which may be NULL). */
@@ -509,23 +528,23 @@ public:
 	~MVKRayTracingPipeline() override;
 
 protected:
-	void propagateDebugName() override {}
-	std::string getMSLSource(const VkPipelineShaderStageCreateInfo* pStage,
-							 spv::ExecutionModel execModel,
-							 const std::string& funcName);
+	bool validateLayout();
+	bool compileStages(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
+					   const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo,
+					   MVKSmallVector<MVKMTLFunction>& functions,
+					   MVKSmallVector<uint32_t>& stageFunctionIndices);
+	std::string getKernelMSL();
+	bool initMTLPipelineState(MVKSmallVector<MVKMTLFunction>& functions);
+	void initGroupTable(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo, const MVKSmallVector<uint32_t>& stageFunctionIndices);
 
 	id<MTLComputePipelineState> _mtlPipelineState = nil;
-	id<MTLIntersectionFunctionTable> _mtlIntersectionFunctionTable = nil;
-	id<MTLFunctionHandle> _mtlIntersectionFunctionHandle = nil;
-	MTLSize _mtlThreadgroupSize = {1, 1, 1};
-	MVKSmallVector<VkRayTracingShaderGroupCreateInfoKHR> _shaderGroups;
-	uint32_t _shaderGroupCount = 0;
-	uint32_t _maxRecursionDepth = 1;
-	uint32_t _mtlIntersectionFunctionTableCount = 0;
-	MTLIntersectionFunctionSignature _mtlIntersectionFunctionSignature = MTLIntersectionFunctionSignatureNone;
-	bool _needsMissShaderBindingTable = false;
-	bool _needsHitShaderBindingTable = false;
-	bool _needsCallableShaderBindingTable = false;
+	id<MTLVisibleFunctionTable> _mtlFunctionTable = nil;
+	id<MTLBuffer> _mtlGroupTable = nil;
+	MVKPipelineStageResourceInfo _stageResources = {};
+	MVKSmallVector<MVKShaderModule*> _ownedModules;
+	MTLSize _mtlThreadgroupSize = MTLSizeMake(1, 1, 1);
+	uint32_t _groupCount = 0;
+	uint32_t _maxRecursionDepth = 0;
 };
 
 

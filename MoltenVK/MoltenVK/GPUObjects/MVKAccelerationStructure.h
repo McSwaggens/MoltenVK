@@ -81,6 +81,9 @@ public:
 	void setReferencedBLASes(NSArray<id<MTLAccelerationStructure>>* blasArray);
 
 	static MVKAccelerationStructure* getMVKAccelerationStructure(id<MTLAccelerationStructure> mtlAS);
+
+	/** Adds the Metal resources of all acceleration structures of the device to the resource usage helper. */
+	static void encodeAccelerationStructures(MVKDevice* device, MVKUseResourceHelper& resources, MVKResourceUsageStages stage);
 	static MVKAccelerationStructure* getMVKAccelerationStructure(VkDeviceAddress deviceAddress);
 
 	MVKAccelerationStructure(MVKDevice* device, const VkAccelerationStructureCreateInfoKHR* pCreateInfo);

@@ -25,12 +25,8 @@
 #include "MVKStrings.h"
 #include "MTLRenderPipelineDescriptor+MoltenVK.h"
 #include "mvk_datatypes.hpp"
-#include <cstring>
 #include <sys/stat.h>
-#include <iomanip>
 #include <sstream>
-#include <sstream>
-#include <unordered_set>
 
 #ifndef MVK_USE_CEREAL
 #define MVK_USE_CEREAL (1)
@@ -51,7 +47,7 @@ using namespace SPIRV_CROSS_NAMESPACE;
 #pragma mark - MVKPipelineLayout
 
 bool MVKPipelineLayout::stageUsesPushConstants(MVKShaderStage stage) const {
-	return mvkIsAnyFlagEnabled(_pushConstantStages, mvkVkShaderStageFlagsFromMVKShaderStage(stage));
+	return mvkIsAnyFlagEnabled(_pushConstantStages, mvkVkShaderStageFlagsBoundToMVKShaderStage(stage));
 }
 
 /** Gets the layout for use with the Metal binding API (rather than argument buffers). */
@@ -196,7 +192,7 @@ void MVKPipelineLayout::populateShaderConversionConfig(SPIRVToMSLConversionConfi
 			MVKShaderStageResourceBinding resCount = desc.totalResourceCount();
 			for (uint32_t i = 0; i < kMVKShaderStageCount; i++) {
 				auto stage = static_cast<MVKShaderStage>(i);
-				bool used = mvkIsAnyFlagEnabled(desc.stageFlags, mvkVkShaderStageFlagsFromMVKShaderStage(stage));
+				bool used = mvkIsAnyFlagEnabled(desc.stageFlags, mvkVkShaderStageFlagsBoundToMVKShaderStage(stage));
 				if (argbuf) {
 					binding.stages[stage].textureIndex = argBufResIdx;
 					binding.stages[stage].bufferIndex = argBufResIdx + resCount.textureIndex;
@@ -439,6 +435,7 @@ MVKPipeline::~MVKPipeline() {
 /** Populate a MVKStageResourceBits based on the resources used by the given shader info. */
 static void populateResourceUsage(MVKPipelineStageResourceInfo& dst, SPIRVToMSLConversionConfiguration& src, SPIRVToMSLConversionResultInfo& results, spv::ExecutionModel stage) {
 	dst.usesPhysicalStorageBufferAddresses = results.usesPhysicalStorageBufferAddressesCapability;
+	dst.usesAccelerationStructures = results.usesAccelerationStructures;
 	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::Swizzle,       results.needsSwizzleBuffer);
 	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::Output,        results.needsOutputBuffer);
 	dst.implicitBuffers.needed |= MVKImplicitBufferList(MVKImplicitBuffer::PatchOutput,   results.needsPatchOutputBuffer);
@@ -1410,6 +1407,9 @@ static constexpr const char* getImplicitBufferName(MVKImplicitBuffer buffer) {
 		case MVKImplicitBuffer::Index:          return "index";
 		case MVKImplicitBuffer::DispatchBase:   return "dispatch base";
 		case MVKImplicitBuffer::DrawId:         return "draw ID";
+		case MVKImplicitBuffer::RayTracingDispatchParams: return "ray tracing dispatch parameter";
+		case MVKImplicitBuffer::RayTracingGroupTable:     return "ray tracing shader group table";
+		case MVKImplicitBuffer::RayTracingFunctionTable:  return "ray tracing function table";
 		case MVKImplicitBuffer::Count:          break;
 	}
 	assert(0);
@@ -2348,6 +2348,55 @@ MVKGraphicsPipeline::~MVKGraphicsPipeline() {
 #pragma mark -
 #pragma mark MVKComputePipeline
 
+// Initializes the shader conversion config of a shader stage that runs in a Metal compute pipeline.
+void MVKPipeline::initComputeShaderConversionConfig(SPIRVToMSLConversionConfiguration& shaderConfig,
+													MVKImplicitBufferBindings& implicitBuffers,
+													const VkPipelineShaderStageCreateInfo* pShaderStage,
+													spv::ExecutionModel execModel) {
+	auto& mtlFeats = getMetalFeatures();
+	auto& mvkCfg = getMVKConfig();
+	shaderConfig.options.entryPointName = pShaderStage->pName;
+	shaderConfig.options.entryPointStage = execModel;
+    shaderConfig.options.mslOptions.msl_version = mtlFeats.mslVersion;
+    shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
+    shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
+    shaderConfig.options.mslOptions.swizzle_texture_samples = !mtlFeats.nativeTextureSwizzle;
+	shaderConfig.options.mslOptions.texture_buffer_native = true;
+	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
+    shaderConfig.options.mslOptions.fixed_subgroup_size = mvkIsAnyFlagEnabled(pShaderStage->flags, VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT) ? 0 : mtlFeats.maxSubgroupSize;
+
+	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
+	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
+	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
+	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
+	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)mtlFeats.argumentBuffersTier;
+
+#if MVK_MACOS
+    shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.simdPermute;
+#else
+    shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.quadPermute;
+    shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
+#endif
+
+	_layout->populateShaderConversionConfig(shaderConfig);
+
+	// Set implicit buffer indices
+	// FIXME: Many of these are optional. We shouldn't set the ones that aren't
+	// present--or at least, we should move the ones that are down to avoid running over
+	// the limit of available buffers. But we can't know that until we compile the shaders.
+	implicitBuffers.ids[MVKImplicitBuffer::DynamicOffset] = getComputeImplicitBufferIndex(0);
+	implicitBuffers.ids[MVKImplicitBuffer::BufferSize]    = getComputeImplicitBufferIndex(1);
+	implicitBuffers.ids[MVKImplicitBuffer::Swizzle]       = getComputeImplicitBufferIndex(2);
+
+	addCommonImplicitBuffersToShaderConfig(shaderConfig, implicitBuffers.ids);
+	shaderConfig.options.mslOptions.replace_recursive_inputs = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0);
+}
+
+// Implicit buffers of shader stages that run in a Metal compute pipeline are allocated from the top of the buffer index range.
+uint32_t MVKPipeline::getComputeImplicitBufferIndex(uint32_t bufferIndexOffset) {
+	return getMetalFeatures().maxPerStageBufferCount - (bufferIndexOffset + 1);
+}
+
 MVKComputePipeline::MVKComputePipeline(MVKDevice* device,
 									   MVKPipelineCache* pipelineCache,
 									   MVKPipeline* parent,
@@ -2432,48 +2481,11 @@ MVKMTLFunction MVKComputePipeline::getMTLFunction(const VkComputePipelineCreateI
 
 	warnIfUnsupportedRobustnessEnabled(this, pSS);
 
-	auto& mtlFeats = getMetalFeatures();
-	auto& mvkCfg = getMVKConfig();
     SPIRVToMSLConversionConfiguration shaderConfig;
-	shaderConfig.options.entryPointName = pCreateInfo->stage.pName;
-	shaderConfig.options.entryPointStage = spv::ExecutionModelGLCompute;
-    shaderConfig.options.mslOptions.msl_version = mtlFeats.mslVersion;
-    shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
-    shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
-    shaderConfig.options.mslOptions.swizzle_texture_samples = !mtlFeats.nativeTextureSwizzle;
-	shaderConfig.options.mslOptions.texture_buffer_native = true;
+	initComputeShaderConversionConfig(shaderConfig, _stageResources.implicitBuffers, pSS, spv::ExecutionModelGLCompute);
 	shaderConfig.options.mslOptions.dispatch_base = _allowsDispatchBase;
-	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
-    shaderConfig.options.mslOptions.fixed_subgroup_size = mvkIsAnyFlagEnabled(pSS->flags, VK_PIPELINE_SHADER_STAGE_CREATE_ALLOW_VARYING_SUBGROUP_SIZE_BIT) ? 0 : mtlFeats.maxSubgroupSize;
-
-	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
-	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
-	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
-	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
-	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)getMetalFeatures().argumentBuffersTier;
-
-#if MVK_MACOS
-    shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.simdPermute;
-#else
-    shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.quadPermute;
-    shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
-#endif
-
-	MVKPipelineLayout* layout = (MVKPipelineLayout*)pCreateInfo->layout;
-	layout->populateShaderConversionConfig(shaderConfig);
-
-	// Set implicit buffer indices
-	// FIXME: Many of these are optional. We shouldn't set the ones that aren't
-	// present--or at least, we should move the ones that are down to avoid running over
-	// the limit of available buffers. But we can't know that until we compile the shaders.
-	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::DynamicOffset] = getImplicitBufferIndex(0);
-	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::BufferSize]    = getImplicitBufferIndex(1);
-	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::Swizzle]       = getImplicitBufferIndex(2);
-	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::DispatchBase]  = getImplicitBufferIndex(3);
-
-	addCommonImplicitBuffersToShaderConfig(shaderConfig, _stageResources.implicitBuffers.ids);
+	_stageResources.implicitBuffers.ids[MVKImplicitBuffer::DispatchBase] = getComputeImplicitBufferIndex(3);
 	shaderConfig.options.mslOptions.indirect_params_buffer_index = _stageResources.implicitBuffers.ids[MVKImplicitBuffer::DispatchBase];
-	shaderConfig.options.mslOptions.replace_recursive_inputs = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0);
 
     MVKMTLFunction func = _module->getMTLFunction(&shaderConfig, pSS->pSpecializationInfo, this, pStageFB);
 	if ( !func.getMTLFunction() ) {
@@ -2490,9 +2502,6 @@ MVKMTLFunction MVKComputePipeline::getMTLFunction(const VkComputePipelineCreateI
 	return func;
 }
 
-uint32_t MVKComputePipeline::getImplicitBufferIndex(uint32_t bufferIndexOffset) {
-	return getMetalFeatures().maxPerStageBufferCount - (bufferIndexOffset + 1);
-}
 
 MVKComputePipeline::~MVKComputePipeline() {
 	@synchronized (getMTLDevice()) {
@@ -2505,2393 +2514,400 @@ MVKComputePipeline::~MVKComputePipeline() {
 #pragma mark -
 #pragma mark MVKRayTracingPipeline
 
-MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
-                                             MVKPipelineCache* pipelineCache,
-                                             MVKPipeline* parent,
-                                             const VkRayTracingPipelineCreateInfoKHR* pCreateInfo)
-	: MVKPipeline(device, pipelineCache,
-				  (MVKPipelineLayout*)pCreateInfo->layout,
-				  (VkPipelineCreateFlags2)pCreateInfo->flags, parent) {
+/** The Vulkan shader stages of a ray tracing pipeline. */
+static constexpr VkShaderStageFlags kMVKRayTracingShaderStages = (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+																   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
+																   VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR);
 
-	_shaderGroupCount = pCreateInfo->groupCount;
+/**
+ * The depth of nested callable shader calls that the call stack of a ray tracing pipeline accommodates,
+ * in addition to the shaders invoked by ray traversal. This is generous compared to the two levels of
+ * callable shaders covered by the default Vulkan pipeline stack size, because the stack size may be dynamic.
+ */
+static constexpr uint32_t kMVKRayTracingMaxCallableDepth = 16;
+
+/** Describes a ray tracing shader stage. */
+struct MVKRayTracingStageInfo {
+	spv::ExecutionModel execModel;
+	const char* functionName;	/**< The prefix of the names of the visible functions compiled from shaders of the stage. */
+	const char* displayName;
+};
+
+static MVKRayTracingStageInfo getRayTracingStageInfo(VkShaderStageFlagBits stage) {
+	switch (stage) {
+		case VK_SHADER_STAGE_RAYGEN_BIT_KHR:       return { spv::ExecutionModelRayGenerationKHR, "raygen",       "Ray generation" };
+		case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:      return { spv::ExecutionModelAnyHitKHR,        "anyhit",       "Any hit" };
+		case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR:  return { spv::ExecutionModelClosestHitKHR,    "closesthit",   "Closest hit" };
+		case VK_SHADER_STAGE_MISS_BIT_KHR:         return { spv::ExecutionModelMissKHR,          "miss",         "Miss" };
+		case VK_SHADER_STAGE_INTERSECTION_BIT_KHR: return { spv::ExecutionModelIntersectionKHR,  "intersection", "Intersection" };
+		case VK_SHADER_STAGE_CALLABLE_BIT_KHR:     return { spv::ExecutionModelCallableKHR,      "callable",     "Callable" };
+		default:                                   return { spv::ExecutionModelMax,              "",             "Unknown" };
+	}
+}
+
+static bool areEqual(const VkSpecializationInfo* pSpecInfo1, const VkSpecializationInfo* pSpecInfo2) {
+	if (pSpecInfo1 == pSpecInfo2) { return true; }
+	if ( !pSpecInfo1 || !pSpecInfo2 ) { return false; }
+	return (pSpecInfo1->mapEntryCount == pSpecInfo2->mapEntryCount &&
+			pSpecInfo1->dataSize == pSpecInfo2->dataSize &&
+			( !pSpecInfo1->mapEntryCount || memcmp(pSpecInfo1->pMapEntries, pSpecInfo2->pMapEntries, pSpecInfo1->mapEntryCount * sizeof(VkSpecializationMapEntry)) == 0) &&
+			( !pSpecInfo1->dataSize || memcmp(pSpecInfo1->pData, pSpecInfo2->pData, pSpecInfo1->dataSize) == 0));
+}
+
+MVKRayTracingPipeline::MVKRayTracingPipeline(MVKDevice* device,
+											 MVKPipelineCache* pipelineCache,
+											 MVKPipeline* parent,
+											 const VkRayTracingPipelineCreateInfoKHR* pCreateInfo) :
+	MVKPipeline(device, pipelineCache, (MVKPipelineLayout*)pCreateInfo->layout, getPipelineCreateFlags(pCreateInfo), parent) {
+
+	_groupCount = pCreateInfo->groupCount;
 	_maxRecursionDepth = pCreateInfo->maxPipelineRayRecursionDepth;
 
-	// Copy shader group definitions for later SBT handle queries.
-	_shaderGroups.resize(_shaderGroupCount);
-	for (uint32_t i = 0; i < _shaderGroupCount; i++) {
-		_shaderGroups[i] = pCreateInfo->pGroups[i];
-	}
-
-	if (pCreateInfo->stageCount == 0) {
-		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
-			"Ray tracing pipeline requires at least one shader stage."));
-		return;
-	}
-
-	// Find the ray generation shader stage. In Vulkan, it's the stage referenced
-	// by a VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR group.
-	// The raygen shader is compiled as a Metal compute kernel via ExecutionModelGLCompute,
-	// but the SPIR-V entry point uses ExecutionModelRayGenerationKHR.
-	const VkPipelineShaderStageCreateInfo* pRaygenStage = nullptr;
-	for (uint32_t g = 0; g < _shaderGroupCount; g++) {
-		auto& group = pCreateInfo->pGroups[g];
-		if (group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR &&
-			group.generalShader != VK_SHADER_UNUSED_KHR) {
-			auto& stage = pCreateInfo->pStages[group.generalShader];
-			if (stage.stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR) {
-				pRaygenStage = &stage;
-				break;
-			}
-		}
-	}
-
-	if (!pRaygenStage) {
-		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
-			"Ray tracing pipeline has no ray generation shader stage."));
-		return;
-	}
-
-	// Check if there are any non-raygen shader stages.
-	bool hasNonRaygenStages = false;
-	bool hasIntersection = false;
-	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
-		auto& stage = pCreateInfo->pStages[i];
-		switch (stage.stage) {
-			case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR: hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:     hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_MISS_BIT_KHR:        hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR: hasIntersection = hasNonRaygenStages = true; break;
-			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:    hasNonRaygenStages = true; break;
-			default: break;
-		}
-	}
-
-	// RT builtin struct definition — passed from raygen to chit/miss/ahit helpers.
-	static const char* kMVKRTBuiltinsStruct =
-		"struct _MVKRTBuiltins {\n"
-		"    float3 worldRayOrigin;\n"
-		"    float3 worldRayDirection;\n"
-		"    float3 objectRayOrigin;\n"
-		"    float3 objectRayDirection;\n"
-		"    float4x3 worldToObjectTransform;\n"
-		"    float4x3 objectToWorldTransform;\n"
-		"    float rayTmin;\n"
-		"    float rayTmax;\n"
-		"    uint primitiveId;\n"
-		"    uint instanceId;\n"
-		"    uint geometryId;\n"
-		"    uint instanceCustomIndex;\n"
-		"    uint hitKind;\n"
-		"    uint incomingRayFlags;\n"
-		"};\n\n";
-
-	// Mapping from SPIRV-Cross parameter variable names to struct members.
-	// SPIRV-Cross emits these as function parameter names for visible functions.
-	static const std::pair<const char*, const char*> rtBuiltinMap[] = {
-		{"gl_WorldRayOriginEXT", "worldRayOrigin"},
-		{"gl_WorldRayDirectionEXT", "worldRayDirection"},
-		{"gl_ObjectRayOriginEXT", "objectRayOrigin"},
-		{"gl_ObjectRayDirectionEXT", "objectRayDirection"},
-		{"gl_BuiltIn_5321", "worldRayOrigin"},
-		{"gl_BuiltIn_5322", "worldRayDirection"},
-		{"gl_BuiltIn_5323", "objectRayOrigin"},
-		{"gl_BuiltIn_5324", "objectRayDirection"},
-		{"gl_WorldToObjectEXT", "worldToObjectTransform"},
-		{"gl_ObjectToWorldEXT", "objectToWorldTransform"},
-		{"gl_WorldToObject3x4EXT", "worldToObjectTransform"},
-		{"gl_ObjectToWorld3x4EXT", "objectToWorldTransform"},
-		{"gl_BuiltIn_5330", "objectToWorldTransform"},
-		{"gl_BuiltIn_5331", "worldToObjectTransform"},
-		{"gl_RayTminEXT", "rayTmin"},
-		{"gl_RayTmaxEXT", "rayTmax"},
-		{"gl_BuiltIn_5325", "rayTmin"},
-		{"gl_BuiltIn_5326", "rayTmax"},
-		{"gl_PrimitiveID", "primitiveId"},
-		{"gl_InstanceID", "instanceId"},
-		{"gl_GeometryIndexEXT", "geometryId"},
-		{"gl_InstanceCustomIndexEXT", "instanceCustomIndex"},
-		{"gl_BuiltIn_5327", "instanceCustomIndex"},
-		{"gl_HitKindEXT", "hitKind"},
-		{"gl_HitTEXT", "rayTmax"},
-		{"gl_IncomingRayFlagsEXT", "incomingRayFlags"},
-		{"gl_BuiltIn_5333", "hitKind"},
-		{"gl_BuiltIn_5351", "incomingRayFlags"},
-		{"gl_BuiltIn_5352", "geometryId"},
-		// NV variants
-		{"gl_WorldRayOriginNV", "worldRayOrigin"},
-		{"gl_WorldRayDirectionNV", "worldRayDirection"},
-		{"gl_ObjectRayOriginNV", "objectRayOrigin"},
-		{"gl_ObjectRayDirectionNV", "objectRayDirection"},
-		{"gl_WorldToObjectNV", "worldToObjectTransform"},
-		{"gl_ObjectToWorldNV", "objectToWorldTransform"},
-		{"gl_RayTminNV", "rayTmin"},
-		{"gl_RayTmaxNV", "rayTmax"},
-		{"gl_HitTNV", "rayTmax"},
-		{"gl_PrimitiveIDNV", "primitiveId"},
-		{"gl_InstanceIDNV", "instanceId"},
-		{"gl_InstanceCustomIndexNV", "instanceCustomIndex"},
-		{"gl_HitKindNV", "hitKind"},
-		{"gl_GeometryIndexNV", "geometryId"},
-		{"gl_IncomingRayFlagsNV", "incomingRayFlags"},
-		{nullptr, nullptr}
-	};
-
-	auto findWholeIdentifier = [](const std::string& text, const std::string& word, size_t startPos = 0) -> bool {
-		size_t pos = startPos;
-		while ((pos = text.find(word, pos)) != std::string::npos) {
-			bool leftOk = (pos == 0 || !(isalnum(text[pos - 1]) || text[pos - 1] == '_'));
-			size_t endPos = pos + word.size();
-			bool rightOk = (endPos >= text.size() || !(isalnum(text[endPos]) || text[endPos] == '_'));
-			if (leftOk && rightOk) { return true; }
-			pos = endPos;
-		}
-		return false;
-	};
-	auto replaceWholeIdentifier = [&](std::string& text, const std::string& oldName, const std::string& newName) {
-		size_t pos = 0;
-		while ((pos = text.find(oldName, pos)) != std::string::npos) {
-			bool leftOk = (pos == 0 || !(isalnum(text[pos - 1]) || text[pos - 1] == '_'));
-			size_t endPos = pos + oldName.size();
-			bool rightOk = (endPos >= text.size() || !(isalnum(text[endPos]) || text[endPos] == '_'));
-			if (!leftOk || !rightOk) {
-				pos = endPos;
-				continue;
-			}
-			text.replace(pos, oldName.size(), newName);
-			pos += newName.size();
-		}
-	};
-	auto extractConstantIdentifier = [](const std::string& constDef) -> std::string {
-		auto constPos = constDef.find("constant ");
-		if (constPos == std::string::npos) { return {}; }
-
-		size_t start = constPos + strlen("constant ");
-		size_t stop = constDef.size();
-		for (char term : {'[', '=', ';'}) {
-			auto pos = constDef.find(term, start);
-			if (pos != std::string::npos) {
-				stop = std::min(stop, pos);
-			}
-		}
-		if (stop <= start) { return {}; }
-
-		std::string token;
-		std::string lastIdentifier;
-		for (size_t i = start; i < stop; i++) {
-			char c = constDef[i];
-			if (isalnum(c) || c == '_') {
-				token += c;
-				continue;
-			}
-			if (!token.empty()) {
-				if (!std::all_of(token.begin(), token.end(), ::isdigit)) {
-					lastIdentifier = token;
-				}
-				token.clear();
-			}
-		}
-		if (!token.empty() && !std::all_of(token.begin(), token.end(), ::isdigit)) {
-			lastIdentifier = token;
-		}
-		return lastIdentifier;
-	};
-	auto trimString = [](const std::string& str) -> std::string {
-		auto start = str.find_first_not_of(" \t\n\r");
-		if (start == std::string::npos) { return {}; }
-		auto end = str.find_last_not_of(" \t\n\r");
-		return str.substr(start, end - start + 1);
-	};
-	auto extractConstantType = [&](const std::string& constDef, const std::string& constName) -> std::string {
-		auto constPos = constDef.find("constant ");
-		if (constPos == std::string::npos) { return {}; }
-		auto typeStart = constPos + strlen("constant ");
-		auto namePos = constDef.find(constName, typeStart);
-		if (namePos == std::string::npos || namePos <= typeStart) { return {}; }
-		return trimString(constDef.substr(typeStart, namePos - typeStart));
-	};
-	auto isTopLevelDeclaration = [](const std::string& text, size_t pos) -> bool {
-		uint32_t depth = 0;
-		for (size_t i = 0; i < pos; i++) {
-			if (text[i] == '{') {
-				depth++;
-			} else if (text[i] == '}' && depth > 0) {
-				depth--;
-			}
-		}
-		return depth == 0;
-	};
-	struct MVKRTSpecialVarInfo {
-		std::string name;
-		std::string typeName;
-		spv::StorageClass storage = spv::StorageClassGeneric;
-		uint32_t location = 0;
-	};
-	class MVKRTCompilerInspector final : public SPIRV_CROSS_NAMESPACE::CompilerMSL {
-	public:
-		using CompilerMSL::CompilerMSL;
-
-		std::vector<MVKRTSpecialVarInfo> getSpecialVars(const std::string& entryPointName,
-														spv::ExecutionModel entryPointStage) {
-			if (!entryPointName.empty() && entryPointStage != spv::ExecutionModelMax) {
-				set_entry_point(entryPointName, entryPointStage);
-			}
-
-			std::vector<MVKRTSpecialVarInfo> vars;
-			ir.for_each_typed_id<SPIRV_CROSS_NAMESPACE::SPIRVariable>([&](uint32_t id, const SPIRV_CROSS_NAMESPACE::SPIRVariable& var) {
-				switch (var.storage) {
-					case spv::StorageClassRayPayloadKHR:
-					case spv::StorageClassIncomingRayPayloadKHR:
-					case spv::StorageClassHitAttributeKHR:
-					case spv::StorageClassCallableDataKHR:
-					case spv::StorageClassIncomingCallableDataKHR:
-						break;
-					default:
-						return;
-				}
-
-				std::string name = get_name(id);
-				if (name.empty()) { name = "_" + std::to_string(id); }
-
-				std::string typeName = getMSLTypeName(get_type_from_variable(id));
-				if (typeName.empty()) { return; }
-
-				uint32_t location = has_decoration(id, spv::DecorationLocation)
-					? get_decoration(id, spv::DecorationLocation) : 0;
-				vars.push_back({name, typeName, var.storage, location});
-			});
-			return vars;
-		}
-
-	private:
-		std::string getMSLTypeName(const SPIRV_CROSS_NAMESPACE::SPIRType& type) {
-			if (type.columns > 1) {
-				auto base = getMSLScalarTypeName(type);
-				if (base.empty()) { return {}; }
-				return base + std::to_string(type.columns) + "x" + std::to_string(type.vecsize);
-			}
-			if (type.vecsize > 1) {
-				auto base = getMSLScalarTypeName(type);
-				if (base.empty()) { return {}; }
-				return base + std::to_string(type.vecsize);
-			}
-			if (type.basetype == SPIRV_CROSS_NAMESPACE::SPIRType::Struct) {
-				auto typeName = get_name(type.self);
-				if (!typeName.empty()) { return typeName; }
-				return "spvType_" + std::to_string(type.self);
-			}
-			return getMSLScalarTypeName(type);
-		}
-
-		std::string getMSLScalarTypeName(const SPIRV_CROSS_NAMESPACE::SPIRType& type) {
-			switch (type.basetype) {
-				case SPIRV_CROSS_NAMESPACE::SPIRType::Boolean: return "bool";
-				case SPIRV_CROSS_NAMESPACE::SPIRType::Int: return "int";
-				case SPIRV_CROSS_NAMESPACE::SPIRType::UInt: return "uint";
-				case SPIRV_CROSS_NAMESPACE::SPIRType::Int64: return "long";
-				case SPIRV_CROSS_NAMESPACE::SPIRType::UInt64: return "ulong";
-				case SPIRV_CROSS_NAMESPACE::SPIRType::Half: return "half";
-				case SPIRV_CROSS_NAMESPACE::SPIRType::Float: return "float";
-				case SPIRV_CROSS_NAMESPACE::SPIRType::Double: return "double";
-				default: return {};
-			}
-		}
-	};
-	auto getRTSpecialVars = [&](const VkPipelineShaderStageCreateInfo* pStage,
-								spv::ExecutionModel entryPointStage) -> std::vector<MVKRTSpecialVarInfo> {
-		MVKShaderModule* shaderModule = (MVKShaderModule*)pStage->module;
-		MVKRTCompilerInspector inspector(shaderModule->getSPIRV());
-		return inspector.getSpecialVars(pStage->pName ? pStage->pName : "", entryPointStage);
-	};
-	auto getSpecializationExpr = [&](const VkSpecializationInfo* pSpecInfo,
-									 uint32_t constantID,
-									 const std::string& type,
-									 std::string& expr) -> bool {
-		if (!pSpecInfo || !pSpecInfo->pMapEntries || !pSpecInfo->pData) { return false; }
-
-		for (uint32_t specIdx = 0; specIdx < pSpecInfo->mapEntryCount; specIdx++) {
-			const VkSpecializationMapEntry* pMapEntry = &pSpecInfo->pMapEntries[specIdx];
-			if (pMapEntry->constantID != constantID) { continue; }
-
-			const char* pData = reinterpret_cast<const char*>(pSpecInfo->pData) + pMapEntry->offset;
-			auto copyValue = [&](auto& value) -> bool {
-				if (pMapEntry->size < sizeof(value)) { return false; }
-				std::memcpy(&value, pData, sizeof(value));
-				return true;
-			};
-			auto formatFloat = [](double value, bool withSuffix) -> std::string {
-				std::ostringstream oss;
-				oss << std::setprecision(17) << value;
-				std::string out = oss.str();
-				if (out.find_first_of(".eE") == std::string::npos) {
-					out += ".0";
-				}
-				if (withSuffix) { out += "f"; }
-				return out;
-			};
-
-			if (type == "bool") {
-				uint32_t value = 0;
-				if (!copyValue(value)) { return false; }
-				expr = value ? "true" : "false";
-				return true;
-			}
-			if (type == "uint") {
-				uint32_t value = 0;
-				if (!copyValue(value)) { return false; }
-				expr = std::to_string(value) + "u";
-				return true;
-			}
-			if (type == "int") {
-				int32_t value = 0;
-				if (!copyValue(value)) { return false; }
-				expr = std::to_string(value);
-				return true;
-			}
-			if (type == "ushort") {
-				uint16_t value = 0;
-				if (!copyValue(value)) { return false; }
-				expr = "ushort(" + std::to_string(value) + "u)";
-				return true;
-			}
-			if (type == "short") {
-				int16_t value = 0;
-				if (!copyValue(value)) { return false; }
-				expr = "short(" + std::to_string(value) + ")";
-				return true;
-			}
-			if (type == "ulong") {
-				uint64_t value = 0;
-				if (!copyValue(value)) { return false; }
-				expr = std::to_string(value) + "ul";
-				return true;
-			}
-			if (type == "long") {
-				int64_t value = 0;
-				if (!copyValue(value)) { return false; }
-				expr = std::to_string(value) + "l";
-				return true;
-			}
-			if (type == "float") {
-				float value = 0.0f;
-				if (!copyValue(value)) { return false; }
-				expr = formatFloat(value, true);
-				return true;
-			}
-			if (type == "half") {
-				uint16_t bits = 0;
-				if (!copyValue(bits)) { return false; }
-				expr = "half(as_type<half>((ushort)" + std::to_string(bits) + "u))";
-				return true;
-			}
-			if (type == "double") {
-				double value = 0.0;
-				if (!copyValue(value)) { return false; }
-				expr = formatFloat(value, false);
-				return true;
-			}
-
-			return false;
-		}
-
-		return false;
-	};
-	auto resolveFunctionConstants = [&](std::string& text, const VkSpecializationInfo* pSpecInfo) {
-		struct FunctionConstantDecl {
-			std::string type;
-			uint32_t index;
-			size_t lineStart;
-			size_t lineLen;
-		};
-		std::unordered_map<std::string, FunctionConstantDecl> decls;
-		size_t pos = 0;
-		while ((pos = text.find("[[function_constant(", pos)) != std::string::npos) {
-			if (!isTopLevelDeclaration(text, pos)) {
-				pos += strlen("[[function_constant(");
-				continue;
-			}
-
-			auto lineStart = text.rfind('\n', pos);
-			if (lineStart == std::string::npos) {
-				lineStart = 0;
-			} else {
-				lineStart++;
-			}
-			auto lineEnd = text.find(';', pos);
-			if (lineEnd == std::string::npos) { break; }
-
-			std::string decl = text.substr(lineStart, lineEnd + 1 - lineStart);
-			std::string declName = extractConstantIdentifier(decl);
-			if (declName.empty()) {
-				pos = lineEnd + 1;
-				continue;
-			}
-
-			auto attrStart = decl.find("[[function_constant(");
-			auto attrEnd = (attrStart == std::string::npos) ? std::string::npos : decl.find(")]]", attrStart);
-			if (attrEnd == std::string::npos) {
-				pos = lineEnd + 1;
-				continue;
-			}
-
-			uint32_t index = (uint32_t)std::stoul(decl.substr(attrStart + strlen("[[function_constant("),
-														  attrEnd - (attrStart + strlen("[[function_constant("))));
-			decls[declName] = {
-				extractConstantType(decl, declName),
-				index,
-				lineStart,
-				lineEnd + 1 - lineStart
-			};
-			pos = lineEnd + 1;
-		}
-
-		pos = 0;
-		while ((pos = text.find("is_function_constant_defined(", pos)) != std::string::npos) {
-			if (!isTopLevelDeclaration(text, pos)) {
-				pos += strlen("is_function_constant_defined(");
-				continue;
-			}
-
-			auto lineStart = text.rfind('\n', pos);
-			if (lineStart == std::string::npos) {
-				lineStart = 0;
-			} else {
-				lineStart++;
-			}
-			auto lineEnd = text.find(';', pos);
-			if (lineEnd == std::string::npos) { break; }
-
-			std::string line = text.substr(lineStart, lineEnd + 1 - lineStart);
-			auto argStart = line.find("is_function_constant_defined(");
-			if (argStart == std::string::npos) {
-				pos = lineEnd + 1;
-				continue;
-			}
-			argStart += strlen("is_function_constant_defined(");
-			auto argEnd = line.find(')', argStart);
-			if (argEnd == std::string::npos) {
-				pos = lineEnd + 1;
-				continue;
-			}
-
-			std::string tmpName = trimString(line.substr(argStart, argEnd - argStart));
-			auto declIt = decls.find(tmpName);
-			if (declIt == decls.end()) {
-				pos = lineEnd + 1;
-				continue;
-			}
-
-			std::string constName = extractConstantIdentifier(line);
-			std::string constType = extractConstantType(line, constName);
-			auto colonPos = line.rfind(':');
-			auto semicolonPos = line.rfind(';');
-			if (colonPos == std::string::npos || semicolonPos == std::string::npos || colonPos >= semicolonPos) {
-				pos = lineEnd + 1;
-				continue;
-			}
-
-			std::string valueExpr = trimString(line.substr(colonPos + 1, semicolonPos - colonPos - 1));
-			std::string specializedExpr;
-			if (getSpecializationExpr(pSpecInfo, declIt->second.index, constType, specializedExpr)) {
-				valueExpr = specializedExpr;
-			}
-
-			std::string replacement = "constant " + constType + " " + constName + " = " + valueExpr + ";";
-			text.replace(lineStart, lineEnd + 1 - lineStart, replacement);
-			pos = lineStart + replacement.size();
-		}
-
-		std::vector<FunctionConstantDecl> sortedDecls;
-		sortedDecls.reserve(decls.size());
-		for (auto& [_, decl] : decls) {
-			sortedDecls.push_back(decl);
-		}
-		std::sort(sortedDecls.begin(), sortedDecls.end(), [](const auto& a, const auto& b) {
-			return a.lineStart > b.lineStart;
-		});
-		for (auto& decl : sortedDecls) {
-			text.erase(decl.lineStart, decl.lineLen);
-		}
-	};
-
-	// All RT pipelines use the combined MSL approach.
-	std::string raygenMSL = getMSLSource(pRaygenStage, spv::ExecutionModelRayGenerationKHR, "");
-	resolveFunctionConstants(raygenMSL, pRaygenStage->pSpecializationInfo);
-	if (raygenMSL.empty()) {
-		_hasValidMTLPipelineStates = false;
-		return;
-	}
-	std::vector<std::string> closestHitFuncs, anyHitFuncs, missFuncs, callableFuncs;
-	std::string intersectionFunc;
-	// Maps stage index -> helper function name for SBT group dispatch.
-	std::unordered_map<uint32_t, std::string> stageToFuncName;
-	std::unordered_map<std::string, std::vector<MVKRTSpecialVarInfo>> helperExtraArgs;
-	std::unordered_set<std::string> extractedConstantNames;
-	std::unordered_set<std::string> extractedHelperSignatures;
-	auto raygenSpecialVars = getRTSpecialVars(pRaygenStage, spv::ExecutionModelRayGenerationKHR);
-	auto getStructMemberName = [&](const std::string& line, size_t idPos) -> std::string {
-		auto nameEnd = line.rfind(' ', idPos - 1);
-		if (nameEnd == std::string::npos) { return {}; }
-		auto nameStart = line.rfind(' ', nameEnd - 1);
-		if (nameStart == std::string::npos) {
-			nameStart = 0;
-		} else {
-			nameStart++;
-		}
-		return trimString(line.substr(nameStart, nameEnd - nameStart));
-	};
-	// Merges spvDescriptorSetBuffer0 members from sourceMSL into raygenMSL.
-	// Members matched by [[id(N)]]: padding placeholders are replaced with real members,
-	// missing members are appended. If memberRenames is provided, records name mismatches
-	// between existing non-padding members for later fixup by the caller.
-	auto mergeDescriptorStructIntoRaygen = [&](
-			const std::string& sourceMSL,
-			std::vector<std::pair<std::string, std::string>>* memberRenames) {
-		auto srcStructStart = sourceMSL.find("struct spvDescriptorSetBuffer0");
-		if (srcStructStart == std::string::npos) { return; }
-		auto srcStructBodyStart = sourceMSL.find('{', srcStructStart);
-		auto srcStructEnd = sourceMSL.find("};", srcStructStart);
-		if (srcStructBodyStart == std::string::npos || srcStructEnd == std::string::npos) { return; }
-		std::string srcMembers = sourceMSL.substr(srcStructBodyStart + 1, srcStructEnd - srcStructBodyStart - 1);
-
-		auto raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
-		auto raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
-		if (raygenStructEnd == std::string::npos) {
-			// Raygen MSL has no descriptor set struct. Insert the full struct from the source.
-			std::string fullStruct = sourceMSL.substr(srcStructStart, srcStructEnd - srcStructStart + 2);
-			auto insertPos = raygenMSL.find("kernel void");
-			if (insertPos == std::string::npos) insertPos = raygenMSL.find("static void");
-			if (insertPos != std::string::npos) {
-				raygenMSL.insert(insertPos, fullStruct + "\n\n");
-			}
-			raygenStructPos = raygenMSL.find("struct spvDescriptorSetBuffer0");
-			raygenStructEnd = (raygenStructPos != std::string::npos) ? raygenMSL.find("};", raygenStructPos) : std::string::npos;
-		}
-		if (raygenStructEnd == std::string::npos) { return; }
-
-		std::istringstream ss(srcMembers);
-		std::string line;
-		while (std::getline(ss, line)) {
-			auto idPos = line.find("[[id(");
-			if (idPos == std::string::npos) continue;
-			auto idNumStart = idPos + 5;
-			auto idNumEnd = line.find(")]]", idNumStart);
-			if (idNumEnd == std::string::npos) continue;
-			std::string idStr = "[[id(" + line.substr(idNumStart, idNumEnd - idNumStart) + ")]]";
-			std::string memberName = getStructMemberName(line, idPos);
-			if (memberName.empty()) continue;
-
-			auto existingId = raygenMSL.find(idStr, raygenStructPos);
-			if (existingId != std::string::npos && existingId < raygenStructEnd) {
-				auto existingLineStart = raygenMSL.rfind('\n', existingId);
-				if (existingLineStart == std::string::npos) existingLineStart = 0; else existingLineStart++;
-				auto existingLineEnd = raygenMSL.find('\n', existingId);
-				std::string existingLine = raygenMSL.substr(existingLineStart, existingLineEnd - existingLineStart);
-				if (existingLine.find("_pad") != std::string::npos) {
-					raygenMSL.replace(existingLineStart, existingLineEnd - existingLineStart, line);
-					raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
-				} else if (memberRenames) {
-					std::string existingMemberName = getStructMemberName(existingLine, existingLine.find("[[id("));
-					if (!existingMemberName.empty() && existingMemberName != memberName) {
-						memberRenames->push_back({memberName, existingMemberName});
-					}
-				}
-			} else if (raygenMSL.substr(0, raygenStructEnd).find(memberName) == std::string::npos) {
-				raygenMSL.insert(raygenStructEnd, line + "\n");
-				raygenStructEnd = raygenMSL.find("};", raygenMSL.find("struct spvDescriptorSetBuffer0"));
-			}
-		}
-	};
-	auto normalizeHelperSignature = [&](const std::string& signature, const std::string& helperName) -> std::string {
-		auto parenPos = signature.find('(');
-		auto closePos = signature.rfind(')');
-		if (parenPos == std::string::npos || closePos == std::string::npos || closePos <= parenPos) {
-			return helperName;
-		}
-		std::string normalized = helperName + "(";
-		std::string params = signature.substr(parenPos + 1, closePos - parenPos - 1);
-		std::istringstream pss(params);
-		std::string param;
-		bool first = true;
-		while (std::getline(pss, param, ',')) {
-			param = trimString(param);
-			if (param.empty()) { continue; }
-			size_t end = param.size();
-			while (end > 0 && isspace(param[end - 1])) { end--; }
-			while (end > 0 && (param[end - 1] == '&' || param[end - 1] == '*')) { end--; }
-			while (end > 0 && isspace(param[end - 1])) { end--; }
-			size_t nameStart = end;
-			while (nameStart > 0 && (isalnum(param[nameStart - 1]) || param[nameStart - 1] == '_')) {
-				nameStart--;
-			}
-			if (nameStart < end) {
-				param.erase(nameStart);
-			}
-			param = trimString(param);
-			normalized += (first ? "" : ",") + param;
-			first = false;
-		}
-		normalized += ")";
-		return normalized;
-	};
-
-	// Compile non-raygen shaders to MSL and transform them into helper functions.
-	// Each shader gets a unique name based on its stage index.
-	for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
-		auto& stage = pCreateInfo->pStages[i];
-		if (stage.stage == VK_SHADER_STAGE_RAYGEN_BIT_KHR) continue;
-
-		spv::ExecutionModel execModel;
-		std::vector<std::string>* targetVec = nullptr;
-		std::string baseName;
-		switch (stage.stage) {
-			case VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR:
-				execModel = spv::ExecutionModelClosestHitKHR;
-				baseName = "_mvk_chit";
-				targetVec = &closestHitFuncs;
-				break;
-			case VK_SHADER_STAGE_ANY_HIT_BIT_KHR:
-				execModel = spv::ExecutionModelAnyHitKHR;
-				baseName = "_mvk_ahit";
-				targetVec = &anyHitFuncs;
-				break;
-			case VK_SHADER_STAGE_MISS_BIT_KHR:
-				execModel = spv::ExecutionModelMissKHR;
-				baseName = "_mvk_miss";
-				targetVec = &missFuncs;
-				break;
-			case VK_SHADER_STAGE_INTERSECTION_BIT_KHR:
-				// Intersection shaders are handled separately below as proper
-				// Metal intersection functions, not as inline helpers.
-				continue;
-			case VK_SHADER_STAGE_CALLABLE_BIT_KHR:
-				execModel = spv::ExecutionModelCallableKHR;
-				baseName = "_mvk_callable";
-				targetVec = &callableFuncs;
-				break;
-			default: continue;
-		}
-		std::string funcName = baseName + "_" + std::to_string(i);
-
-		std::string msl = getMSLSource(&stage, execModel, funcName);
-		resolveFunctionConstants(msl, stage.pSpecializationInfo);
-		if (msl.empty() || !targetVec) continue;
-		auto stageSpecialVars = getRTSpecialVars(&stage, execModel);
-		targetVec->push_back(funcName);
-		stageToFuncName[i] = funcName;
-		std::vector<std::pair<std::string, std::string>> helperMemberRenames;
-		mergeDescriptorStructIntoRaygen(msl, &helperMemberRenames);
-		for (auto& [oldName, newName] : helperMemberRenames) {
-			replaceWholeIdentifier(msl, oldName, newName);
-		}
-
-		// Extract just the function code (remove headers, structs, namespaces)
-		auto funcPos = msl.find(funcName + "(");
-		if (funcPos == std::string::npos) continue;
-
-		// Check if the function body is empty (passthrough shader).
-		// Skip empty helpers — they do nothing and avoid needing descriptor set types.
-		auto bodyStart = msl.find('{', funcPos);
-		auto bodyEnd = msl.find('}', bodyStart + 1);
-		if (bodyStart != std::string::npos && bodyEnd != std::string::npos) {
-			std::string body = msl.substr(bodyStart + 1, bodyEnd - bodyStart - 1);
-			// Trim whitespace
-			body.erase(0, body.find_first_not_of(" \t\n\r"));
-			body.erase(body.find_last_not_of(" \t\n\r") + 1);
-			if (body.empty()) {
-				targetVec->pop_back();  // Remove — don't generate empty helper
-				stageToFuncName.erase(i);
-				continue;
-			}
-		}
-
-		// Extract SPIRV-Cross helper definitions from the helper stage MSL:
-		// struct types (e.g., struct _7 { ... }), template/inline functions
-		// (spvSMod, etc.), and constant arrays. These appear between
-		// "using namespace metal;" and the entry point function.
-		std::vector<std::pair<std::string, std::string>> helperConstantRenames;
-		{
-			auto usingNS = msl.find("using namespace metal;");
-			size_t helperStart = (usingNS != std::string::npos) ? usingNS + strlen("using namespace metal;") : 0;
-			auto entryLineStart = msl.rfind('\n', funcPos);
-			if (entryLineStart == std::string::npos) entryLineStart = 0;
-			if (helperStart >= entryLineStart) helperStart = 0;
-			std::string helperRegion = msl.substr(helperStart, entryLineStart - helperStart);
-
-			// Give helper-scoped constants stable unique names before merging them into the
-			// combined source, otherwise different helper stages collide on shared _NN names.
-			{
-				size_t pos = 0;
-				while ((pos = helperRegion.find("constant ", pos)) != std::string::npos) {
-					if (!isTopLevelDeclaration(helperRegion, pos)) {
-						pos += strlen("constant ");
-						continue;
-					}
-					auto lineEnd = helperRegion.find(';', pos);
-					if (lineEnd == std::string::npos) { break; }
-					std::string constDef = helperRegion.substr(pos, lineEnd + 1 - pos);
-					std::string cName = extractConstantIdentifier(constDef);
-					if (cName.size() > 1 && cName[0] == '_' && isdigit(cName[1])) {
-						helperConstantRenames.push_back({cName, cName + "_" + funcName});
-					}
-					pos = lineEnd + 1;
-				}
-				for (auto& [oldName, newName] : helperConstantRenames) {
-					replaceWholeIdentifier(helperRegion, oldName, newName);
-				}
-			}
-
-			// Find insertion point for struct types: before spvDescriptorSetBuffer0 since
-			// descriptor set members may reference these types. For helpers/constants,
-			// insert before _MVKRTBuiltins or static/kernel functions.
-			auto findStructInsertPos = [&]() -> size_t {
-				auto p = raygenMSL.find("struct spvDescriptorSetBuffer0");
-				if (p == std::string::npos) p = raygenMSL.find("struct _MVKRTBuiltins");
-				if (p == std::string::npos) p = raygenMSL.find("static void");
-				if (p == std::string::npos) p = raygenMSL.find("kernel void");
-				return p;
-			};
-			auto findInsertPos = [&]() -> size_t {
-				auto p = raygenMSL.find("struct _MVKRTBuiltins");
-				if (p == std::string::npos) p = raygenMSL.find("static void");
-				if (p == std::string::npos) p = raygenMSL.find("kernel void");
-				return p;
-			};
-
-			// Extract struct definitions (struct _NN { ... };)
-			{
-				size_t pos = 0;
-				while ((pos = helperRegion.find("struct ", pos)) != std::string::npos) {
-					// Skip the spvDescriptorSetBuffer0 struct (handled separately)
-					if (helperRegion.compare(pos, strlen("struct spvDescriptorSetBuffer"), "struct spvDescriptorSetBuffer") == 0) {
-						pos += 7; continue;
-					}
-					auto lineS = helperRegion.rfind('\n', pos);
-					if (lineS == std::string::npos) lineS = 0; else lineS++;
-					auto braceStart = helperRegion.find('{', pos);
-					auto semicolonEnd = helperRegion.find("};", pos);
-					if (braceStart == std::string::npos || semicolonEnd == std::string::npos) { pos += 7; continue; }
-					std::string structDef = helperRegion.substr(lineS, semicolonEnd + 2 - lineS);
-					// Extract struct name
-					auto nameStart = pos + 7; // after "struct "
-					auto nameEnd = nameStart;
-					while (nameEnd < helperRegion.size() && (isalnum(helperRegion[nameEnd]) || helperRegion[nameEnd] == '_'))
-						nameEnd++;
-					std::string structName = helperRegion.substr(nameStart, nameEnd - nameStart);
-						// Only add if not already in raygen MSL
-					if (!structName.empty() && !findWholeIdentifier(raygenMSL, "struct " + structName)) {
-						auto insertPos = findStructInsertPos();
-						if (insertPos != std::string::npos) {
-							raygenMSL.insert(insertPos, structDef + "\n\n");
-						}
-					}
-					pos = semicolonEnd + 2;
-				}
-			}
-
-			// Extract top-level helper functions that appear before the entry point.
-			{
-				size_t pos = 0;
-				while ((pos = helperRegion.find('{', pos)) != std::string::npos) {
-					if (!isTopLevelDeclaration(helperRegion, pos)) {
-						pos++;
-						continue;
-					}
-
-					auto funcStart = helperRegion.rfind("\n\n", pos);
-					if (funcStart == std::string::npos) {
-						funcStart = 0;
-					} else {
-						funcStart += 2;
-					}
-
-					std::string signature = trimString(helperRegion.substr(funcStart, pos - funcStart));
-					if (signature.empty() ||
-						signature.rfind("struct ", 0) == 0 ||
-						signature.rfind("constant ", 0) == 0 ||
-						signature.rfind("namespace ", 0) == 0 ||
-						signature.rfind("using ", 0) == 0 ||
-						signature.rfind("typedef ", 0) == 0 ||
-						signature.rfind("enum ", 0) == 0 ||
-						signature.find('(') == std::string::npos) {
-						pos++;
-						continue;
-					}
-
-					int depth = 1;
-					size_t braceEnd = pos + 1;
-					while (braceEnd < helperRegion.size() && depth > 0) {
-						if (helperRegion[braceEnd] == '{') depth++;
-						else if (helperRegion[braceEnd] == '}') depth--;
-						braceEnd++;
-					}
-					if (depth != 0) { break; }
-
-					std::string helperFunc = helperRegion.substr(funcStart, braceEnd - funcStart);
-					auto parenPos = signature.rfind('(');
-					auto nameEnd = parenPos;
-					while (nameEnd > 0 && (signature[nameEnd - 1] == ' ' || signature[nameEnd - 1] == '\t' || signature[nameEnd - 1] == '&' || signature[nameEnd - 1] == '*')) {
-						nameEnd--;
-					}
-					auto nameStart = nameEnd;
-					while (nameStart > 0 && (isalnum(signature[nameStart - 1]) || signature[nameStart - 1] == '_')) {
-						nameStart--;
-					}
-					std::string helperName = signature.substr(nameStart, nameEnd - nameStart);
-					if (!helperName.empty() &&
-						helperName != funcName &&
-						helperName != "if" &&
-						helperName != "for" &&
-						helperName != "while" &&
-						helperName != "switch") {
-						std::string signatureNeedle = trimString(signature);
-						if (!signatureNeedle.empty() && raygenMSL.find(signatureNeedle) != std::string::npos) {
-							pos = braceEnd;
-							continue;
-						}
-						std::string normalizedSignature = normalizeHelperSignature(signature, helperName);
-						if (!normalizedSignature.empty() &&
-							!extractedHelperSignatures.insert(normalizedSignature).second) {
-							pos = braceEnd;
-							continue;
-						}
-						auto insertPos = findInsertPos();
-						if (insertPos != std::string::npos) {
-							raygenMSL.insert(insertPos, helperFunc + "\n\n");
-						}
-					}
-
-					pos = braceEnd;
-				}
-			}
-
-			// Extract constant buffer definitions (constant _NN _NN_val = { ... };)
-			{
-				size_t pos = 0;
-				while ((pos = helperRegion.find("constant ", pos)) != std::string::npos) {
-					if (!isTopLevelDeclaration(helperRegion, pos)) {
-						pos += strlen("constant ");
-						continue;
-					}
-					auto lineS = helperRegion.rfind('\n', pos);
-					if (lineS == std::string::npos) lineS = 0; else lineS++;
-					auto lineEnd = helperRegion.find(';', pos);
-					if (lineEnd == std::string::npos) { pos += 9; continue; }
-					// Check if it spans multiple lines (has braces for array init)
-					auto braceStart = helperRegion.find('{', pos);
-					if (braceStart != std::string::npos && braceStart < lineEnd) {
-						// Multi-line constant array: find matching }
-						int depth = 1;
-						size_t braceEnd = braceStart + 1;
-						while (braceEnd < helperRegion.size() && depth > 0) {
-							if (helperRegion[braceEnd] == '{') depth++;
-							else if (helperRegion[braceEnd] == '}') depth--;
-							braceEnd++;
-						}
-						lineEnd = helperRegion.find(';', braceEnd);
-						if (lineEnd == std::string::npos) { pos += 9; continue; }
-					}
-					std::string constDef = helperRegion.substr(lineS, lineEnd + 1 - lineS);
-					std::string cName = extractConstantIdentifier(constDef);
-					if (!cName.empty() && !findWholeIdentifier(raygenMSL, cName)) {
-						auto insertPos = findInsertPos();
-						if (insertPos != std::string::npos) {
-							raygenMSL.insert(insertPos, constDef + "\n\n");
-							extractedConstantNames.insert(cName);
-						}
-					}
-					pos = lineEnd + 1;
-				}
-			}
-		}
-
-		auto lineStart = msl.rfind('\n', funcPos);
-		if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
-		std::string funcCode = msl.substr(lineStart);
-		for (auto& [oldName, newName] : helperConstantRenames) {
-			replaceWholeIdentifier(funcCode, oldName, newName);
-		}
-
-		// Remove [[visible]], kernel, [[intersection(...)]] qualifiers
-		for (auto& qual : {"[[visible]] ", "kernel ", "[[intersection(triangle, instancing)]] "}) {
-			size_t qp = funcCode.find(qual);
-			if (qp != std::string::npos) funcCode.erase(qp, strlen(qual));
-		}
-
-		// Remove [[ ]] attributes from parameters
-		size_t attrStart;
-		while ((attrStart = funcCode.find(" [[")) != std::string::npos) {
-			auto attrEnd = funcCode.find("]]", attrStart);
-			if (attrEnd != std::string::npos) {
-				funcCode.erase(attrStart, attrEnd + 2 - attrStart);
-			} else break;
-		}
-
-		// Parse original parameters to find payload/callable data variables.
-		// After attribute removal, params look like: "ray_data uint4& _9, constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV"
-		// Any parameter that isn't spvDescriptorSet0/gl_LaunchIDNV/gl_LaunchSizeNV is a
-		// payload/callable data variable that needs to become a local variable.
-		std::string extraLocalDecls;
-		std::vector<std::string> extraHelperParamDecls;
-		std::vector<MVKRTSpecialVarInfo> usedSpecialVars;
-		{
-			auto sigStart = funcCode.find('(');
-			auto sigEnd = funcCode.find(')');
-			if (sigStart != std::string::npos && sigEnd != std::string::npos) {
-				std::string params = funcCode.substr(sigStart + 1, sigEnd - sigStart - 1);
-				std::istringstream pss(params);
-				std::string param;
-				while (std::getline(pss, param, ',')) {
-					// Trim
-					size_t s = param.find_first_not_of(" \t\n\r");
-					if (s == std::string::npos) continue;
-					param = param.substr(s);
-					// Skip standard parameters
-					if (param.find("spvDescriptorSet") != std::string::npos) continue;
-					if (param.find("gl_LaunchIDNV") != std::string::npos) continue;
-					if (param.find("gl_LaunchSizeNV") != std::string::npos) continue;
-					if (param.find("gl_LaunchID") != std::string::npos) continue;
-					if (param.find("gl_LaunchSize") != std::string::npos) continue;
-					// Skip RT builtin parameters — they are handled via _mvk_rt struct
-					bool isRTBuiltin = false;
-					for (auto* m = rtBuiltinMap; m->first; m++) {
-						if (param.find(m->first) != std::string::npos) { isRTBuiltin = true; break; }
-					}
-					if (isRTBuiltin) continue;
-					// Extract variable name (last token) and base type
-					// Remove qualifiers: ray_data, device, constant, thread, &
-					std::string cleaned = param;
-					for (auto& q : {"ray_data ", "device ", "constant ", "thread ", "threadgroup "}) {
-						size_t qp = cleaned.find(q);
-						if (qp != std::string::npos) cleaned.erase(qp, strlen(q));
-					}
-					// Remove reference (&)
-					size_t ampPos = cleaned.find('&');
-					if (ampPos != std::string::npos) cleaned.erase(ampPos, 1);
-					// Remove pointer (*)
-					size_t starPos = cleaned.find('*');
-					if (starPos != std::string::npos) cleaned.erase(starPos, 1);
-					// Trim again
-					s = cleaned.find_first_not_of(" \t");
-					if (s != std::string::npos) cleaned = cleaned.substr(s);
-					auto e = cleaned.find_last_not_of(" \t");
-					if (e != std::string::npos) cleaned = cleaned.substr(0, e + 1);
-					// Should now be "type name" like "uint4 _9"
-					if (!cleaned.empty()) {
-						extraLocalDecls += "\n    " + cleaned + ";\n";
-					}
-				}
-
-				for (auto& var : stageSpecialVars) {
-					if (var.name.empty() || var.typeName.empty() || !findWholeIdentifier(funcCode, var.name)) {
-						continue;
-					}
-					bool alreadyAdded = false;
-					for (auto& existing : usedSpecialVars) {
-						if (existing.name == var.name) {
-							alreadyAdded = true;
-							break;
-						}
-					}
-					if (alreadyAdded) { continue; }
-
-					switch (var.storage) {
-						case spv::StorageClassRayPayloadKHR:
-						case spv::StorageClassIncomingRayPayloadKHR:
-						case spv::StorageClassCallableDataKHR:
-						case spv::StorageClassIncomingCallableDataKHR:
-							extraHelperParamDecls.push_back("thread " + var.typeName + "& " + var.name);
-							usedSpecialVars.push_back(var);
-							break;
-						case spv::StorageClassHitAttributeKHR:
-							extraHelperParamDecls.push_back(var.typeName + " " + var.name);
-							usedSpecialVars.push_back(var);
-							break;
-						default:
-							break;
-					}
-				}
-
-				// Replace signature with standard parameters plus RT builtins struct
-				std::string newParams = "constant spvDescriptorSetBuffer0& spvDescriptorSet0, uint3 gl_LaunchIDNV, uint3 gl_LaunchSizeNV, const thread _MVKRTBuiltins& _mvk_rt";
-				for (auto& paramDecl : extraHelperParamDecls) {
-					newParams += ", " + paramDecl;
-				}
-				funcCode.replace(sigStart + 1, sigEnd - sigStart - 1, newParams);
-			}
-		}
-		if (!usedSpecialVars.empty()) {
-			helperExtraArgs[funcName] = usedSpecialVars;
-		}
-
-		// Insert local declarations for payload/callable data variables at the function body start.
-		if (!extraLocalDecls.empty()) {
-			auto funcBodyStart = funcCode.find('{');
-			if (funcBodyStart != std::string::npos) {
-				funcCode.insert(funcBodyStart + 1, extraLocalDecls);
-			}
-		}
-
-		// Replace RT builtin variable references with struct member access.
-		for (auto* m = rtBuiltinMap; m->first; m++) {
-			std::string oldName = m->first;
-			std::string newName = std::string("_mvk_rt.") + m->second;
-			size_t pos = 0;
-			while ((pos = funcCode.find(oldName, pos)) != std::string::npos) {
-				// Check word boundaries
-				if (pos > 0 && (isalnum(funcCode[pos - 1]) || funcCode[pos - 1] == '_')) {
-					pos += oldName.size(); continue;
-				}
-				size_t endPos = pos + oldName.size();
-				if (endPos < funcCode.size() && (isalnum(funcCode[endPos]) || funcCode[endPos] == '_')) {
-					pos += oldName.size(); continue;
-				}
-				funcCode.replace(pos, oldName.size(), newName);
-				pos += newName.size();
-			}
-		}
-
-		// Insert as static helper before the kernel
-		auto kernelPos = raygenMSL.find("kernel void");
-		if (kernelPos != std::string::npos) {
-			raygenMSL.insert(kernelPos, "\nstatic " + funcCode + "\n\n");
-		}
-	}
-
-	// Insert the RT builtins struct before helpers if any non-raygen stages exist.
-	if (hasNonRaygenStages) {
-		auto kernelPos = raygenMSL.find("kernel void");
-		auto firstStaticPos = raygenMSL.find("static void");
-		size_t insertPos = (firstStaticPos != std::string::npos && firstStaticPos < kernelPos)
-			? firstStaticPos : kernelPos;
-		if (insertPos != std::string::npos) {
-			raygenMSL.insert(insertPos, kMVKRTBuiltinsStruct);
-		}
-	}
-
-	// Merged helper stages can declare the same Metal function_constant index.
-	// Keep the first declaration for each index and rewrite later references to it.
-	{
-		std::unordered_map<std::string, std::string> functionConstantDecls;
-		size_t pos = 0;
-		while ((pos = raygenMSL.find("[[function_constant(", pos)) != std::string::npos) {
-			auto lineStart = raygenMSL.rfind('\n', pos);
-			if (lineStart == std::string::npos) {
-				lineStart = 0;
-			} else {
-				lineStart++;
-			}
-			auto lineEnd = raygenMSL.find(';', pos);
-			if (lineEnd == std::string::npos) { break; }
-
-			std::string decl = raygenMSL.substr(lineStart, lineEnd + 1 - lineStart);
-			std::string declName = extractConstantIdentifier(decl);
-			if (declName.empty()) {
-				pos = lineEnd + 1;
-				continue;
-			}
-
-			auto attrStart = decl.find("[[function_constant(");
-			auto attrEnd = (attrStart == std::string::npos) ? std::string::npos : decl.find(")]]", attrStart);
-			if (attrEnd == std::string::npos) {
-				pos = lineEnd + 1;
-				continue;
-			}
-
-			std::string attrKey = decl.substr(attrStart, attrEnd + 3 - attrStart);
-			auto [it, inserted] = functionConstantDecls.emplace(attrKey, declName);
-			if (!inserted) {
-				replaceWholeIdentifier(raygenMSL, declName, it->second);
-				raygenMSL.erase(lineStart, lineEnd + 1 - lineStart);
-				pos = lineStart;
-				continue;
-			}
-
-			pos = lineEnd + 1;
-		}
-	}
-
-	// Handle intersection shaders: compile as proper Metal [[intersection()]] functions.
-	// For AABB geometry, Metal requires intersection functions via MTLIntersectionFunctionTable.
-	std::string isectFuncMSL;
-	std::string isectPreambleMSL;
-	if (hasIntersection) {
-		auto extractStructDefinition = [](const std::string& source, const std::string& structName) -> std::string {
-			auto structPos = source.find("struct " + structName);
-			if (structPos == std::string::npos) { return {}; }
-			auto structEnd = source.find("};", structPos);
-			if (structEnd == std::string::npos) { return {}; }
-			return source.substr(structPos, structEnd + 2 - structPos);
-		};
-		auto appendStructDefinitions = [&](std::string& dest,
-										  std::unordered_set<std::string>& seenStructs,
-										  const std::string& source,
-										  bool includeDescriptorSetStruct) {
-			auto kernelPos = source.find("kernel void");
-			std::string sourcePreamble = (kernelPos == std::string::npos) ? source : source.substr(0, kernelPos);
-			size_t structPos = 0;
-			while ((structPos = sourcePreamble.find("struct ", structPos)) != std::string::npos) {
-				auto nameStart = structPos + 7;
-				auto nameEnd = sourcePreamble.find_first_of(" \n\r\t{", nameStart);
-				if (nameEnd == std::string::npos) { break; }
-				std::string structName = sourcePreamble.substr(nameStart, nameEnd - nameStart);
-				auto structEnd = sourcePreamble.find("};", nameEnd);
-				if (structEnd == std::string::npos) { break; }
-				if ((structName != "spvDescriptorSetBuffer0" || includeDescriptorSetStruct) &&
-					seenStructs.insert(structName).second) {
-					dest += sourcePreamble.substr(structPos, structEnd + 2 - structPos) + "\n\n";
-				}
-				structPos = structEnd + 2;
-			}
-		};
-		auto buildDescriptorMemberMap = [](const std::string& source) {
-			std::unordered_map<uint32_t, std::string> memberNamesByID;
-			auto structPos = source.find("struct spvDescriptorSetBuffer0");
-			if (structPos == std::string::npos) { return memberNamesByID; }
-			auto structBodyStart = source.find('{', structPos);
-			auto structEnd = source.find("};", structPos);
-			if (structBodyStart == std::string::npos || structEnd == std::string::npos) {
-				return memberNamesByID;
-			}
-			std::istringstream ss(source.substr(structBodyStart + 1, structEnd - structBodyStart - 1));
-			std::string line;
-			while (std::getline(ss, line)) {
-				auto idPos = line.find("[[id(");
-				if (idPos == std::string::npos) { continue; }
-				auto idStart = idPos + 5;
-				auto idEnd = line.find(")]]", idStart);
-				if (idEnd == std::string::npos) { continue; }
-				uint32_t id = uint32_t(strtoul(line.substr(idStart, idEnd - idStart).c_str(), nullptr, 10));
-				auto nameEnd = line.rfind(' ', idPos - 1);
-				if (nameEnd == std::string::npos) { continue; }
-				auto nameStart = line.rfind(' ', nameEnd - 1);
-				nameStart = (nameStart == std::string::npos) ? 0 : nameStart + 1;
-				memberNamesByID[id] = line.substr(nameStart, nameEnd - nameStart);
-			}
-			return memberNamesByID;
-		};
-		for (uint32_t i = 0; i < pCreateInfo->stageCount; i++) {
-			auto& stage = pCreateInfo->pStages[i];
-			if (stage.stage != VK_SHADER_STAGE_INTERSECTION_BIT_KHR) continue;
-
-			std::string msl = getMSLSource(&stage, spv::ExecutionModelIntersectionKHR, "_mvk_isect");
-			resolveFunctionConstants(msl, stage.pSpecializationInfo);
-			if (msl.empty()) continue;
-			intersectionFunc = "_mvk_isect";
-
-			// Merge intersection shader's descriptor struct members into the raygen's
-			// descriptor struct, replacing padding placeholders with real members.
-			// This must happen before extracting the merged struct for the intersection function.
-			mergeDescriptorStructIntoRaygen(msl, nullptr);
-
-			auto funcPos = msl.find("_mvk_isect(");
-			if (funcPos == std::string::npos) continue;
-			auto lineStart = msl.rfind('\n', funcPos);
-			if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
-			auto sigStart = msl.find('(', funcPos);
-			size_t sigEnd = std::string::npos;
-			if (sigStart != std::string::npos) {
-				int depth = 1;
-				sigEnd = sigStart + 1;
-				while (sigEnd < msl.size() && depth > 0) {
-					if (msl[sigEnd] == '(') depth++;
-					else if (msl[sigEnd] == ')') depth--;
-					sigEnd++;
-				}
-				if (depth != 0) { sigEnd = std::string::npos; }
-			}
-			auto paramListEnd = (sigEnd == std::string::npos) ? std::string::npos : sigEnd - 1;
-			auto bodyStart = (paramListEnd == std::string::npos) ? std::string::npos : msl.find('{', paramListEnd);
-			if (sigStart == std::string::npos || paramListEnd == std::string::npos || bodyStart == std::string::npos) {
-				continue;
-			}
-
-			std::string preamble;
-			auto firstStructPos = msl.find("struct ");
-			preamble = (firstStructPos == std::string::npos) ? msl.substr(0, lineStart) : msl.substr(0, firstStructPos);
-			std::unordered_set<std::string> seenStructs;
-			appendStructDefinitions(preamble, seenStructs, msl, false);
-			appendStructDefinitions(preamble, seenStructs, raygenMSL, false);
-			auto mergedDescriptorStruct = extractStructDefinition(raygenMSL, "spvDescriptorSetBuffer0");
-			if (!mergedDescriptorStruct.empty()) {
-				preamble += mergedDescriptorStruct + "\n\n";
-			}
-			isectPreambleMSL = preamble;
-			auto originalDescriptorMembers = buildDescriptorMemberMap(msl);
-			auto mergedDescriptorMembers = buildDescriptorMemberMap(raygenMSL);
-
-			// Build the proper intersection function
-			std::string isectMSL;
-			isectMSL += "struct _MVKIsectPayload { uint3 launchID; uint3 launchSize; uint rayFlags; };\n\n";
-			isectMSL += "struct _MVKBBoxResult {\n";
-			isectMSL += "    bool accept [[accept_intersection]];\n";
-			isectMSL += "    float distance [[distance]];\n";
-			isectMSL += "};\n\n";
-
-			std::string originalParams = msl.substr(sigStart + 1, paramListEnd - sigStart - 1);
-			// Remove compute-kernel-only parameters that are passed via the payload
-			// in intersection functions (e.g., gl_LaunchIDNV [[thread_position_in_grid]],
-			// gl_LaunchSizeNV [[threads_per_grid]]).
-			for (const char* kernelAttr : {"[[thread_position_in_grid]]", "[[threads_per_grid]]"}) {
-				auto attrPos = originalParams.find(kernelAttr);
-				if (attrPos != std::string::npos) {
-					// Find the start of this parameter (scan back to previous comma or start)
-					auto paramStart = originalParams.rfind(',', attrPos);
-					// Find the end of this parameter (scan forward to next comma or end)
-					auto paramEnd = originalParams.find(',', attrPos);
-					if (paramStart != std::string::npos) {
-						// Not the first param: remove ", param"
-						size_t end = (paramEnd != std::string::npos) ? paramEnd : originalParams.size();
-						originalParams.erase(paramStart, end - paramStart);
-					} else if (paramEnd != std::string::npos) {
-						// First param with more after: remove "param, "
-						originalParams.erase(0, paramEnd + 1);
-						// Trim leading whitespace
-						auto firstNonSpace = originalParams.find_first_not_of(" \t\n\r");
-						if (firstNonSpace != std::string::npos && firstNonSpace > 0)
-							originalParams.erase(0, firstNonSpace);
-					} else {
-						// Only param: clear
-						originalParams.clear();
-					}
-				}
-			}
-			std::string newSig = "[[intersection(bounding_box, instancing)]]\n"
-				"_MVKBBoxResult _mvk_isect(\n"
-				"    ray_data _MVKIsectPayload& _mvk_payload [[payload]]";
-			if (!originalParams.empty()) {
-				newSig += ",\n    " + originalParams;
-			}
-			newSig += ")";
-			std::string funcBody = newSig + " " + msl.substr(bodyStart);
-			for (auto& [oldAttr, newAttr] : std::initializer_list<std::pair<const char*, const char*>>{
-				{"[[world_space_origin]]", "[[origin]]"},
-				{"[[world_space_direction]]", "[[direction]]"},
-				{"[[object_space_origin]]", "[[origin]]"},
-				{"[[object_space_direction]]", "[[direction]]"}
-			}) {
-				size_t attrPos = 0;
-				while ((attrPos = funcBody.find(oldAttr, attrPos)) != std::string::npos) {
-					funcBody.replace(attrPos, strlen(oldAttr), newAttr);
-					attrPos += strlen(newAttr);
-				}
-			}
-
-			// Replace gl_LaunchIDNV and gl_LaunchSizeNV with payload accessors
-			for (auto& [oldName, newName] : std::initializer_list<std::pair<std::string, std::string>>{
-				{"gl_LaunchSizeNV", "_mvk_payload.launchSize"},
-				{"gl_LaunchIDNV", "_mvk_payload.launchID"}
-			}) {
-				size_t pos = 0;
-				while ((pos = funcBody.find(oldName, pos)) != std::string::npos) {
-					funcBody.replace(pos, oldName.length(), newName);
-					pos += newName.length();
-				}
-			}
-			for (auto& [id, oldName] : originalDescriptorMembers) {
-				auto mergedIt = mergedDescriptorMembers.find(id);
-				if (mergedIt != mergedDescriptorMembers.end() && mergedIt->second != oldName) {
-					replaceWholeIdentifier(funcBody, oldName, mergedIt->second);
-				}
-			}
-
-			// Add local declarations for undeclared hit attribute variables.
-			{
-				auto funcBodyStart = funcBody.find('{');
-				if (funcBodyStart != std::string::npos) {
-					std::string localDecls;
-					std::unordered_map<std::string, std::string> localVarTypes;
-					auto trim = [](std::string str) -> std::string {
-						auto first = str.find_first_not_of(" \t\r\n");
-						if (first == std::string::npos) { return {}; }
-						auto last = str.find_last_not_of(" \t\r\n");
-						return str.substr(first, last - first + 1);
-					};
-					auto registerDeclType = [&](const std::string& line) {
-						auto assignPos = line.find('=');
-						auto semiPos = line.find(';');
-						auto declEnd = std::min(assignPos == std::string::npos ? line.size() : assignPos,
-												semiPos == std::string::npos ? line.size() : semiPos);
-						std::string decl = trim(line.substr(0, declEnd));
-						if (decl.empty()) { return; }
-						if (decl.rfind("return ", 0) == 0) { return; }
-						if (decl.rfind("if ", 0) == 0 || decl.rfind("while ", 0) == 0 || decl.rfind("for ", 0) == 0) { return; }
-						auto spacePos = decl.find_last_of(" \t");
-						if (spacePos == std::string::npos || spacePos + 1 >= decl.size()) { return; }
-						std::string typeName = trim(decl.substr(0, spacePos));
-						std::string varName = trim(decl.substr(spacePos + 1));
-						if (!varName.empty() && (isalnum(varName[0]) || varName[0] == '_')) {
-							while (!varName.empty() && (varName.front() == '*' || varName.front() == '&')) {
-								varName.erase(varName.begin());
-							}
-							if (!varName.empty()) {
-								localVarTypes[varName] = typeName;
-							}
-						}
-					};
-					std::istringstream lineStream(funcBody.substr(funcBodyStart + 1));
-					std::string line;
-					while (std::getline(lineStream, line)) {
-						registerDeclType(line);
-					}
-
-					auto declareIfNeeded = [&](const std::string& varName, const std::string& typeName) {
-						if (varName.empty() || typeName.empty()) { return; }
-						if (findWholeIdentifier(funcBody.substr(0, funcBodyStart), varName)) { return; }
-						if (funcBody.find(typeName + " " + varName, funcBodyStart) != std::string::npos) { return; }
-						if (localDecls.find(typeName + " " + varName + ";") != std::string::npos) { return; }
-						localDecls += "\n    " + typeName + " " + varName + ";";
-					};
-
-					size_t assignPos = funcBodyStart;
-					while ((assignPos = funcBody.find(" = ", assignPos)) != std::string::npos) {
-						auto lineBegin = funcBody.rfind('\n', assignPos);
-						lineBegin = (lineBegin == std::string::npos) ? funcBodyStart + 1 : lineBegin + 1;
-						auto lhs = trim(funcBody.substr(lineBegin, assignPos - lineBegin));
-						if (lhs.find(' ') != std::string::npos || lhs.find('\t') != std::string::npos) {
-							assignPos += 3;
-							continue;
-						}
-						auto rhsStart = assignPos + 3;
-						auto rhsEnd = funcBody.find(';', rhsStart);
-						if (rhsEnd == std::string::npos) { break; }
-						std::string rhs = trim(funcBody.substr(rhsStart, rhsEnd - rhsStart));
-						auto ctorPos = rhs.find('(');
-						if (ctorPos != std::string::npos) {
-							declareIfNeeded(lhs, trim(rhs.substr(0, ctorPos)));
-						} else {
-							auto it = localVarTypes.find(rhs);
-							if (it != localVarTypes.end()) {
-								declareIfNeeded(lhs, it->second);
-							}
-						}
-						assignPos = rhsEnd + 1;
-					}
-					if (!localDecls.empty()) {
-						funcBody.insert(funcBodyStart + 1, localDecls);
-					}
-				}
-			}
-
-			// Track each accepted reportIntersectionEXT. Metal intersection functions return
-			// one result, so retain the nearest report unless Vulkan requested the first hit.
-			{
-				auto isectBodyStart = funcBody.find('{');
-				if (isectBodyStart != std::string::npos) {
-					funcBody.insert(isectBodyStart + 1,
-						"\n    bool _mvk_reported = false;\n"
-						"    float _mvk_reported_distance = 3.402823466e+38f;");
-				}
-
-				size_t searchPos = isectBodyStart;
-				while ((searchPos = funcBody.find("bool ", searchPos)) != std::string::npos) {
-					auto assignmentEnd = funcBody.find(';', searchPos);
-					if (assignmentEnd == std::string::npos) { break; }
-					std::string declaration = funcBody.substr(searchPos, assignmentEnd - searchPos + 1);
-					if (declaration.find("= true;") == std::string::npos) {
-						searchPos = assignmentEnd + 1;
-						continue;
-					}
-					auto distancePos = funcBody.rfind("_mvk_isect_dist_", searchPos);
-					if (distancePos == std::string::npos) {
-						searchPos = assignmentEnd + 1;
-						continue;
-					}
-					auto distanceEnd = distancePos;
-					while (distanceEnd < funcBody.size() &&
-						   (isalnum(funcBody[distanceEnd]) || funcBody[distanceEnd] == '_')) {
-						distanceEnd++;
-					}
-					std::string distanceName = funcBody.substr(distancePos, distanceEnd - distancePos);
-					std::string reportCode =
-						"if ((_mvk_payload.rayFlags & " + std::to_string(spv::RayFlagsTerminateOnFirstHitKHRMask) +
-						") != 0) { return {true, " + distanceName + "}; }\n    "
-						"_mvk_reported = true;\n    "
-						"_mvk_reported_distance = min(_mvk_reported_distance, " + distanceName + ");\n    " +
-						declaration;
-					funcBody.replace(searchPos, declaration.size(), reportCode);
-					searchPos += reportCode.size();
-				}
-			}
-
-			// Remove the final empty return if present
-			{
-				auto funcBodyStart = funcBody.find('{');
-				auto lastReturn = funcBody.rfind("return;");
-				if (lastReturn != std::string::npos) {
-					funcBody.replace(lastReturn, 7, "return {_mvk_reported, _mvk_reported_distance};");
-				} else {
-					auto lastBrace = funcBody.rfind('}');
-					if (funcBodyStart != std::string::npos && lastBrace != std::string::npos &&
-						funcBody.find("return {_mvk_reported, _mvk_reported_distance};", funcBodyStart) == std::string::npos) {
-						funcBody.insert(lastBrace, "\n    return {_mvk_reported, _mvk_reported_distance};\n");
-					}
-				}
-			}
-
-			isectMSL += funcBody;
-			isectFuncMSL = isectMSL;
-			break; // Only one intersection shader
-		}
-	}
-
-	// Add the payload struct and modify OpTraceRayKHR to pass it when intersection functions are used.
-	if (hasIntersection && !isectFuncMSL.empty()) {
-		// Add payload struct before the kernel
-		auto kernelPos = raygenMSL.find("kernel void");
-		if (kernelPos != std::string::npos) {
-			raygenMSL.insert(kernelPos,
-				"struct _MVKIsectPayload { uint3 launchID; uint3 launchSize; uint rayFlags; };\n\n");
-		}
-
-		// Modify the OpTraceRayKHR intersect() call to pass an intersection_function_table
-		// and a payload with the launch ID.
-		// The current emission is:
-		//   intersector<instancing> _mtl_i;
-		//   auto _mtl_isect = _mtl_i.intersect(_mtl_r, AS, mask);
-		// We need:
-		//   _MVKIsectPayload _mtl_payload = { gl_LaunchIDNV, gl_LaunchSizeNV, _mtl_ray_flags };
-		//   auto _mtl_isect = _mtl_i.intersect(_mtl_r, AS, mask, _mvk_ift, _mtl_payload);
-		{
-			size_t searchPos = 0;
-			while (true) {
-				auto iPos = raygenMSL.find("intersector<instancing>", searchPos);
-				if (iPos == std::string::npos) { break; }
-				// Add payload before the ray declaration
-				auto rayPos = raygenMSL.find("ray _mtl_r(", iPos);
-				if (rayPos == std::string::npos) { break; }
-				raygenMSL.insert(rayPos,
-					"_MVKIsectPayload _mtl_payload = { gl_LaunchIDNV, gl_LaunchSizeNV, _mtl_ray_flags };\n      ");
-
-				// Find the intersect() call and add the function table + payload parameters
-				auto isectCall = raygenMSL.find(".intersect(_mtl_r,", iPos);
-				if (isectCall == std::string::npos) { break; }
-				// Find the closing ");"
-				auto callEnd = raygenMSL.find(");", isectCall);
-				if (callEnd == std::string::npos) { break; }
-				raygenMSL.insert(callEnd, ", _mvk_ift, _mtl_payload");
-				searchPos = callEnd + strlen(", _mvk_ift, _mtl_payload");
-			}
-
-			// Add the intersection function table as a kernel parameter.
-			// Find the closing ')' of the parameter list by matching parentheses.
-			auto mainSig = raygenMSL.find("kernel void main0(");
-			if (mainSig != std::string::npos) {
-				auto parenStart = raygenMSL.find('(', mainSig);
-				int depth = 1;
-				size_t sigEnd = parenStart + 1;
-				while (sigEnd < raygenMSL.size() && depth > 0) {
-					if (raygenMSL[sigEnd] == '(') depth++;
-					else if (raygenMSL[sigEnd] == ')') depth--;
-					if (depth > 0) sigEnd++;
-				}
-				if (depth == 0) {
-					bool needsTriangleIFTData = false;
-					for (auto& [_, vars] : helperExtraArgs) {
-						for (auto& var : vars) {
-							if (var.storage == spv::StorageClassHitAttributeKHR) {
-								needsTriangleIFTData = true;
-								break;
-							}
-						}
-						if (needsTriangleIFTData) { break; }
-					}
-					const char* iftType = hasIntersection
-						? (needsTriangleIFTData
-							? "intersection_function_table<triangle_data, instancing, world_space_data>"
-							: "intersection_function_table<instancing, world_space_data>")
-						: "intersection_function_table<instancing>";
-					raygenMSL.insert(sigEnd,
-						", " + std::string(iftType) + " _mvk_ift [[buffer(" + std::to_string(MVKRayTracingPipeline::kIntersectionFunctionTableBufferIndex) + ")]]");
-				}
-			}
-		}
-	}
-
-	// Use world-space data for object-space ray builtins and transform matrices.
-	// For triangle-only pipelines, also request triangle data so HitKind can read face winding.
-	{
-		bool needsTriangleIntersectionData = !hasIntersection;
-		if (!needsTriangleIntersectionData) {
-			for (auto& [_, vars] : helperExtraArgs) {
-				for (auto& var : vars) {
-					if (var.storage == spv::StorageClassHitAttributeKHR) {
-						needsTriangleIntersectionData = true;
-						break;
-					}
-				}
-				if (needsTriangleIntersectionData) { break; }
-			}
-		}
-
-		const char* replacement = needsTriangleIntersectionData
-			? "intersector<triangle_data, instancing, world_space_data>"
-			: "intersector<instancing, world_space_data>";
-		_mtlIntersectionFunctionSignature = MTLIntersectionFunctionSignatureInstancing |
-			MTLIntersectionFunctionSignatureWorldSpaceData;
-		if (needsTriangleIntersectionData) {
-			_mtlIntersectionFunctionSignature = (MTLIntersectionFunctionSignature)(
-				_mtlIntersectionFunctionSignature | MTLIntersectionFunctionSignatureTriangleData);
-		}
-		size_t iPos = 0;
-		while ((iPos = raygenMSL.find("intersector<instancing>", iPos)) != std::string::npos) {
-			raygenMSL.replace(iPos, strlen("intersector<instancing>"), replacement);
-			iPos += strlen(replacement);
-		}
-		if (needsTriangleIntersectionData) {
-			iPos = 0;
-			const std::string oldName = "intersector<instancing, world_space_data>";
-			const std::string newName = "intersector<triangle_data, instancing, world_space_data>";
-			while ((iPos = raygenMSL.find(oldName, iPos)) != std::string::npos) {
-				raygenMSL.replace(iPos, oldName.size(), newName);
-				iPos += newName.size();
-			}
-		}
-	}
-
-	// Helper lambda to add a kernel parameter if it's not already present.
-	auto addKernelParam = [&](const char* param) {
-		auto kernelStart = raygenMSL.find("kernel void main0(");
-		auto kernelBody = raygenMSL.find('{', kernelStart);
-		auto found = raygenMSL.find(param, kernelStart);
-		if (found == std::string::npos || found > kernelBody) {
-			auto parenStart = raygenMSL.find('(', kernelStart);
-			int depth = 1;
-			size_t sigEnd = parenStart + 1;
-			while (sigEnd < raygenMSL.size() && depth > 0) {
-				if (raygenMSL[sigEnd] == '(') depth++;
-				else if (raygenMSL[sigEnd] == ')') depth--;
-				if (depth > 0) sigEnd++;
-			}
-			if (depth == 0) {
-				std::string prefix = (sigEnd > parenStart + 1) ? ", " : "";
-				raygenMSL.insert(sigEnd, prefix + param);
-			}
-		}
-	};
-
-	bool needsHitSBT = false;
-	bool needsMissSBT = false;
-	bool needsCallableSBT = callableFuncs.size() > 1;
-	auto buildHelperArgs = [&](const std::string& fn) -> std::string {
-		std::string args = "spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
-		auto it = helperExtraArgs.find(fn);
-		if (it == helperExtraArgs.end()) { return args; }
-		for (auto& var : it->second) {
-			const MVKRTSpecialVarInfo* callerVar = nullptr;
-			spv::StorageClass callerStorage = spv::StorageClassGeneric;
-			switch (var.storage) {
-				case spv::StorageClassIncomingRayPayloadKHR:
-					callerStorage = spv::StorageClassRayPayloadKHR;
-					break;
-				case spv::StorageClassIncomingCallableDataKHR:
-					callerStorage = spv::StorageClassCallableDataKHR;
-					break;
-				default:
-					break;
-			}
-			if (callerStorage != spv::StorageClassGeneric) {
-				for (auto& candidate : raygenSpecialVars) {
-					if (candidate.storage == callerStorage && candidate.location == var.location) {
-						callerVar = &candidate;
-						break;
-					}
-				}
-			}
-			args += ", " + (callerVar ? callerVar->name : var.name);
-		}
-		return args;
-	};
-
-	// Now modify the raygen kernel's OpTraceRayKHR site to call the helper functions.
-	// The SPIRV-Cross emission left a marker: "(void)_mtl_isect;"
-	// Replace it with calls to the closest-hit or miss function based on intersection result.
-	{
-		// Metal cannot reliably distinguish Vulkan opaque and non-opaque geometry when
-		// applying opacity cull modes without an intersection function table. Remove
-		// those modes and filter results using the Vulkan metadata carried per primitive.
-		size_t opacityCullPos = 0;
-		while ((opacityCullPos = raygenMSL.find("_mtl_i.set_opacity_cull_mode(", opacityCullPos)) != std::string::npos) {
-			auto ifLineStart = raygenMSL.rfind('\n', opacityCullPos);
-			ifLineStart = (ifLineStart == std::string::npos) ? 0 : ifLineStart + 1;
-			ifLineStart = raygenMSL.rfind('\n', ifLineStart > 0 ? ifLineStart - 1 : 0);
-			ifLineStart = (ifLineStart == std::string::npos) ? 0 : ifLineStart + 1;
-			auto statementEnd = raygenMSL.find(';', opacityCullPos);
-			if (statementEnd == std::string::npos) { break; }
-			if (statementEnd + 1 < raygenMSL.size() && raygenMSL[statementEnd + 1] == '\n') {
-				statementEnd++;
-			}
-			raygenMSL.erase(ifLineStart, statementEnd - ifLineStart + 1);
-			opacityCullPos = ifLineStart;
-		}
-
-		std::string callCode;
-		if (!closestHitFuncs.empty() || !anyHitFuncs.empty() || !missFuncs.empty() || hasIntersection) {
-			// Populate RT builtins struct from intersection result and ray data.
-			callCode =  "  _MVKRTBuiltins _mvk_rt;\n";
-			callCode += "  _mvk_rt.worldRayOrigin = _mtl_r.origin;\n";
-			callCode += "  _mvk_rt.worldRayDirection = _mtl_r.direction;\n";
-			callCode += "  _mvk_rt.rayTmin = _mtl_r.min_distance;\n";
-			callCode += "  _mvk_rt.rayTmax = _mtl_isect.distance;\n";
-			callCode += "  const device uint* _mvk_primitive_data = (const device uint*)_mtl_isect.primitive_data;\n";
-			callCode += "  _mvk_rt.primitiveId = _mvk_primitive_data ? _mvk_primitive_data[1] : _mtl_isect.primitive_id;\n";
-			callCode += "  _mvk_rt.instanceId = _mtl_isect.instance_id;\n";
-			callCode += "  _mvk_rt.geometryId = _mvk_primitive_data ? _mvk_primitive_data[0] : _mtl_isect.geometry_id;\n";
-			callCode += "  _mvk_rt.instanceCustomIndex = _mtl_isect.user_instance_id;\n";
-			callCode += "  _mvk_rt.worldToObjectTransform = _mtl_isect.world_to_object_transform;\n";
-			callCode += "  _mvk_rt.objectToWorldTransform = _mtl_isect.object_to_world_transform;\n";
-			if (!hasIntersection)
-				callCode += "  _mvk_rt.hitKind = (_mtl_isect.type == intersection_type::triangle) ? (_mtl_isect.triangle_front_facing ? 0xFEu : 0xFFu) : 0u;\n";
-			else
-				callCode += "  _mvk_rt.hitKind = 0u;\n";
-			callCode += "  _mvk_rt.objectRayOrigin = (_mvk_rt.worldToObjectTransform * float4(_mtl_r.origin, 1.0)).xyz;\n";
-			callCode += "  _mvk_rt.objectRayDirection = (_mvk_rt.worldToObjectTransform * float4(_mtl_r.direction, 0.0)).xyz;\n";
-			callCode += "  _mvk_rt.incomingRayFlags = _mtl_ray_flags;\n";
-			callCode += "  if (_mtl_isect.type != intersection_type::none) {\n";
-
-			// Build hit group dispatch: map shader groups to hit shader functions.
-			// Multiple hit groups use a switch on instance_id to dispatch to the right shader.
-			std::vector<std::pair<uint32_t, std::string>> hitGroupDispatch; // group index -> chit func
-			std::vector<std::pair<uint32_t, std::string>> ahitGroupDispatch;
-			for (uint32_t g = 0; g < _shaderGroupCount; g++) {
-				auto& group = pCreateInfo->pGroups[g];
-				if (group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR ||
-					group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR) {
-					if (group.closestHitShader != VK_SHADER_UNUSED_KHR) {
-						auto it = stageToFuncName.find(group.closestHitShader);
-						if (it != stageToFuncName.end())
-							hitGroupDispatch.push_back({g, it->second});
-					}
-					if (group.anyHitShader != VK_SHADER_UNUSED_KHR) {
-						auto it = stageToFuncName.find(group.anyHitShader);
-						if (it != stageToFuncName.end())
-							ahitGroupDispatch.push_back({g, it->second});
-					}
-				}
-			}
-
-			// Build miss shader dispatch
-			std::vector<std::pair<uint32_t, std::string>> missGroupDispatch;
-			uint32_t missIdx = 0;
-			for (uint32_t g = 0; g < _shaderGroupCount; g++) {
-				auto& group = pCreateInfo->pGroups[g];
-				if (group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR &&
-					group.generalShader != VK_SHADER_UNUSED_KHR) {
-					auto it = stageToFuncName.find(group.generalShader);
-					if (it != stageToFuncName.end() &&
-						pCreateInfo->pStages[group.generalShader].stage == VK_SHADER_STAGE_MISS_BIT_KHR) {
-						missGroupDispatch.push_back({missIdx++, it->second});
-					}
-				}
-			}
-
-			if (hitGroupDispatch.size() > 1 || ahitGroupDispatch.size() > 1) {
-				needsHitSBT = true;
-				callCode += "    uint _mvk_instance_sbt_offset = _mvk_instance_sbt_offsets ? _mvk_instance_sbt_offsets[_mvk_rt.instanceId] : 0u;\n";
-				callCode += "    uint _mvk_hit_group = _mvk_hit_sbt[_mvk_instance_sbt_offset + _mvk_sbt_offset + (_mvk_rt.geometryId * _mvk_sbt_stride)];\n";
-			}
-
-			{
-				std::unordered_map<std::string, std::string> hitAttrInit;
-				for (auto& dispatch : {ahitGroupDispatch, hitGroupDispatch}) {
-					for (auto& [gIdx, fn] : dispatch) {
-						auto it = helperExtraArgs.find(fn);
-						if (it == helperExtraArgs.end()) { continue; }
-						for (auto& var : it->second) {
-							if (var.storage != spv::StorageClassHitAttributeKHR || hitAttrInit.count(var.name)) {
-								continue;
-							}
-							if (var.typeName == "float2") {
-								hitAttrInit[var.name] = var.typeName + " " + var.name + " = _mtl_isect.triangle_barycentric_coord;";
-							} else {
-								hitAttrInit[var.name] = var.typeName + " " + var.name + " = {};";
-							}
-						}
-					}
-				}
-				for (auto& [name, init] : hitAttrInit) {
-					callCode += "    " + init + "\n";
-				}
-			}
-
-			// Emit any-hit dispatch
-			if (!ahitGroupDispatch.empty()) {
-				callCode += "    bool _mvk_opaque = _mvk_primitive_data && ((_mvk_primitive_data[2] & " +
-					std::to_string(VK_GEOMETRY_OPAQUE_BIT_KHR) + ") != 0);\n";
-				callCode += "    uint _mvk_instance_flags_value = _mvk_instance_flags ? _mvk_instance_flags[_mvk_rt.instanceId] : 0u;\n";
-				callCode += "    if ((_mvk_instance_flags_value & " + std::to_string(VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR) + ") != 0) _mvk_opaque = true;\n";
-				callCode += "    if ((_mvk_instance_flags_value & " + std::to_string(VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR) + ") != 0) _mvk_opaque = false;\n";
-				callCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsOpaqueKHRMask) + ") != 0) _mvk_opaque = true;\n";
-				callCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsNoOpaqueKHRMask) + ") != 0) _mvk_opaque = false;\n";
-				callCode += "    if (!_mvk_opaque) {\n";
-				if (ahitGroupDispatch.size() == 1) {
-					callCode += "      " + ahitGroupDispatch[0].second + "(" + buildHelperArgs(ahitGroupDispatch[0].second) + ");\n";
-				} else {
-					callCode += "      switch (_mvk_hit_group) {\n";
-					for (auto& [gIdx, fn] : ahitGroupDispatch)
-						callCode += "        case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
-					callCode += "        default: " + ahitGroupDispatch[0].second + "(" + buildHelperArgs(ahitGroupDispatch[0].second) + "); break;\n      }\n";
-				}
-				callCode += "    }\n";
-			}
-
-			// Emit closest-hit dispatch
-			if (!hitGroupDispatch.empty()) {
-				callCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsSkipClosestHitShaderKHRMask) + ") == 0) {\n";
-			}
-			if (hitGroupDispatch.size() == 1) {
-				callCode += "      " + hitGroupDispatch[0].second + "(" + buildHelperArgs(hitGroupDispatch[0].second) + ");\n";
-			} else if (hitGroupDispatch.size() > 1) {
-				callCode += "      switch (_mvk_hit_group) {\n";
-				for (auto& [gIdx, fn] : hitGroupDispatch)
-					callCode += "        case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
-				callCode += "        default: " + hitGroupDispatch[0].second + "(" + buildHelperArgs(hitGroupDispatch[0].second) + "); break;\n      }\n";
-			}
-			if (!hitGroupDispatch.empty()) {
-				callCode += "    }\n";
-			}
-
-			callCode += "  } else {\n";
-
-			// Emit miss dispatch
-			if (missGroupDispatch.size() == 1) {
-				callCode += "    " + missGroupDispatch[0].second + "(" + buildHelperArgs(missGroupDispatch[0].second) + ");\n";
-			} else if (missGroupDispatch.size() > 1) {
-				needsMissSBT = true;
-				callCode += "    switch (_mvk_miss_sbt[_mvk_miss_index]) {\n";
-				for (auto& [gIdx, fn] : missGroupDispatch)
-					callCode += "      case " + std::to_string(gIdx) + ": " + fn + "(" + buildHelperArgs(fn) + "); break;\n";
-				callCode += "      default: " + missGroupDispatch[0].second + "(" + buildHelperArgs(missGroupDispatch[0].second) + "); break;\n    }\n";
-			}
-			callCode += "  }\n";
-		}
-
-		size_t markerPos = 0;
-		while ((markerPos = raygenMSL.find("(void)_mtl_isect;", markerPos)) != std::string::npos) {
-			std::string traceCallCode;
-			auto isectDecl = raygenMSL.rfind("auto _mtl_isect = ", markerPos);
-			if (isectDecl != std::string::npos) {
-				auto expressionStart = isectDecl + strlen("auto _mtl_isect = ");
-				auto expressionEnd = raygenMSL.find(';', expressionStart);
-				if (expressionEnd != std::string::npos && expressionEnd < markerPos) {
-					std::string intersectExpression = raygenMSL.substr(expressionStart, expressionEnd - expressionStart);
-					traceCallCode += "  while (_mtl_isect.type != intersection_type::none) {\n";
-					traceCallCode += "    const device uint* _mvk_filter_primitive_data = (const device uint*)_mtl_isect.primitive_data;\n";
-					traceCallCode += "    bool _mvk_filter_opaque = _mvk_filter_primitive_data && ((_mvk_filter_primitive_data[2] & " + std::to_string(VK_GEOMETRY_OPAQUE_BIT_KHR) + ") != 0);\n";
-					traceCallCode += "    uint _mvk_filter_instance_flags = _mvk_instance_flags ? _mvk_instance_flags[_mtl_isect.instance_id] : 0u;\n";
-					traceCallCode += "    if ((_mvk_filter_instance_flags & " + std::to_string(VK_GEOMETRY_INSTANCE_FORCE_OPAQUE_BIT_KHR) + ") != 0) _mvk_filter_opaque = true;\n";
-					traceCallCode += "    if ((_mvk_filter_instance_flags & " + std::to_string(VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR) + ") != 0) _mvk_filter_opaque = false;\n";
-					traceCallCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsOpaqueKHRMask) + ") != 0) _mvk_filter_opaque = true;\n";
-					traceCallCode += "    if ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsNoOpaqueKHRMask) + ") != 0) _mvk_filter_opaque = false;\n";
-					traceCallCode += "    bool _mvk_filter_culled = ((_mtl_ray_flags & " + std::to_string(spv::RayFlagsCullOpaqueKHRMask) + ") != 0) && _mvk_filter_opaque;\n";
-					traceCallCode += "    _mvk_filter_culled = _mvk_filter_culled || (((_mtl_ray_flags & " + std::to_string(spv::RayFlagsCullNoOpaqueKHRMask) + ") != 0) && !_mvk_filter_opaque);\n";
-					traceCallCode += "    if (!_mvk_filter_culled) break;\n";
-					traceCallCode += "    _mtl_r.min_distance = nextafter(_mtl_isect.distance, 3.402823466e+38f);\n";
-					traceCallCode += "    _mtl_isect = " + intersectExpression + ";\n";
-					traceCallCode += "  }\n";
-				}
-			}
-			traceCallCode += callCode;
-			raygenMSL.replace(markerPos, strlen("(void)_mtl_isect;"), traceCallCode);
-			markerPos += traceCallCode.size();
-		}
-
-		// Ensure kernel has all parameters that helpers need.
-		// The raygen shader might not reference descriptors or launch builtins directly.
-		{
-			auto ks = raygenMSL.find("kernel void main0(");
-			auto kb = raygenMSL.find('{', ks);
-			if (ks != std::string::npos && raygenMSL.find("spvDescriptorSet0", ks) > kb) {
-				auto firstParam = raygenMSL.find('(', ks) + 1;
-				auto closeP = raygenMSL.find(')', firstParam);
-				bool hasParams = false;
-				for (size_t p = firstParam; p < closeP; p++) {
-					if (raygenMSL[p] != ' ' && raygenMSL[p] != '\n' && raygenMSL[p] != '\t') {
-						hasParams = true; break;
-					}
-				}
-				std::string suffix = hasParams ? ", " : "";
-				raygenMSL.insert(firstParam,
-					"constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]]" + suffix);
-			}
-		}
-		addKernelParam("uint3 gl_LaunchIDNV [[thread_position_in_grid]]");
-		addKernelParam("uint3 gl_LaunchSizeNV [[threads_per_grid]]");
-		if (needsMissSBT)
-			addKernelParam(("constant uint* _mvk_miss_sbt [[buffer(" + std::to_string(MVKRayTracingPipeline::kMissSBTBufferIndex) + ")]]").c_str());
-		if (needsHitSBT)
-			addKernelParam(("constant uint* _mvk_hit_sbt [[buffer(" + std::to_string(MVKRayTracingPipeline::kHitSBTBufferIndex) + ")]]").c_str());
-		if (needsHitSBT)
-			addKernelParam(("constant uint* _mvk_instance_sbt_offsets [[buffer(" + std::to_string(MVKRayTracingPipeline::kInstanceSBTOffsetBufferIndex) + ")]]").c_str());
-		addKernelParam(("constant uint* _mvk_instance_flags [[buffer(" + std::to_string(MVKRayTracingPipeline::kInstanceFlagsBufferIndex) + ")]]").c_str());
-	}
-
-	// Replace executeCallableEXT markers with calls to callable helpers.
-	if (!callableFuncs.empty()) {
-		std::vector<std::pair<uint32_t, std::string>> callableGroupDispatch;
-		for (uint32_t g = 0; g < _shaderGroupCount; g++) {
-			auto& group = pCreateInfo->pGroups[g];
-			if (group.type != VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR ||
-				group.generalShader == VK_SHADER_UNUSED_KHR) {
-				continue;
-			}
-			auto it = stageToFuncName.find(group.generalShader);
-			if (it != stageToFuncName.end() &&
-				pCreateInfo->pStages[group.generalShader].stage == VK_SHADER_STAGE_CALLABLE_BIT_KHR) {
-				callableGroupDispatch.push_back({g, it->second});
-			}
-		}
-
-		// Ensure the kernel has the descriptor set parameter (the raygen shader
-		// might not reference any descriptors, but the callable shader does).
-		auto kernelStart = raygenMSL.find("kernel void main0(");
-		auto descInKernel = raygenMSL.find("spvDescriptorSet0", kernelStart);
-		auto kernelBody = raygenMSL.find('{', kernelStart);
-		if (kernelStart != std::string::npos &&
-		    (descInKernel == std::string::npos || descInKernel > kernelBody)) {
-			auto mainSig2 = raygenMSL.find("kernel void main0(");
-			if (mainSig2 != std::string::npos) {
-				auto firstParam = raygenMSL.find('(', mainSig2) + 1;
-				auto closeP = raygenMSL.find(')', firstParam);
-				bool hasParams = false;
-				for (size_t p = firstParam; p < closeP; p++) {
-					if (raygenMSL[p] != ' ' && raygenMSL[p] != '\n' && raygenMSL[p] != '\t') {
-						hasParams = true; break;
-					}
-				}
-				std::string suffix = hasParams ? ", " : "";
-				raygenMSL.insert(firstParam,
-					"constant spvDescriptorSetBuffer0& spvDescriptorSet0 [[buffer(0)]]" + suffix);
-			}
-		}
-
-		// Ensure gl_LaunchIDNV and gl_LaunchSizeNV parameters exist in the kernel.
-		addKernelParam("uint3 gl_LaunchIDNV [[thread_position_in_grid]]");
-		addKernelParam("uint3 gl_LaunchSizeNV [[threads_per_grid]]");
-		if (needsCallableSBT) {
-			addKernelParam(("constant uint* _mvk_callable_sbt [[buffer(" + std::to_string(MVKRayTracingPipeline::kCallableSBTBufferIndex) + ")]]").c_str());
-		}
-
-		// Replace each callable marker, passing the caller's payload variable by reference.
-		// After each marker, find the first _NN variable used — that's the callable data.
-		{
-			size_t pos;
-			while ((pos = raygenMSL.find("/* MVK_EXECUTE_CALLABLE */")) != std::string::npos) {
-				// Find the payload variable used after the marker
-				std::string payloadVar;
-				size_t searchStart = pos + strlen("/* MVK_EXECUTE_CALLABLE */");
-				size_t nextLine = raygenMSL.find('\n', searchStart);
-				if (nextLine == std::string::npos) nextLine = raygenMSL.size();
-				// Scan remaining function body for first _NN identifier
-				for (size_t s = searchStart; s < raygenMSL.size(); s++) {
-					if (raygenMSL[s] == '_' && s + 1 < raygenMSL.size() && isdigit(raygenMSL[s + 1])) {
-						if (s > 0 && (isalnum(raygenMSL[s - 1]) || raygenMSL[s - 1] == '_')) continue;
-						size_t nameStart = s;
-						s++;
-						while (s < raygenMSL.size() && isdigit(raygenMSL[s])) s++;
-						if (s < raygenMSL.size() && (isalnum(raygenMSL[s]) || raygenMSL[s] == '_')) continue;
-						payloadVar = raygenMSL.substr(nameStart, s - nameStart);
-						break;
-					}
-				}
-				std::string callableCall = "{ _MVKRTBuiltins _mvk_rt = {}; ";
-				if (callableGroupDispatch.size() <= 1) {
-					callableCall += callableFuncs[0] + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
-					if (!payloadVar.empty()) callableCall += ", " + payloadVar;
-					callableCall += "); ";
-				} else {
-					callableCall += "switch (_mvk_callable_sbt[_mvk_callable_index]) { ";
-					for (auto& [gIdx, fn] : callableGroupDispatch) {
-						callableCall += "case " + std::to_string(gIdx) + ": " + fn + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
-						if (!payloadVar.empty()) callableCall += ", " + payloadVar;
-						callableCall += "); break; ";
-					}
-					callableCall += "default: " + callableGroupDispatch[0].second + "(spvDescriptorSet0, gl_LaunchIDNV, gl_LaunchSizeNV, _mvk_rt";
-					if (!payloadVar.empty()) callableCall += ", " + payloadVar;
-					callableCall += "); break; } ";
-				}
-				callableCall += "}\n";
-				raygenMSL.replace(pos, strlen("/* MVK_EXECUTE_CALLABLE */"), callableCall);
-			}
-
-			// Add the payload parameter to each callable helper function definition.
-			// Find the callable helper's payload variable and infer its type from assignment.
-			for (auto& cfn : callableFuncs) {
-				auto funcPos = raygenMSL.find(cfn + "(");
-				if (funcPos == std::string::npos) continue;
-				auto bodyStart = raygenMSL.find('{', funcPos);
-				if (bodyStart == std::string::npos) continue;
-				int depth = 1;
-				size_t bodyEnd = bodyStart + 1;
-				while (bodyEnd < raygenMSL.size() && depth > 0) {
-					if (raygenMSL[bodyEnd] == '{') depth++;
-					else if (raygenMSL[bodyEnd] == '}') depth--;
-					bodyEnd++;
-				}
-				std::string body = raygenMSL.substr(bodyStart + 1, bodyEnd - bodyStart - 2);
-				// Find first _NN = type(...) assignment to get variable name and type
-				std::string helperPayload, payloadType;
-				static const char* knownPayloadTypes[] = {
-					"uint4", "uint3", "uint2", "uint",
-					"int4", "int3", "int2", "int",
-					"float4", "float3", "float2", "float",
-					"half4", "half3", "half2", "half", nullptr
-				};
-				for (const char** tp = knownPayloadTypes; *tp; tp++) {
-					std::string pat = std::string(" = ") + *tp + "(";
-					auto assignPos = body.find(pat);
-					if (assignPos == std::string::npos) continue;
-					// Extract the variable name before " = type("
-					auto nameEnd = assignPos;
-					auto ns = body.rfind('\n', nameEnd);
-					if (ns == std::string::npos) ns = 0; else ns++;
-					while (ns < nameEnd && (body[ns] == ' ' || body[ns] == '\t')) ns++;
-					std::string varName = body.substr(ns, nameEnd - ns);
-					if (varName.size() > 1 && varName[0] == '_' &&
-						std::all_of(varName.begin() + 1, varName.end(), ::isdigit)) {
-						helperPayload = varName;
-						payloadType = *tp;
-						break;
-					}
-				}
-				if (!helperPayload.empty() && !payloadType.empty()) {
-					auto sigClose = raygenMSL.find(')', funcPos);
-					if (sigClose != std::string::npos) {
-						raygenMSL.insert(sigClose, ", thread " + payloadType + "& " + helperPayload);
-					}
-				}
-			}
-		}
-	}
-
-	if (!raygenSpecialVars.empty()) {
-		auto kernelPos = raygenMSL.find("kernel void main0(");
-		auto bodyStart = raygenMSL.find('{', kernelPos);
-		if (bodyStart != std::string::npos) {
-			std::string localDecls;
-			for (auto& var : raygenSpecialVars) {
-				switch (var.storage) {
-					case spv::StorageClassRayPayloadKHR:
-					case spv::StorageClassCallableDataKHR:
-						break;
-					default:
-						continue;
-				}
-
-				if (var.name.empty() || var.typeName.empty()) { continue; }
-				if (!findWholeIdentifier(raygenMSL, var.name, bodyStart)) { continue; }
-				if (findWholeIdentifier(raygenMSL.substr(kernelPos, bodyStart - kernelPos), var.name)) { continue; }
-				if (raygenMSL.find(var.typeName + " " + var.name, bodyStart) != std::string::npos) { continue; }
-				localDecls += "\n    " + var.typeName + " " + var.name + " = {};";
-			}
-			if (!localDecls.empty()) {
-				raygenMSL.insert(bodyStart + 1, localDecls);
-			}
-		}
-	}
-
-	_needsMissShaderBindingTable = needsMissSBT;
-	_needsHitShaderBindingTable = needsHitSBT;
-	_needsCallableShaderBindingTable = needsCallableSBT;
-
-	// Fix undeclared SPIR-V temporary variables in the combined MSL.
-	// SPIRV-Cross omits declarations for ray payload (StorageClassRayPayloadKHR,
-	// StorageClassIncomingRayPayloadKHR) and callable data variables. Scan each
-	// function body for undeclared _NN variables and add declarations.
-	{
-		// First pass: find all _NN = type(...) assignments to determine types.
-		std::unordered_map<std::string, std::string> varTypes; // varName -> type
-		static const char* knownTypes[] = {
-			"uint4", "uint3", "uint2", "uint",
-			"int4", "int3", "int2", "int",
-			"float4", "float3", "float2", "float",
-			"half4", "half3", "half2", "half",
-			"bool", nullptr
-		};
-
-		for (const char** tp = knownTypes; *tp; tp++) {
-			std::string pattern = std::string(" = ") + *tp + "(";
-			size_t pos = 0;
-			while ((pos = raygenMSL.find(pattern, pos)) != std::string::npos) {
-				auto nameEnd = pos;
-				auto nameStart = raygenMSL.rfind('\n', nameEnd);
-				if (nameStart == std::string::npos) nameStart = 0; else nameStart++;
-				while (nameStart < nameEnd && (raygenMSL[nameStart] == ' ' || raygenMSL[nameStart] == '\t'))
-					nameStart++;
-				std::string varName = raygenMSL.substr(nameStart, nameEnd - nameStart);
-				if (varName.size() > 1 && varName[0] == '_' &&
-					std::all_of(varName.begin() + 1, varName.end(), ::isdigit)) {
-					if (varTypes.find(varName) == varTypes.end())
-						varTypes[varName] = *tp;
-				}
-				pos += pattern.length();
-			}
-		}
-
-		// Second pass: find all _NN identifiers used anywhere in the MSL.
-		// If they don't have a known type from assignments, default to uint4
-		// (the most common ray payload type).
-		{
-			size_t pos = 0;
-			while (pos < raygenMSL.size()) {
-				if (raygenMSL[pos] == '_' && pos + 1 < raygenMSL.size() && isdigit(raygenMSL[pos + 1])) {
-					// Check it's not part of a larger identifier (preceded by alnum or _)
-					if (pos > 0 && (isalnum(raygenMSL[pos - 1]) || raygenMSL[pos - 1] == '_')) {
-						pos++;
-						continue;
-					}
-					size_t nameStart = pos;
-					pos++; // skip '_'
-					while (pos < raygenMSL.size() && isdigit(raygenMSL[pos])) pos++;
-					// Check it's not followed by alnum/_ (larger identifier) or ( (type constructor)
-					if (pos < raygenMSL.size() && (isalnum(raygenMSL[pos]) || raygenMSL[pos] == '_')) continue;
-					if (pos < raygenMSL.size() && raygenMSL[pos] == '(') continue; // skip type constructors
-					std::string varName = raygenMSL.substr(nameStart, pos - nameStart);
-					if (varTypes.find(varName) == varTypes.end())
-						varTypes[varName] = "uint4"; // default payload type
-				} else {
-					pos++;
-				}
-			}
-		}
-
-		auto isVarDeclaredInBody = [&](const std::string& body, const std::string& varName) -> bool {
-			size_t pos = 0;
-			while ((pos = body.find(varName, pos)) != std::string::npos) {
-				if (pos > 0 && (isalnum(body[pos - 1]) || body[pos - 1] == '_')) {
-					pos += varName.size();
-					continue;
-				}
-				size_t endPos = pos + varName.size();
-				if (endPos < body.size() && (isalnum(body[endPos]) || body[endPos] == '_')) {
-					pos += varName.size();
-					continue;
-				}
-
-				auto lineStart = body.rfind('\n', pos);
-				if (lineStart == std::string::npos) lineStart = 0; else lineStart++;
-				std::string prefix = trimString(body.substr(lineStart, pos - lineStart));
-				if (prefix.empty()) {
-					pos = endPos;
-					continue;
-				}
-
-				char prevChar = (pos > 0) ? body[pos - 1] : '\0';
-				// Skip whitespace after the variable name to find the actual suffix character
-				size_t suffixPos = endPos;
-				while (suffixPos < body.size() && (body[suffixPos] == ' ' || body[suffixPos] == '\t'))
-					suffixPos++;
-				char suffix = (suffixPos < body.size()) ? body[suffixPos] : '\0';
-				if ((prevChar == ' ' || prevChar == '\t' || prevChar == '&' || prevChar == '*') &&
-					(suffix == ';' || suffix == '=' || suffix == '[')) {
-					return true;
-				}
-
-				pos = endPos;
-			}
-			return false;
-		};
-
-		// For each function, check which _NN variables are used but not declared.
-		size_t funcStart = 0;
-		while (true) {
-			auto staticPos = raygenMSL.find("static void ", funcStart);
-			auto kernelPos = raygenMSL.find("kernel void ", funcStart);
-			size_t nextFunc = std::string::npos;
-			if (staticPos != std::string::npos && (kernelPos == std::string::npos || staticPos < kernelPos))
-				nextFunc = staticPos;
-			else if (kernelPos != std::string::npos)
-				nextFunc = kernelPos;
-			if (nextFunc == std::string::npos) break;
-
-			auto bodyStart = raygenMSL.find('{', nextFunc);
-			if (bodyStart == std::string::npos) break;
-
-			// Find matching closing brace
-			int depth = 1;
-			size_t bodyEnd = bodyStart + 1;
-			while (bodyEnd < raygenMSL.size() && depth > 0) {
-				if (raygenMSL[bodyEnd] == '{') depth++;
-				else if (raygenMSL[bodyEnd] == '}') depth--;
-				bodyEnd++;
-			}
-
-			std::string body = raygenMSL.substr(bodyStart, bodyEnd - bodyStart);
-			std::string paramSection = raygenMSL.substr(nextFunc, bodyStart - nextFunc);
-			std::string decls;
-
-			for (auto& [varName, varType] : varTypes) {
-				if (!findWholeIdentifier(body, varName)) continue;
-				if (extractedConstantNames.find(varName) != extractedConstantNames.end()) continue;
-				if (isVarDeclaredInBody(body, varName)) continue;
-				// Check if it's in the function parameter list (as a parameter, not part of the function name)
-				// Look for varName preceded by "& " or "  " (in parameter context)
-				auto sigStart = paramSection.find('(');
-				if (sigStart != std::string::npos && findWholeIdentifier(paramSection, varName, sigStart)) continue;
-				decls += "\n    " + varType + " " + varName + " = " + varType + "(0);";
-			}
-
-			if (!decls.empty()) {
-				raygenMSL.insert(bodyStart + 1, decls);
-			}
-
-			funcStart = bodyStart + 1 + decls.size();
-		}
-	}
-	// Compile the combined MSL source.
-	_mtlPipelineState = nil;
-	_mtlThreadgroupSize = {4, 4, 4};
-
-	NSError* err = nil;
-	id<MTLDevice> mtlDev = getPhysicalDevice()->getMTLDevice();
-	MTLCompileOptions* compileOptions = _device->getMTLCompileOptions();
-
-	id<MTLLibrary> mtlLib = [mtlDev newLibraryWithSource: @(raygenMSL.c_str())
-											 options: compileOptions
-											   error: &err];
-	// compileOptions not released — Metal may reference it asynchronously during compilation.
-
-	const char* rtDumpDir = getMVKConfig().shaderDumpDir;
-	if (rtDumpDir && *rtDumpDir) {
-		mkdir(rtDumpDir, 0755);
-		std::string combinedPath = std::string(rtDumpDir) + "/rt-combined-main0.metal";
-		FILE* file = fopen(combinedPath.c_str(), "wb");
-		if (file) {
-			fwrite(raygenMSL.data(), 1, raygenMSL.size(), file);
-			fclose(file);
-		}
-	}
-
-	if (err && !mtlLib) {
-		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
-			"RT pipeline MSL compile failed: %s", err.localizedDescription.UTF8String));
-		_hasValidMTLPipelineStates = false;
-		return;
-	}
-
-	id<MTLFunction> mtlFunc = [mtlLib newFunctionWithName: @"main0"];
-	if (!mtlFunc) {
-		setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED,
-			"RT pipeline: raygen function 'main0' not found in compiled library."));
-		[mtlLib release];
-		_hasValidMTLPipelineStates = false;
-		return;
-	}
-
-	// Compile the intersection function if present
-	id<MTLFunction> mtlIsectFunc = nil;
-	id<MTLLibrary> mtlIsectLib = nil;
-	if (hasIntersection && !isectFuncMSL.empty()) {
-		std::string fullIsectMSL = isectPreambleMSL.empty() ? isectFuncMSL : (isectPreambleMSL + "\n" + isectFuncMSL);
-
-		NSError* isectErr = nil;
-		MTLCompileOptions* isectOpts = _device->getMTLCompileOptions();
-		mtlIsectLib = [mtlDev newLibraryWithSource: @(fullIsectMSL.c_str())
-										   options: isectOpts
-											 error: &isectErr];
-		if (isectErr && !mtlIsectLib) {
-			const char* dumpDir = getMVKConfig().shaderDumpDir;
-			if (dumpDir && *dumpDir) {
-				mkdir(dumpDir, 0755);
-				std::string isectPath = std::string(dumpDir) + "/rt-isect-full.metal";
-				FILE* file = fopen(isectPath.c_str(), "wb");
-				if (file) {
-					fwrite(fullIsectMSL.data(), 1, fullIsectMSL.size(), file);
-					fclose(file);
-				}
-			}
-			reportError(VK_ERROR_INITIALIZATION_FAILED,
-				"RT intersection function compile failed: %s", isectErr.localizedDescription.UTF8String);
-		} else {
-			mtlIsectFunc = [mtlIsectLib newFunctionWithName: @"_mvk_isect"];
-		}
-	}
-
-	// Create the compute pipeline, linking the intersection function if present
-	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];
-	plDesc.computeFunction = mtlFunc;
-
-	if (mtlIsectFunc) {
-		MTLLinkedFunctions* linked = [[MTLLinkedFunctions alloc] init];
-		linked.functions = @[mtlIsectFunc];
-		plDesc.linkedFunctions = linked;
-		[linked release];
-	}
-
-	MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this);
-	_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);
-	plc->destroy();
-	[plDesc release];
-	[mtlFunc release];
-	[mtlLib release];
-
-	if (!_mtlPipelineState) {
-		_hasValidMTLPipelineStates = false;
-		[mtlIsectFunc release];
-		[mtlIsectLib release];
-		return;
-	}
-
-	// Create the intersection function table
-	if (mtlIsectFunc) {
-		_mtlIntersectionFunctionHandle = [[_mtlPipelineState functionHandleWithFunction: mtlIsectFunc] retain];
-
-		[mtlIsectFunc release];
-		[mtlIsectLib release];
-	}
-}
-
-void MVKRayTracingPipeline::updateMTLIntersectionFunctionTable(const std::vector<uint32_t>& hitGroupIndices) {
-	if (!_mtlPipelineState || !_mtlIntersectionFunctionHandle) { return; }
-
-	uint32_t requiredCount = std::max<uint32_t>(1, (uint32_t)hitGroupIndices.size());
-	if (!_mtlIntersectionFunctionTable || _mtlIntersectionFunctionTableCount != requiredCount) {
-		[_mtlIntersectionFunctionTable release];
-		_mtlIntersectionFunctionTable = nil;
-
-		MTLIntersectionFunctionTableDescriptor* iftDesc = [MTLIntersectionFunctionTableDescriptor new];
-		iftDesc.functionCount = requiredCount;
-		_mtlIntersectionFunctionTable = [_mtlPipelineState newIntersectionFunctionTableWithDescriptor: iftDesc];
-		[iftDesc release];
-		_mtlIntersectionFunctionTableCount = _mtlIntersectionFunctionTable ? requiredCount : 0;
-	}
-
-	if (!_mtlIntersectionFunctionTable) { return; }
-
-	for (uint32_t i = 0; i < _mtlIntersectionFunctionTableCount; i++) {
-		uint32_t groupIndex = (i < hitGroupIndices.size()) ? hitGroupIndices[i] : VK_SHADER_UNUSED_KHR;
-		if (groupIndex >= _shaderGroupCount) {
-			[_mtlIntersectionFunctionTable setFunction: nil atIndex: i];
-			continue;
-		}
-
-		auto& group = _shaderGroups[groupIndex];
-		switch (group.type) {
-			case VK_RAY_TRACING_SHADER_GROUP_TYPE_TRIANGLES_HIT_GROUP_KHR:
-				[_mtlIntersectionFunctionTable setOpaqueTriangleIntersectionFunctionWithSignature: _mtlIntersectionFunctionSignature
-																						atIndex: i];
-				break;
-			case VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR:
-				if (group.intersectionShader != VK_SHADER_UNUSED_KHR) {
-					[_mtlIntersectionFunctionTable setFunction: _mtlIntersectionFunctionHandle atIndex: i];
-				} else {
-					[_mtlIntersectionFunctionTable setFunction: nil atIndex: i];
-				}
+	const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo = nullptr;
+	for (const auto* next = (VkBaseInStructure*)pCreateInfo->pNext; next; next = next->pNext) {
+		switch (next->sType) {
+			case VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO:
+				pFeedbackInfo = (VkPipelineCreationFeedbackCreateInfo*)next;
 				break;
 			default:
-				[_mtlIntersectionFunctionTable setFunction: nil atIndex: i];
 				break;
 		}
 	}
+
+	warnIfUnsupportedRobustnessEnabled(this, pCreateInfo);
+
+	// Initialize feedback. The VALID bit must be initialized, either set or cleared.
+	// We'll set the VALID bit on the stage feedback when we compile it.
+	VkPipelineCreationFeedback* pPipelineFB = nullptr;
+	uint64_t pipelineStart = 0;
+	if (pFeedbackInfo) {
+		pPipelineFB = pFeedbackInfo->pPipelineCreationFeedback;
+		// n.b. Do *NOT* use mvkClear().
+		pPipelineFB->flags = 0;
+		pPipelineFB->duration = 0;
+		for (uint32_t i = 0; i < pFeedbackInfo->pipelineStageCreationFeedbackCount; ++i) {
+			pFeedbackInfo->pPipelineStageCreationFeedbacks[i].flags = 0;
+			pFeedbackInfo->pPipelineStageCreationFeedbacks[i].duration = 0;
+		}
+		pipelineStart = mvkGetTimestamp();
+	}
+
+	MVKSmallVector<MVKMTLFunction> functions;
+	MVKSmallVector<uint32_t> stageFunctionIndices;
+	_hasValidMTLPipelineStates = (validateLayout() &&
+								  compileStages(pCreateInfo, pFeedbackInfo, functions, stageFunctionIndices) &&
+								  initMTLPipelineState(functions));
+	if (_hasValidMTLPipelineStates) { initGroupTable(pCreateInfo, stageFunctionIndices); }
+
+	if (pPipelineFB) {
+		if (_hasValidMTLPipelineStates) { mvkEnableFlags(pPipelineFB->flags, VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT); }
+		pPipelineFB->duration = mvkGetElapsedNanoseconds(pipelineStart);
+	}
 }
 
-std::string MVKRayTracingPipeline::getMSLSource(const VkPipelineShaderStageCreateInfo* pStage,
-                                                spv::ExecutionModel execModel,
-                                                const std::string& funcName) {
-	MVKShaderModule* shaderModule = (MVKShaderModule*)pStage->module;
-
-	auto& mtlFeats = getMetalFeatures();
-	auto& mvkCfg = getMVKConfig();
-	SPIRVToMSLConversionConfiguration shaderConfig;
-	shaderConfig.options.entryPointName = pStage->pName;
-	shaderConfig.options.entryPointStage = execModel;
-	shaderConfig.options.mslOptions.msl_version = mtlFeats.mslVersion;
-	shaderConfig.options.mslOptions.texel_buffer_texture_width = mtlFeats.maxTextureDimension;
-	shaderConfig.options.mslOptions.r32ui_linear_texture_alignment = (uint32_t)_device->getVkFormatTexelBufferAlignment(VK_FORMAT_R32_UINT, this);
-	shaderConfig.options.mslOptions.texture_buffer_native = true;
-	shaderConfig.options.mslOptions.texture_1D_as_2D = mvkCfg.texture1DAs2D;
-	shaderConfig.options.mslOptions.replace_recursive_inputs = mvkOSVersionIsAtLeast(14.0, 17.0, 1.0);
-	bool useMetalArgBuff = isUsingMetalArgumentBuffers();
-	shaderConfig.options.mslOptions.argument_buffers = useMetalArgBuff;
-	shaderConfig.options.mslOptions.force_active_argument_buffer_resources = false;
-	shaderConfig.options.mslOptions.pad_argument_buffer_resources = useMetalArgBuff;
-	shaderConfig.options.mslOptions.argument_buffers_tier = (SPIRV_CROSS_NAMESPACE::CompilerMSL::Options::ArgumentBuffersTier)mtlFeats.argumentBuffersTier;
-
-#if MVK_MACOS
-	shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.simdPermute;
-#else
-	shaderConfig.options.mslOptions.emulate_subgroups = !mtlFeats.quadPermute;
-	shaderConfig.options.mslOptions.ios_use_simdgroup_functions = !!mtlFeats.simdPermute;
-#endif
-
-	_layout->populateShaderConversionConfig(shaderConfig);
-
-	// Duplicate compute-stage resource bindings with the RT execution model.
-	// populateShaderConversionConfig provides bindings for GLCompute (stage 5),
-	// but SPIRV-Cross filters by the actual entry point stage (e.g., RayGenerationKHR).
-	{
-		std::vector<mvk::MSLResourceBinding> rtBindings;
-		for (auto& rb : shaderConfig.resourceBindings) {
-			if (rb.resourceBinding.stage == spv::ExecutionModelGLCompute) {
-				auto rtRb = rb;
-				rtRb.resourceBinding.stage = execModel;
-				rtBindings.push_back(rtRb);
+// Ray tracing shaders read all descriptor sets through Metal argument buffers.
+bool MVKRayTracingPipeline::validateLayout() {
+	if ( !isUsingMetalArgumentBuffers() ) {
+		setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Ray tracing pipelines require Metal argument buffers."));
+		return false;
+	}
+	for (uint32_t dslIdx = 0; dslIdx < _layout->getDescriptorSetCount(); dslIdx++) {
+		const MVKDescriptorSetLayout* dsl = _layout->getDescriptorSetLayout(dslIdx);
+		if (dsl->argBufMode() != MVKArgumentBufferMode::Off) { continue; }
+		for (const MVKDescriptorBinding& binding : dsl->bindings()) {
+			if (mvkIsAnyFlagEnabled(binding.stageFlags, kMVKRayTracingShaderStages)) {
+				setConfigurationResult(reportError(VK_ERROR_FEATURE_NOT_PRESENT, "Ray tracing shaders cannot use descriptor set %u, because %s.", dslIdx,
+												   dsl->isPushDescriptorSetLayout() ? "it is a push descriptor set" : "it cannot be held in a Metal argument buffer"));
+				return false;
 			}
 		}
-		shaderConfig.resourceBindings.insert(shaderConfig.resourceBindings.end(), rtBindings.begin(), rtBindings.end());
 	}
-
-	mvk::SPIRVToMSLConversionResult conversionResult;
-	mvk::SPIRVToMSLConverter spvConverter;
-	const auto& spirv = shaderModule->getSPIRV();
-	if (spirv.size() < 5) {
-		reportError(VK_ERROR_INITIALIZATION_FAILED,
-					"RT shader '%s' stage %u has invalid SPIR-V word count %zu.",
-					pStage->pName ? pStage->pName : "<unnamed>",
-					(uint32_t)execModel,
-					spirv.size());
-		return "";
-	}
-	spvConverter.setSPIRV(spirv);
-	bool shouldLogCode = mvkCfg.debugMode;
-	bool shouldLogEstimatedGLSL = shouldLogCode && mvkCfg.shaderLogEstimatedGLSL;
-	if (!spvConverter.convert(shaderConfig, conversionResult, shouldLogCode, shouldLogCode, shouldLogEstimatedGLSL)) {
-		reportError(VK_ERROR_INITIALIZATION_FAILED,
-			"RT shader MSL conversion failed: %s", conversionResult.resultLog.c_str());
-		return "";
-	}
-	// Rename entry point if requested (for non-raygen shaders to avoid symbol conflicts)
-	if (!funcName.empty() && funcName != "main0") {
-		std::string oldName = "main0";
-		size_t pos = 0;
-		while ((pos = conversionResult.msl.find(oldName, pos)) != std::string::npos) {
-			conversionResult.msl.replace(pos, oldName.length(), funcName);
-			pos += funcName.length();
-		}
-	}
-	return conversionResult.msl;
+	return true;
 }
 
-VkResult MVKRayTracingPipeline::getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount,
-                                                       size_t dataSize, void* pData) {
-	const uint32_t handleSize = 32;
-	if (dataSize < groupCount * handleSize) {
-		return reportError(VK_ERROR_OUT_OF_HOST_MEMORY,
-			"vkGetRayTracingShaderGroupHandlesKHR: dataSize is too small.");
+// Compiles each distinct shader stage into a visible function, and populates the
+// index of the function compiled for each shader stage, and the resources used by all shader stages.
+bool MVKRayTracingPipeline::compileStages(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
+										  const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo,
+										  MVKSmallVector<MVKMTLFunction>& functions,
+										  MVKSmallVector<uint32_t>& stageFunctionIndices) {
+
+	// Identical shader stages share a function, and all functions linked into the pipeline need unique names.
+	struct FunctionKey {
+		MVKShaderModuleKey moduleKey;
+		VkShaderStageFlagBits stage;
+		VkPipelineShaderStageCreateFlags flags;
+		const char* pName;
+		const VkSpecializationInfo* pSpecializationInfo;
+	};
+	MVKSmallVector<FunctionKey> functionKeys;
+
+	// All shader stages run in the Metal compute stage, so their resource usage is accumulated in the compute stage.
+	SPIRVToMSLConversionConfiguration resourceConfig;
+	SPIRVToMSLConversionResultInfo resourceResults;
+
+	for (uint32_t stageIdx = 0; stageIdx < pCreateInfo->stageCount; stageIdx++) {
+		const VkPipelineShaderStageCreateInfo* pStage = &pCreateInfo->pStages[stageIdx];
+		VkPipelineCreationFeedback* pStageFB = (pFeedbackInfo && stageIdx < pFeedbackInfo->pipelineStageCreationFeedbackCount
+												? &pFeedbackInfo->pPipelineStageCreationFeedbacks[stageIdx] : nullptr);
+		MVKRayTracingStageInfo stageInfo = getRayTracingStageInfo(pStage->stage);
+
+		bool ownsModule = false;
+		MVKShaderModule* module = getOrCreateShaderModule(_device, pStage, ownsModule);
+		if (ownsModule) { _ownedModules.push_back(module); }
+
+		warnIfUnsupportedRobustnessEnabled(this, pStage);
+
+		FunctionKey funcKey = { module->getKey(), pStage->stage, pStage->flags, pStage->pName, pStage->pSpecializationInfo };
+		uint32_t funcIdx = 0;
+		uint32_t nameIdx = 0;
+		for (const auto& fk : functionKeys) {
+			if (fk.moduleKey == funcKey.moduleKey && fk.stage == funcKey.stage) {
+				if (fk.flags == funcKey.flags && strcmp(fk.pName, funcKey.pName) == 0 &&
+					areEqual(fk.pSpecializationInfo, funcKey.pSpecializationInfo)) { break; }
+				nameIdx++;
+			}
+			funcIdx++;
+		}
+		stageFunctionIndices.push_back(funcIdx);
+		if (funcIdx < functionKeys.size()) {
+			if (pStageFB) { mvkEnableFlags(pStageFB->flags, VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT); }
+			continue;
+		}
+		functionKeys.push_back(funcKey);
+
+		SPIRVToMSLConversionConfiguration shaderConfig;
+		initComputeShaderConversionConfig(shaderConfig, _stageResources.implicitBuffers, pStage, stageInfo.execModel);
+		shaderConfig.options.mslOptions.ray_tracing_visible_function = true;
+		shaderConfig.options.mslOptions.use_acceleration_structure_headers = true;
+		char funcName[64];
+		snprintf(funcName, sizeof(funcName), nameIdx ? "%s_%016zx_%u" : "%s_%016zx", stageInfo.functionName, funcKey.moduleKey.codeHash, nameIdx);
+		shaderConfig.options.mslEntryPointName = funcName;
+		if (functions.empty()) { resourceConfig = shaderConfig; }
+
+		// Ray tracing shaders use the resource bindings of the compute stage.
+		for (auto& rb : shaderConfig.resourceBindings) {
+			if (rb.resourceBinding.stage == spv::ExecutionModelGLCompute) { rb.resourceBinding.stage = stageInfo.execModel; }
+		}
+		for (auto& db : shaderConfig.dynamicBufferDescriptors) {
+			if (db.stage == spv::ExecutionModelGLCompute) { db.stage = stageInfo.execModel; }
+		}
+
+		MVKMTLFunction func = module->getMTLFunction(&shaderConfig, pStage->pSpecializationInfo, this, pStageFB);
+		if ( !func.getMTLFunction() ) {
+			if (shouldFailOnPipelineCompileRequired()) {
+				setConfigurationResult(VK_PIPELINE_COMPILE_REQUIRED);
+			} else {
+				setConfigurationResult(reportError(VK_ERROR_INITIALIZATION_FAILED, "%s shader function could not be compiled into pipeline. See previous logged error.", stageInfo.displayName));
+			}
+			return false;
+		}
+		functions.push_back(func);
+
+		assert(shaderConfig.resourceBindings.size() == resourceConfig.resourceBindings.size());
+		for (size_t rbIdx = 0; rbIdx < shaderConfig.resourceBindings.size(); rbIdx++) {
+			resourceConfig.resourceBindings[rbIdx].outIsUsedByShader |= shaderConfig.resourceBindings[rbIdx].outIsUsedByShader;
+		}
+		auto& funcRslts = func.shaderConversionResults;
+		resourceResults.needsSwizzleBuffer |= funcRslts.needsSwizzleBuffer;
+		resourceResults.needsBufferSizeBuffer |= funcRslts.needsBufferSizeBuffer;
+		resourceResults.needsDynamicOffsetBuffer |= funcRslts.needsDynamicOffsetBuffer;
 	}
-	if (firstGroup + groupCount > _shaderGroupCount) {
-		return reportError(VK_ERROR_OUT_OF_HOST_MEMORY,
-			"vkGetRayTracingShaderGroupHandlesKHR: group range exceeds pipeline group count.");
+
+	populateResourceUsage(_stageResources, resourceConfig, resourceResults, spv::ExecutionModelGLCompute);
+	_layout->populateBindOperations(_stageResources.bindScript, resourceConfig, spv::ExecutionModelGLCompute);
+
+	// Shaders read the shader binding tables through device addresses, and trace rays through any acceleration structure.
+	_stageResources.usesPhysicalStorageBufferAddresses = true;
+	_stageResources.usesAccelerationStructures = true;
+
+	auto& implicitBuffers = _stageResources.implicitBuffers;
+	implicitBuffers.ids[MVKImplicitBuffer::PushConstant] = _layout->getPushConstantResourceIndex(kMVKShaderStageCompute);
+	implicitBuffers.set(MVKImplicitBuffer::RayTracingFunctionTable, getComputeImplicitBufferIndex(3));
+	implicitBuffers.set(MVKImplicitBuffer::RayTracingDispatchParams, getComputeImplicitBufferIndex(4));
+	implicitBuffers.set(MVKImplicitBuffer::RayTracingGroupTable, getComputeImplicitBufferIndex(5));
+	return verifyImplicitBuffers(implicitBuffers, "Ray tracing", _descriptorBufferCounts.stages[kMVKShaderStageCompute], this);
+}
+
+// Returns the MSL source code of the kernel function of this pipeline, which binds the resources used by the shader
+// stages, initializes the state shared by the shaders invoked for a launch ID, and calls the ray generation shader.
+std::string MVKRayTracingPipeline::getKernelMSL() {
+	const auto& implicitBuffers = _stageResources.implicitBuffers;
+	auto bufferIndex = [&](MVKImplicitBuffer buffer) { return (uint32_t)implicitBuffers.ids[buffer]; };
+
+	std::ostringstream msl;
+	msl << CompilerMSL::get_ray_tracing_pipeline_header() << "\n";
+	msl << "using namespace metal;\n\n";
+	msl << "kernel void spvRTMain(uint3 spvLaunchId [[thread_position_in_grid]],\n";
+	msl << "    visible_function_table<spvRTFunction> spvFunctions [[buffer(" << bufferIndex(MVKImplicitBuffer::RayTracingFunctionTable) << ")]],\n";
+	msl << "    constant spvRTDispatchParams& spvParams [[buffer(" << bufferIndex(MVKImplicitBuffer::RayTracingDispatchParams) << ")]],\n";
+	msl << "    constant spvRTGroup* spvGroups [[buffer(" << bufferIndex(MVKImplicitBuffer::RayTracingGroupTable) << ")]]";
+	for (size_t dsIdx : _stageResources.resources.descriptorSetData) {
+		msl << ",\n    const device uchar* spvDescriptorSet" << dsIdx << " [[buffer(" << dsIdx << ")]]";
 	}
-	uint8_t* dst = (uint8_t*)pData;
-	for (uint32_t i = 0; i < groupCount; i++) {
-		memset(dst, 0, handleSize);
-		uint32_t groupIndex = firstGroup + i;
-		memcpy(dst, &groupIndex, sizeof(groupIndex));
-		dst += handleSize;
+	auto addImplicitBuffer = [&](MVKImplicitBuffer buffer, const char* type, const char* name) {
+		if (implicitBuffers.needed.has(buffer)) {
+			msl << ",\n    constant " << type << "* " << name << " [[buffer(" << bufferIndex(buffer) << ")]]";
+		}
+	};
+	addImplicitBuffer(MVKImplicitBuffer::PushConstant, "uchar", "spvPushConstants");
+	addImplicitBuffer(MVKImplicitBuffer::DynamicOffset, "uint", "spvDynamicOffsets");
+	addImplicitBuffer(MVKImplicitBuffer::BufferSize, "uint", "spvBufferSizes");
+	addImplicitBuffer(MVKImplicitBuffer::Swizzle, "uint", "spvSwizzleConstants");
+	msl << ")\n{\n";
+
+	// An indirect dispatch has threads beyond the launch size in its partial threadgroups.
+	msl << "    uint3 spvLaunchSize = uint3(spvParams.launchWidth, spvParams.launchHeight, spvParams.launchDepth);\n";
+	msl << "    if (spvParams.indirectLaunchAddress != 0)\n";
+	msl << "        spvLaunchSize = uint3(*reinterpret_cast<const device packed_uint3*>(spvParams.indirectLaunchAddress));\n";
+	msl << "    if (any(spvLaunchId >= spvLaunchSize))\n";
+	msl << "        return;\n\n";
+
+	msl << "    spvRTShared spvShared;\n";
+	msl << "    spvShared.functions = spvFunctions;\n";
+	msl << "    spvShared.params = &spvParams;\n";
+	msl << "    spvShared.groups = spvGroups;\n";
+	for (uint32_t dsIdx = 0; dsIdx < kMVKMaxDescriptorSetCount; dsIdx++) {
+		msl << "    spvShared.descriptorSets[" << dsIdx << "] = ";
+		if (_stageResources.resources.descriptorSetData.get(dsIdx)) {
+			msl << "reinterpret_cast<ulong>(spvDescriptorSet" << dsIdx << ");\n";
+		} else {
+			msl << "0;\n";
+		}
+	}
+	auto setImplicitBuffer = [&](MVKImplicitBuffer buffer, const char* member, const char* name) {
+		msl << "    spvShared." << member << " = " << (implicitBuffers.needed.has(buffer) ? name : "nullptr") << ";\n";
+	};
+	setImplicitBuffer(MVKImplicitBuffer::PushConstant, "pushConstants", "spvPushConstants");
+	setImplicitBuffer(MVKImplicitBuffer::DynamicOffset, "dynamicOffsets", "spvDynamicOffsets");
+	setImplicitBuffer(MVKImplicitBuffer::BufferSize, "bufferSizes", "spvBufferSizes");
+	setImplicitBuffer(MVKImplicitBuffer::Swizzle, "swizzleConstants", "spvSwizzleConstants");
+	msl << "    spvShared.launchId = spvLaunchId;\n";
+	msl << "    spvShared.launchSize = spvLaunchSize;\n\n";
+
+	msl << "    spvRTContext spvRT;\n";
+	msl << "    spvRT.shared = &spvShared;\n";
+	msl << "    spvRT.recursionDepth = 0;\n";
+	msl << "    spvRTInitCallee(spvRT, spvRT);\n";
+	msl << "    ulong spvRecord = 0;\n";
+	msl << "    uint spvGroup = spvRTReadSBTGroup(spvParams.raygenAddress, spvParams.raygenStride, 0u, spvRecord);\n";
+	msl << "    uint spvRaygen = spvGroup != SPV_RT_NULL ? spvGroups[spvGroup].x : SPV_RT_NULL;\n";
+	msl << "    if (spvRaygen == SPV_RT_NULL)\n";
+	msl << "        return;\n";
+	msl << "    spvRT.shaderRecord = spvRecord;\n";
+	msl << "    spvFunctions[spvRaygen](spvRT, nullptr);\n";
+	msl << "}\n";
+	return msl.str();
+}
+
+// Links the shader stage functions into a Metal compute pipeline, and populates the function table with them.
+bool MVKRayTracingPipeline::initMTLPipelineState(MVKSmallVector<MVKMTLFunction>& functions) {
+	id<MTLFunction> mtlKernelFunc = _device->getGeneratedMTLFunction(getKernelMSL(), "spvRTMain", this);
+	if ( !mtlKernelFunc ) { return false; }
+
+	NSMutableArray<id<MTLFunction>>* mtlFuncs = [NSMutableArray arrayWithCapacity: functions.size()];
+	for (auto& func : functions) { [mtlFuncs addObject: func.getMTLFunction()]; }
+	MTLLinkedFunctions* mtlLinkedFuncs = [MTLLinkedFunctions linkedFunctions];
+	mtlLinkedFuncs.functions = mtlFuncs;
+
+	MTLComputePipelineDescriptor* plDesc = [MTLComputePipelineDescriptor new];	// temp retain
+	plDesc.computeFunction = mtlKernelFunc;
+	plDesc.linkedFunctions = mtlLinkedFuncs;
+
+	// Each recursion level of ray tracing calls a closest hit or miss shader, except the last one, which may call
+	// an intersection shader that calls an any-hit shader. Callable shaders may be called from any shader.
+	plDesc.maxCallStackDepth = 1 + std::max(_maxRecursionDepth, 1u) + 1 + kMVKRayTracingMaxCallableDepth;
+
+	// Metal does not allow the name of the pipeline to be changed after it has been created,
+	// and we need to create the Metal pipeline immediately to provide error feedback to app.
+	// The best we can do at this point is set the pipeline name from the layout.
+	setMetalObjectLabel(plDesc, _layout->getDebugName());
+
+	MVKComputePipelineCompiler* plc = new MVKComputePipelineCompiler(this, "Ray tracing pipeline");
+	_mtlPipelineState = plc->newMTLComputePipelineState(plDesc);	// retained
+	plc->destroy();
+	[plDesc release];															// temp release
+	if ( !_mtlPipelineState ) { return false; }
+
+	MTLVisibleFunctionTableDescriptor* vftDesc = [MTLVisibleFunctionTableDescriptor new];	// temp retain
+	vftDesc.functionCount = functions.size();
+	_mtlFunctionTable = [_mtlPipelineState newVisibleFunctionTableWithDescriptor: vftDesc];	// retained
+	[vftDesc release];																			// temp release
+	for (NSUInteger funcIdx = 0; funcIdx < mtlFuncs.count; funcIdx++) {
+		[_mtlFunctionTable setFunction: [_mtlPipelineState functionHandleWithFunction: mtlFuncs[funcIdx]] atIndex: funcIdx];
+	}
+
+	// Rays traced by neighboring launch IDs tend to be coherent, so run them in the same SIMD group where possible.
+	NSUInteger maxThreads = _mtlPipelineState.maxTotalThreadsPerThreadgroup;
+	NSUInteger tgWidth = std::min<NSUInteger>(8, maxThreads);
+	NSUInteger tgHeight = std::max<NSUInteger>(1, std::min<NSUInteger>(_mtlPipelineState.threadExecutionWidth, maxThreads) / tgWidth);
+	_mtlThreadgroupSize = MTLSizeMake(tgWidth, tgHeight, 1);
+
+	return true;
+}
+
+// Populates the group table, holding the function table indices of the shaders of each shader group.
+// The index of an unused shader is VK_SHADER_UNUSED_KHR, which is also the null function index of the shaders.
+void MVKRayTracingPipeline::initGroupTable(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
+										   const MVKSmallVector<uint32_t>& stageFunctionIndices) {
+	auto getFunctionIndex = [&](uint32_t stageIdx) {
+		return stageIdx == VK_SHADER_UNUSED_KHR ? VK_SHADER_UNUSED_KHR : stageFunctionIndices[stageIdx];
+	};
+
+	MVKSmallVector<uint32_t> groupTable;
+	groupTable.reserve(std::max(_groupCount, 1u) * 4);
+	for (uint32_t grpIdx = 0; grpIdx < _groupCount; grpIdx++) {
+		const VkRayTracingShaderGroupCreateInfoKHR& group = pCreateInfo->pGroups[grpIdx];
+		bool isGeneral = group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_GENERAL_KHR;
+		bool isProcedural = group.type == VK_RAY_TRACING_SHADER_GROUP_TYPE_PROCEDURAL_HIT_GROUP_KHR;
+		groupTable.push_back(getFunctionIndex(isGeneral ? group.generalShader : group.closestHitShader));
+		groupTable.push_back(getFunctionIndex(isGeneral ? VK_SHADER_UNUSED_KHR : group.anyHitShader));
+		groupTable.push_back(getFunctionIndex(isProcedural ? group.intersectionShader : VK_SHADER_UNUSED_KHR));
+		groupTable.push_back(group.type);
+	}
+	if (groupTable.empty()) { groupTable.resize(4, VK_SHADER_UNUSED_KHR); }
+
+	_mtlGroupTable = [getMTLDevice() newBufferWithBytes: groupTable.data()
+												 length: groupTable.size() * sizeof(uint32_t)
+												options: MTLResourceStorageModeShared];	// retained
+	setMetalObjectLabel(_mtlGroupTable, @"Ray tracing shader group table");
+}
+
+MTLSize MVKRayTracingPipeline::getThreadgroupSize(MTLSize launchSize) const {
+	if (launchSize.height == 1 && launchSize.depth == 1) {
+		return MTLSizeMake(_mtlThreadgroupSize.width * _mtlThreadgroupSize.height, 1, 1);
+	}
+	return _mtlThreadgroupSize;
+}
+
+// Each shader group handle holds the index of its shader group plus one, so a zeroed shader binding table record is a null record.
+VkResult MVKRayTracingPipeline::getShaderGroupHandles(uint32_t firstGroup, uint32_t groupCount, size_t dataSize, void* pData) {
+	uint32_t handleCount = std::min({groupCount, _groupCount - std::min(firstGroup, _groupCount), uint32_t(dataSize / kMVKRayTracingShaderGroupHandleSize)});
+	if (handleCount < groupCount) {
+		reportWarning(VK_ERROR_VALIDATION_FAILED_EXT, "vkGetRayTracingShaderGroupHandlesKHR(): Shader group range [%u, %u) and data size %zu do not match the %u shader groups of the pipeline.",
+					  firstGroup, firstGroup + groupCount, dataSize, _groupCount);
+	}
+	auto* pHandles = (uint8_t*)pData;
+	for (uint32_t handleIdx = 0; handleIdx < handleCount; handleIdx++) {
+		uint8_t* pHandle = pHandles + handleIdx * kMVKRayTracingShaderGroupHandleSize;
+		uint32_t handleValue = firstGroup + handleIdx + 1;
+		mvkClear(pHandle, kMVKRayTracingShaderGroupHandleSize);
+		memcpy(pHandle, &handleValue, sizeof(handleValue));
 	}
 	return VK_SUCCESS;
 }
 
-VkDeviceSize MVKRayTracingPipeline::getShaderGroupStackSize(uint32_t group,
-                                                             VkShaderGroupShaderKHR groupShader) {
-	return 0; // Metal manages stack sizes internally
+// Metal sizes the call stack of the pipeline itself, so shaders don't use any of the Vulkan pipeline stack.
+VkDeviceSize MVKRayTracingPipeline::getShaderGroupStackSize(uint32_t group, VkShaderGroupShaderKHR groupShader) {
+	return 0;
 }
 
 MVKRayTracingPipeline::~MVKRayTracingPipeline() {
 	@synchronized (getMTLDevice()) {
 		[_mtlPipelineState release];
-		[_mtlIntersectionFunctionTable release];
-		[_mtlIntersectionFunctionHandle release];
+		[_mtlFunctionTable release];
+		[_mtlGroupTable release];
+		for (MVKShaderModule* module : _ownedModules) { delete module; }
 	}
 }
 
@@ -5247,7 +3263,9 @@ namespace SPIRV_CROSS_NAMESPACE {
 				opt.force_fragment_with_side_effects_execution,
 				opt.input_attachment_is_ds_attachment,
 				opt.auto_disable_rasterization,
-				opt.use_fast_math_pragmas);
+				opt.use_fast_math_pragmas,
+				opt.ray_tracing_visible_function,
+				opt.use_acceleration_structure_headers);
 	}
 
 	template<class Archive>
@@ -5325,6 +3343,7 @@ namespace mvk {
 	void serialize(Archive & archive, SPIRVToMSLConversionOptions& opt) {
 		archive(opt.mslOptions,
 				opt.entryPointName,
+				opt.mslEntryPointName,
 				opt.entryPointStage,
 				opt.tessPatchKind,
 				opt.numTessControlPoints,
@@ -5381,7 +3400,8 @@ namespace mvk {
 				scr.needsViewRangeBuffer,
 				scr.needsDrawId,
 				scr.needsDepthClipStateBuffer,
-				scr.usesPhysicalStorageBufferAddressesCapability);
+				scr.usesPhysicalStorageBufferAddressesCapability,
+				scr.usesAccelerationStructures);
 	}
 
 	template<class Archive>

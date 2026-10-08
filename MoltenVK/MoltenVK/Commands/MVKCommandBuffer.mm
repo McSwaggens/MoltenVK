@@ -639,6 +639,7 @@ static MVKBarrierStage commandUseToBarrierStage(MVKCommandUse use) {
 	case kMVKCommandUseClearDepthStencilImage:       return kMVKBarrierStageCopy; /**< vkCmdClearDepthStencilImage. */
 	case kMVKCommandUseResetQueryPool:               return kMVKBarrierStageCopy; /**< vkCmdResetQueryPool. */
 	case kMVKCommandUseDispatch:                     return kMVKBarrierStageCompute; /**< vkCmdDispatch. */
+	case kMVKCommandUseTraceRays:                    return kMVKBarrierStageCompute; /**< vkCmdTraceRaysKHR. */
 	case kMVKCommandUseTessellationVertexTessCtl:    return kMVKBarrierStageVertex; /**< vkCmdDraw* - vertex and tessellation control stages. */
 	case kMVKCommandUseDrawIndirectConvertBuffers:   return kMVKBarrierStageVertex; /**< vkCmdDrawIndirect* convert indirect buffers. */
 	case kMVKCommandUseCopyQueryPoolResults:         return kMVKBarrierStageCopy; /**< vkCmdCopyQueryPoolResults. */
@@ -907,7 +908,7 @@ void MVKCommandEncoder::bindPipeline(VkPipelineBindPoint pipelineBindPoint, MVKP
             break;
 
         case VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR:
-            setRayTracingPipeline(static_cast<MVKRayTracingPipeline*>(pipeline));
+            _state.bindRayTracingPipeline(static_cast<MVKRayTracingPipeline*>(pipeline));
             break;
 
         default:
@@ -1029,6 +1030,11 @@ void MVKCommandEncoder::beginMetalComputeEncoding(MVKCommandUse cmdUse) {
 void MVKCommandEncoder::finalizeDispatchState() {
 	getMTLComputeEncoder(kMVKCommandUseDispatch);
 	prepareComputeDispatch();
+}
+
+void MVKCommandEncoder::finalizeRayTracingDispatchState() {
+	getMTLComputeEncoder(kMVKCommandUseTraceRays);
+	_state.prepareRayTracingDispatch(_mtlComputeEncoder, *this);
 }
 
 void MVKCommandEncoder::endRendering() {
@@ -1427,6 +1433,7 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse) {
 NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse) {
     switch (cmdUse) {
         case kMVKCommandUseDispatch:                        return @"vkCmdDispatch ComputeEncoder";
+        case kMVKCommandUseTraceRays:                       return @"vkCmdTraceRaysKHR ComputeEncoder";
         case kMVKCommandUseCopyBuffer:                      return @"vkCmdCopyBuffer ComputeEncoder";
         case kMVKCommandUseCopyBufferToImage:               return @"vkCmdCopyBufferToImage ComputeEncoder";
         case kMVKCommandUseCopyImageToBuffer:               return @"vkCmdCopyImageToBuffer ComputeEncoder";

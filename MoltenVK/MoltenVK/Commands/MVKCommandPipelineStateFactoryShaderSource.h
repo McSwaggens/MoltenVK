@@ -547,4 +547,12 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
 	uint8_t idx = src[pos];
 	dst[pos] = idx;
 }
+
+kernel void cmdTraceRaysIndirectConvertBuffers(const device uint32_t* launchSize [[buffer(0)]],
+                                               device uint32_t* threadgroupCounts [[buffer(1)]],
+                                               constant uint32_t* threadgroupSize [[buffer(2)]]) {
+	for (uint32_t i = 0; i < 3; i++) {
+		threadgroupCounts[i] = launchSize[i] / threadgroupSize[i] + (launchSize[i] % threadgroupSize[i] ? 1 : 0);
+	}
+}
 )";

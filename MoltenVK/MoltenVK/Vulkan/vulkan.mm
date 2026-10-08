@@ -27,7 +27,7 @@
 #include "MVKCmdTransfer.h"
 #include "MVKCmdQueries.h"
 #include "../Commands/MVKCmdAccelerationStructure.h"
-#include "../Commands/MVKCmdRayTracing.h"
+#include "MVKCmdRayTracing.h"
 #include "../GPUObjects/MVKAccelerationStructure.h"
 #include "MVKImage.h"
 #include "MVKBuffer.h"
@@ -3677,10 +3677,10 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdTraceRaysIndirectKHR(
 	VkDeviceAddress                             indirectDeviceAddress) {
 
 	MVKTraceVulkanCallStart();
-	// For indirect trace rays, we don't have the dimensions at record time.
-	// For now, report as unsupported — the feature flag should be disabled.
-	MVKCommandBuffer* cmdBuff = MVKCommandBuffer::getMVKCommandBuffer(commandBuffer);
-	cmdBuff->reportError(VK_ERROR_FEATURE_NOT_PRESENT, "vkCmdTraceRaysIndirectKHR is not yet implemented.");
+	MVKAddCmd(TraceRaysIndirect, commandBuffer,
+			  pRaygenShaderBindingTable, pMissShaderBindingTable,
+			  pHitShaderBindingTable, pCallableShaderBindingTable,
+			  indirectDeviceAddress);
 	MVKTraceVulkanCallEnd();
 }
 
@@ -3701,8 +3701,8 @@ MVK_PUBLIC_VULKAN_SYMBOL void vkCmdSetRayTracingPipelineStackSizeKHR(
 	VkCommandBuffer                             commandBuffer,
 	uint32_t                                    pipelineStackSize) {
 
+	// Metal sizes the call stack of a ray tracing pipeline when the pipeline is created.
 	MVKTraceVulkanCallStart();
-	// Metal manages stack sizes internally; this is a no-op.
 	MVKTraceVulkanCallEnd();
 }
 

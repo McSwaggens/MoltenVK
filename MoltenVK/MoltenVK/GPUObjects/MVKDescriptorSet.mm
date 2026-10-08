@@ -26,6 +26,7 @@
 #include "MVKInstance.h"
 #include "MVKImage.h"
 #include "MVKOSExtensions.h"
+#include "mvk_datatypes.hpp"
 #include <sstream>
 
 static constexpr uint32_t alignDescriptorOffset(uint32_t offset, uint32_t align) {
@@ -670,7 +671,7 @@ MVKDescriptorSetLayout* MVKDescriptorSetLayout::Create(MVKDevice* device, const 
 		MVKShaderStageResourceBinding resourceCount = binding.totalResourceCount();
 		for (uint32_t i = 0; i < kMVKShaderStageCount; i++) {
 			auto stage = static_cast<MVKShaderStage>(i);
-			if (mvkIsAnyFlagEnabled(binding.stageFlags, mvkVkShaderStageFlagsFromMVKShaderStage(stage)))
+			if (mvkIsAnyFlagEnabled(binding.stageFlags, mvkVkShaderStageFlagsBoundToMVKShaderStage(stage)))
 				ret->_totalResourceCount.stages[stage] += resourceCount;
 		}
 		if (!binding.isVariable())

@@ -385,6 +385,9 @@ public:
 	/** Returns a new MTLComputePipelineState for converting a Uint8 index buffer to Uint16. */
 	id<MTLComputePipelineState> newConvertUint8IndicesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 
+	/** Returns a new MTLComputePipelineState for converting the launch size of an indirect ray trace to threadgroup counts. */
+	id<MTLComputePipelineState> newCmdTraceRaysIndirectConvertBuffersMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
 
 #pragma mark Construction
 

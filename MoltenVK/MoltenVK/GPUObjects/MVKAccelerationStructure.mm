@@ -18,6 +18,7 @@
 
 #include "MVKAccelerationStructure.h"
 #include "MVKBuffer.h"
+#include "MVKCommandEncoderState.h"
 
 std::shared_mutex MVKAccelerationStructure::_mtlAccelerationStructureMapLock;
 std::unordered_map<uint64_t, MVKAccelerationStructure*> MVKAccelerationStructure::_mtlAccelerationStructureMap;
@@ -97,6 +98,16 @@ MVKAccelerationStructure* MVKAccelerationStructure::getMVKAccelerationStructure(
 	std::shared_lock<std::shared_mutex> lock(_mtlAccelerationStructureMapLock);
 	auto it = _mtlAccelerationStructureMap.find(deviceAddress);
 	return it == _mtlAccelerationStructureMap.end() ? nullptr : it->second;
+}
+
+void MVKAccelerationStructure::encodeAccelerationStructures(MVKDevice* device, MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
+	std::shared_lock<std::shared_mutex> lock(_mtlAccelerationStructureMapLock);
+	for (auto& entry : _mtlAccelerationStructureMap) {
+		MVKAccelerationStructure* mvkAS = entry.second;
+		if (mvkAS->getDevice() != device) { continue; }
+		resources.add(mvkAS->_mtlAccelerationStructure, stage, false);
+		if (mvkAS->_instanceShaderBindingTableOffsetBuffer) { resources.add(mvkAS->_instanceShaderBindingTableOffsetBuffer, stage, false); }
+	}
 }
 
 void MVKAccelerationStructure::retainBuffer(id<MTLBuffer> mtlBuffer) {

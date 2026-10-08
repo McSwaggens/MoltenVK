@@ -270,6 +270,14 @@ void MVKCmdBindComputePipeline::encode(MVKCommandEncoder* cmdEncoder) {
 
 
 #pragma mark -
+#pragma mark MVKCmdBindRayTracingPipeline
+
+void MVKCmdBindRayTracingPipeline::encode(MVKCommandEncoder* cmdEncoder) {
+	cmdEncoder->bindPipeline(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, _pipeline);
+}
+
+
+#pragma mark -
 #pragma mark MVKCmdBindDescriptorSetsStatic
 
 template <size_t N>

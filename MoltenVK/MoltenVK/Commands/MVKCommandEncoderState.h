@@ -29,6 +29,7 @@
 
 class MVKCommandEncoder;
 class MVKGraphicsPipeline;
+class MVKRayTracingPipeline;
 class MVKDescriptorSet;
 class MVKOcclusionQueryPool;
 
@@ -236,6 +237,20 @@ struct MVKVulkanComputeCommandEncoderState: public MVKVulkanCommonEncoderState {
 	                        const uint32_t* dynamicOffsets);
 };
 
+/** Tracks the state of the Vulkan ray tracing bind point, which runs on a Metal compute encoder. */
+struct MVKVulkanRayTracingCommandEncoderState: public MVKVulkanCommonEncoderState {
+	MVKRayTracingPipeline* _pipeline = nullptr;
+	MVKImplicitBufferData _implicitBufferData;
+
+	/** Bind the given descriptor sets, placing their bindings into `_descriptorSetBindings`. */
+	void bindDescriptorSets(MVKPipelineLayout* layout,
+	                        uint32_t firstSet,
+	                        uint32_t setCount,
+	                        MVKDescriptorSet*const* sets,
+	                        uint32_t dynamicOffsetCount,
+	                        const uint32_t* dynamicOffsets);
+};
+
 struct MVKMetalSharedCommandEncoderState {
 	/** Storage space for use by various methods to reduce alloc/free. */
 	MVKSmallVector<uint32_t, 8> _scratch;
@@ -246,8 +261,12 @@ struct MVKMetalSharedCommandEncoderState {
 	/** Which GPU addressable resources have been added to `_useResource`. */
 	MVKResourceUsageStages _gpuAddressableResourceStages;
 
+	/** Which acceleration structure resources have been added to `_useResource`. */
+	MVKResourceUsageStages _accelerationStructureStages;
+
 	void reset() {
 		_gpuAddressableResourceStages = MVKResourceUsageStages::None;
+		_accelerationStructureStages = MVKResourceUsageStages::None;
 		_useResource.used.clear();
 	}
 };
@@ -405,6 +424,9 @@ struct MVKMetalComputeCommandEncoderState {
 	/** The current stage being run on this compute encoder. */
 	MVKShaderStage _vkStage = kMVKShaderStageCount;
 
+	/** Whether the resources of the compute stage are those of the Vulkan ray tracing bind point. */
+	bool _isVkRayTracing = false;
+
 	MVKStageResourceBindings _bindings;
 
 	void bindPipeline(id<MTLComputeCommandEncoder> encoder, id<MTLComputePipelineState> pipeline);
@@ -414,10 +436,14 @@ struct MVKMetalComputeCommandEncoderState {
 	void bindSampler(id<MTLComputeCommandEncoder> encoder, id<MTLSamplerState> sampler, NSUInteger index);
 	template <typename T> void bindStructBytes(id<MTLComputeCommandEncoder> encoder, const T* t, NSUInteger index) { bindBytes(encoder, t, sizeof(T), index); }
 	void prepareComputeDispatch(id<MTLComputeCommandEncoder> encoder, MVKCommandEncoder& mvkEncoder, const MVKVulkanComputeCommandEncoderState& vkState, const MVKVulkanSharedCommandEncoderState& vkShared);
+	void prepareRayTracingDispatch(id<MTLComputeCommandEncoder> encoder, MVKCommandEncoder& mvkEncoder, const MVKVulkanRayTracingCommandEncoderState& vkState, const MVKVulkanSharedCommandEncoderState& vkShared);
 	void prepareRenderDispatch(id<MTLComputeCommandEncoder> encoder, MVKCommandEncoder& mvkEncoder, const MVKVulkanGraphicsCommandEncoderState& vkState, const MVKVulkanSharedCommandEncoderState& vkShared, MVKShaderStage stage);
 
 	/** For API compatibility with MVKMetalGraphicsCommandEncoderState. */
 	MVKArrayRef<MVKStageResourceBits> exists() { return {&_exists, 1}; }
+
+	/** Returns the Vulkan bind point whose resources are bound to this encoder, or VK_PIPELINE_BIND_POINT_MAX_ENUM if none. */
+	VkPipelineBindPoint getVkBindPoint() const;
 
 	void reset();
 };
@@ -429,6 +455,7 @@ class MVKCommandEncoderState {
 	MVKVulkanSharedCommandEncoderState   _vkShared;
 	MVKVulkanGraphicsCommandEncoderState _vkGraphics;
 	MVKVulkanComputeCommandEncoderState  _vkCompute;
+	MVKVulkanRayTracingCommandEncoderState _vkRayTracing;
 	MVKMetalSharedCommandEncoderState    _mtlShared;
 	MVKMetalGraphicsCommandEncoderState  _mtlGraphics;
 	MVKMetalComputeCommandEncoderState   _mtlCompute;
@@ -450,6 +477,8 @@ public:
 	const MVKVulkanGraphicsCommandEncoderState& vkGraphics() const { return _vkGraphics; }
 	/** Get a reference to the Vulkan compute state.  Read-only, use methods on this class (which will invalidate associated Metal state) to modify. */
 	const MVKVulkanComputeCommandEncoderState&  vkCompute()  const { return _vkCompute; }
+	/** Get a reference to the Vulkan ray tracing state.  Read-only, use methods on this class (which will invalidate associated Metal state) to modify. */
+	const MVKVulkanRayTracingCommandEncoderState& vkRayTracing() const { return _vkRayTracing; }
 	/** Returns a reference to the Metal state shared between graphics and compute. */
 	MVKMetalSharedCommandEncoderState&   mtlShared()   { return _mtlShared; }
 	/** Returns a reference to the Metal graphics state. */
@@ -484,6 +513,10 @@ public:
 	void prepareComputeDispatch(id<MTLComputeCommandEncoder> encoder, MVKCommandEncoder& mvkEncoder) {
 		_mtlCompute.prepareComputeDispatch(encoder, mvkEncoder, _vkCompute, _vkShared);
 	}
+	/** Binds everything needed to trace rays with the current Vulkan ray tracing state on the current Metal compute state. */
+	void prepareRayTracingDispatch(id<MTLComputeCommandEncoder> encoder, MVKCommandEncoder& mvkEncoder) {
+		_mtlCompute.prepareRayTracingDispatch(encoder, mvkEncoder, _vkRayTracing, _vkShared);
+	}
 	/** Binds the given graphics pipeline to the Vulkan graphics state, invalidating any necessary resources. */
 	void bindGraphicsPipeline(MVKGraphicsPipeline* pipeline);
 	/** Updates the mask of viewports whose reversed-depth range should be emulated in graphics shaders. */
@@ -492,8 +525,8 @@ public:
 	void setGraphicsDepthClipState(const MVKDepthClipState& depthClipState);
 	/** Binds the given compute pipeline to the Vulkan graphics state, invalidating any necessary resources. */
 	void bindComputePipeline(MVKComputePipeline* pipeline);
-	/** Sets the compute pipeline layout for ray tracing descriptor set compatibility. */
-	void setComputeLayout(MVKPipelineLayout* layout);
+	/** Binds the given ray tracing pipeline to the Vulkan ray tracing state, invalidating any necessary resources. */
+	void bindRayTracingPipeline(MVKRayTracingPipeline* pipeline);
 	/** Binds the given push constants to the Vulkan state, invalidating any necessary resources. */
 	void pushConstants(uint32_t offset, uint32_t size, const void* data);
 	/** Binds the given descriptor sets to the Vulkan state, invalidating any necessary resources. */

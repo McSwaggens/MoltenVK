@@ -1,7 +1,7 @@
 /*
  * MVKCmdRayTracing.mm
  *
- * Copyright (c) 2015-2025 The Brenwill Workshop Ltd. (http://www.brenwill.com)
+ * Copyright (c) 2015-2026 The Brenwill Workshop Ltd. (http://www.brenwill.com)
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -18,46 +18,38 @@
 
 #include "MVKCmdRayTracing.h"
 #include "MVKCommandBuffer.h"
-#include "MVKAccelerationStructure.h"
-#include "MVKPipeline.h"
 #include "MVKCommandPool.h"
-#include "MVKDescriptorSet.h"
-#include <vector>
+#include "MVKPipeline.h"
 
 
-static std::vector<uint32_t> mvkDecodeShaderBindingTable(MVKDevice* device, const VkStridedDeviceAddressRegionKHR& region) {
-	std::vector<uint32_t> groupIndices;
-	if (!region.deviceAddress || !region.size || !region.stride) { return groupIndices; }
-
-	uint32_t recordCount = static_cast<uint32_t>(region.size / region.stride);
-	if (!recordCount) { return groupIndices; }
-
-	VkDeviceSize baseOffset = 0;
-	id<MTLBuffer> mtlBuffer = device->getMTLBufferForDeviceAddress(region.deviceAddress, &baseOffset);
-	const uint8_t* bufferContents = mtlBuffer ? (const uint8_t*)mtlBuffer.contents : nullptr;
-	if (!bufferContents || mtlBuffer.length < baseOffset) { return groupIndices; }
-
-	groupIndices.resize(recordCount, 0);
-	const uint8_t* sbtData = bufferContents + baseOffset;
-	size_t availableBytes = mtlBuffer.length - baseOffset;
-	for (uint32_t i = 0; i < recordCount; i++) {
-		size_t recordOffset = i * region.stride;
-		if (recordOffset + sizeof(uint32_t) > availableBytes) { break; }
-		memcpy(&groupIndices[i], sbtData + recordOffset, sizeof(uint32_t));
-	}
-	return groupIndices;
+// Populates the shader binding table regions of the dispatch parameters.
+// A region of size zero is unused, and the shader reads it as a table with no records.
+static void setShaderBindingTables(MVKRayTracingDispatchParams& params,
+								   const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
+								   const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,
+								   const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable,
+								   const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable) {
+	auto getAddress = [](const VkStridedDeviceAddressRegionKHR* pRegion) { return pRegion->size ? pRegion->deviceAddress : 0; };
+	params.raygenAddress = getAddress(pRaygenShaderBindingTable);
+	params.raygenStride = pRaygenShaderBindingTable->stride;
+	params.missAddress = getAddress(pMissShaderBindingTable);
+	params.missStride = pMissShaderBindingTable->stride;
+	params.hitAddress = getAddress(pHitShaderBindingTable);
+	params.hitStride = pHitShaderBindingTable->stride;
+	params.callableAddress = getAddress(pCallableShaderBindingTable);
+	params.callableStride = pCallableShaderBindingTable->stride;
 }
 
-static void mvkBindShaderBindingTable(MVKCommandEncoder* cmdEncoder,
-									  id<MTLComputeCommandEncoder> mtlEncoder,
-									  uint32_t bufferIndex,
-									  const std::vector<uint32_t>& groupIndices) {
-	uint32_t zero = 0;
-	if (groupIndices.empty()) {
-		cmdEncoder->setComputeBytes(mtlEncoder, &zero, sizeof(zero), bufferIndex);
-	} else {
-		cmdEncoder->setComputeBytes(mtlEncoder, groupIndices.data(), groupIndices.size() * sizeof(uint32_t), bufferIndex);
-	}
+// Binds the dispatch parameters of the bound ray tracing pipeline, and returns the pipeline.
+static MVKRayTracingPipeline* bindDispatchParams(MVKCommandEncoder* cmdEncoder,
+												 id<MTLComputeCommandEncoder> mtlEncoder,
+												 const MVKRayTracingDispatchParams& cmdParams) {
+	MVKRayTracingPipeline* pipeline = cmdEncoder->getRayTracingPipeline();
+	MVKRayTracingDispatchParams params = cmdParams;
+	params.maxRecursionDepth = pipeline->getMaxRecursionDepth();
+	cmdEncoder->setComputeBytes(mtlEncoder, &params, sizeof(params),
+								pipeline->getStageResources().implicitBuffers.ids[MVKImplicitBuffer::RayTracingDispatchParams]);
+	return pipeline;
 }
 
 
@@ -65,149 +57,73 @@ static void mvkBindShaderBindingTable(MVKCommandEncoder* cmdEncoder,
 #pragma mark MVKCmdTraceRays
 
 VkResult MVKCmdTraceRays::setContent(MVKCommandBuffer* cmdBuff,
-                                     const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
-                                     const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,
-                                     const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable,
-                                     const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable,
-                                     uint32_t width,
-                                     uint32_t height,
-                                     uint32_t depth) {
-	_raygenSBT = *pRaygenShaderBindingTable;
-	_missSBT = *pMissShaderBindingTable;
-	_hitSBT = *pHitShaderBindingTable;
-	_callableSBT = *pCallableShaderBindingTable;
-	_width = width;
-	_height = height;
-	_depth = depth;
+									 const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
+									 const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,
+									 const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable,
+									 const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable,
+									 uint32_t width,
+									 uint32_t height,
+									 uint32_t depth) {
+	_params = {};
+	setShaderBindingTables(_params, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable);
+	_params.launchWidth = width;
+	_params.launchHeight = height;
+	_params.launchDepth = depth;
 	return VK_SUCCESS;
 }
 
 void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
-	auto* rtPipeline = cmdEncoder->getRayTracingPipeline();
-	if (!rtPipeline || !rtPipeline->getMTLComputePipelineState()) { return; }
+	if ( !_params.launchWidth || !_params.launchHeight || !_params.launchDepth ) { return; }
 
-	// Finalize descriptor set state, then set the raygen pipeline state.
-	cmdEncoder->finalizeDispatchState();
-	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseDispatch);
-
-	cmdEncoder->getMtlCompute().bindPipeline(mtlEncoder, rtPipeline->getMTLComputePipelineState());
-
-	std::vector<uint32_t> hitGroupIndices;
-	if (_hitSBT.deviceAddress && _hitSBT.size && _hitSBT.stride &&
-		(rtPipeline->needsHitShaderBindingTable() || rtPipeline->usesIntersectionFunctionTable())) {
-		hitGroupIndices = mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _hitSBT);
-	}
-
-	id<MTLBuffer> instanceSBTOffsetBuffer = nil;
-	id<MTLBuffer> instanceFlagsBuffer = nil;
-	auto& vk = cmdEncoder->getState().vkCompute();
-	// Collect descriptor set GPU buffers in a single pass for later IFT binding.
-	struct DescSetInfo { id<MTLBuffer> gpuBuffer; NSUInteger gpuOffset; };
-	MVKSmallVector<DescSetInfo, 4> descSetInfos;
-	if (vk._layout) {
-		size_t setCount = vk._layout->getDescriptorSetCount();
-		descSetInfos.resize(setCount);
-		for (size_t s = 0; s < setCount; s++) {
-			MVKDescriptorSet* set = vk._descriptorSets[s];
-			descSetInfos[s] = { set ? set->gpuBufferObject : nil,
-								set ? set->gpuBufferOffset : 0 };
-
-			const MVKDescriptorSetLayout* setLayout = vk._layout->getDescriptorSetLayout(s);
-			if (!set || !setLayout || !set->cpuBuffer) { continue; }
-
-			for (const auto& binding : setLayout->bindings()) {
-				if (binding.descriptorType != VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR ||
-					binding.cpuLayout != MVKDescriptorCPULayout::OneID ||
-					!binding.descriptorCount) {
-					continue;
-				}
-
-				auto* desc = reinterpret_cast<id<MTLAccelerationStructure>*>(set->cpuBuffer + binding.cpuOffset);
-				uint32_t descriptorCount = binding.getDescriptorCount(set->variableDescriptorCount);
-				for (uint32_t i = 0; i < descriptorCount; i++) {
-					if (auto* mvkAS = MVKAccelerationStructure::getMVKAccelerationStructure(desc[i])) {
-						mvkAS->encodeResourceUsage(mtlEncoder);
-						if (!instanceSBTOffsetBuffer) {
-							instanceSBTOffsetBuffer = mvkAS->getInstanceShaderBindingTableOffsetBuffer();
-						}
-						if (!instanceFlagsBuffer) {
-							instanceFlagsBuffer = mvkAS->getInstanceFlagsBuffer();
-						}
-					}
-				}
-			}
-		}
-	}
-	[mtlEncoder setBuffer: instanceSBTOffsetBuffer
-				   offset: 0
-				  atIndex: MVKRayTracingPipeline::kInstanceSBTOffsetBufferIndex];
-	[mtlEncoder setBuffer: instanceFlagsBuffer
-				   offset: 0
-				  atIndex: MVKRayTracingPipeline::kInstanceFlagsBufferIndex];
-
-	// Bind the intersection function table if present (for AABB geometry).
-	if (rtPipeline->usesIntersectionFunctionTable()) {
-		rtPipeline->updateMTLIntersectionFunctionTable(hitGroupIndices);
-		id<MTLIntersectionFunctionTable> ift = rtPipeline->getMTLIntersectionFunctionTable();
-		if (ift) {
-			[mtlEncoder setIntersectionFunctionTable: ift
-									 atBufferIndex: MVKRayTracingPipeline::kIntersectionFunctionTableBufferIndex];
-
-			// Bind descriptor set resources to the intersection function table.
-			for (size_t s = 0; s < descSetInfos.size(); s++) {
-				if (descSetInfos[s].gpuBuffer) {
-					[ift setBuffer: descSetInfos[s].gpuBuffer
-						   offset: descSetInfos[s].gpuOffset
-						  atIndex: s];
-				}
-			}
-		}
-	}
-
-	if (rtPipeline->needsMissShaderBindingTable()) {
-		mvkBindShaderBindingTable(cmdEncoder, mtlEncoder,
-								  MVKRayTracingPipeline::kMissSBTBufferIndex,
-								  mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _missSBT));
-	}
-	if (rtPipeline->needsHitShaderBindingTable()) {
-		mvkBindShaderBindingTable(cmdEncoder, mtlEncoder,
-								  MVKRayTracingPipeline::kHitSBTBufferIndex,
-								  hitGroupIndices);
-	}
-	if (rtPipeline->needsCallableShaderBindingTable()) {
-		mvkBindShaderBindingTable(cmdEncoder, mtlEncoder,
-								  MVKRayTracingPipeline::kCallableSBTBufferIndex,
-								  mvkDecodeShaderBindingTable(cmdEncoder->getDevice(), _callableSBT));
-	}
-
-	// Dispatch one thread per ray (width x height x depth).
-	// Use dispatchThreads so threads_per_grid is available for gl_LaunchSizeEXT.
-	MTLSize gridSize = MTLSizeMake(_width, _height, _depth);
-
-	MTLSize threadgroupSize;
-	if (_depth <= 1) {
-		threadgroupSize = MTLSizeMake(8, 8, 1);
-	} else {
-		threadgroupSize = MTLSizeMake(4, 4, 4);
-	}
-
-	[mtlEncoder dispatchThreads: gridSize
-		  threadsPerThreadgroup: threadgroupSize];
+	cmdEncoder->finalizeRayTracingDispatchState();	// Ensure all updated state has been submitted to Metal
+	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTraceRays);
+	MVKRayTracingPipeline* pipeline = bindDispatchParams(cmdEncoder, mtlEncoder, _params);
+	MTLSize launchSize = MTLSizeMake(_params.launchWidth, _params.launchHeight, _params.launchDepth);
+	[mtlEncoder dispatchThreads: launchSize
+		  threadsPerThreadgroup: pipeline->getThreadgroupSize(launchSize)];
 }
 
 
 #pragma mark -
-#pragma mark MVKCmdBindRayTracingPipeline
+#pragma mark MVKCmdTraceRaysIndirect
 
-VkResult MVKCmdBindRayTracingPipeline::setContent(MVKCommandBuffer* cmdBuff, VkPipeline pipeline) {
-	_pipeline = pipeline;
+VkResult MVKCmdTraceRaysIndirect::setContent(MVKCommandBuffer* cmdBuff,
+											 const VkStridedDeviceAddressRegionKHR* pRaygenShaderBindingTable,
+											 const VkStridedDeviceAddressRegionKHR* pMissShaderBindingTable,
+											 const VkStridedDeviceAddressRegionKHR* pHitShaderBindingTable,
+											 const VkStridedDeviceAddressRegionKHR* pCallableShaderBindingTable,
+											 VkDeviceAddress indirectDeviceAddress) {
+	_params = {};
+	setShaderBindingTables(_params, pRaygenShaderBindingTable, pMissShaderBindingTable, pHitShaderBindingTable, pCallableShaderBindingTable);
+	_params.indirectLaunchAddress = indirectDeviceAddress;
+
+	// The launch size is converted to threadgroup counts by reading it through its Metal buffer.
+	_mtlIndirectBuffer = cmdBuff->getDevice()->getMTLBufferForDeviceAddress(indirectDeviceAddress, &_mtlIndirectBufferOffset);
+	if ( !_mtlIndirectBuffer ) {
+		return cmdBuff->reportError(VK_ERROR_INITIALIZATION_FAILED, "vkCmdTraceRaysIndirectKHR(): The indirect device address 0x%llx is not in any buffer.", indirectDeviceAddress);
+	}
 	return VK_SUCCESS;
 }
 
-void MVKCmdBindRayTracingPipeline::encode(MVKCommandEncoder* cmdEncoder) {
-	auto* rtPipeline = (MVKRayTracingPipeline*)_pipeline;
-	cmdEncoder->setRayTracingPipeline(rtPipeline);
-	// Set the compute layout so descriptor sets bound with VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR
-	// get encoded properly by finalizeDispatchState().
-	cmdEncoder->getState().setComputeLayout(rtPipeline->getLayout());
+void MVKCmdTraceRaysIndirect::encode(MVKCommandEncoder* cmdEncoder) {
+	MVKRayTracingPipeline* pipeline = cmdEncoder->getRayTracingPipeline();
+	MTLSize tgSize = pipeline->getThreadgroupSize();
+	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTraceRays);
+
+	// Convert the launch size to the threadgroup counts of an indirect Metal dispatch.
+	const MVKMTLBufferAllocation* tgCounts = cmdEncoder->getTempMTLBuffer(sizeof(MTLDispatchThreadgroupsIndirectArguments), true);
+	uint32_t tgSizes[] = { (uint32_t)tgSize.width, (uint32_t)tgSize.height, (uint32_t)tgSize.depth };
+	MVKMetalComputeCommandEncoderState& mtlCompute = cmdEncoder->getMtlCompute();
+	mtlCompute.bindPipeline(mtlEncoder, cmdEncoder->getCommandEncodingPool()->getCmdTraceRaysIndirectConvertBuffersMTLComputePipelineState());
+	mtlCompute.bindBuffer(mtlEncoder, _mtlIndirectBuffer, _mtlIndirectBufferOffset, 0);
+	mtlCompute.bindBuffer(mtlEncoder, tgCounts->_mtlBuffer, tgCounts->_offset, 1);
+	mtlCompute.bindBytes(mtlEncoder, tgSizes, sizeof(tgSizes), 2);
+	[mtlEncoder dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
+
+	// The pipeline reads the launch size, and skips the threads of partial threadgroups outside it.
+	cmdEncoder->finalizeRayTracingDispatchState();
+	bindDispatchParams(cmdEncoder, mtlEncoder, _params);
+	[mtlEncoder dispatchThreadgroupsWithIndirectBuffer: tgCounts->_mtlBuffer
+								  indirectBufferOffset: tgCounts->_offset
+								 threadsPerThreadgroup: tgSize];
 }

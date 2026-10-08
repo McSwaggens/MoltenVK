@@ -119,6 +119,9 @@ MVKMTLDeviceCapabilities::MVKMTLDeviceCapabilities(id<MTLDevice> mtlDev) {
 	if ([mtlDev respondsToSelector: @selector(supportsRaytracing)]) {
 		supportsRayTracing = mtlDev.supportsRaytracing;
 	}
+	if ([mtlDev respondsToSelector: @selector(supportsFunctionPointers)]) {
+		supportsFunctionPointers = mtlDev.supportsFunctionPointers;
+	}
 	if ([mtlDev respondsToSelector: @selector(supportsBCTextureCompression)]) {
 		supportsBCTextureCompression = mtlDev.supportsBCTextureCompression;
 	}
@@ -631,11 +634,12 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR: {
 				auto* rtpFeatures = (VkPhysicalDeviceRayTracingPipelineFeaturesKHR*)next;
-				rtpFeatures->rayTracingPipeline = _gpuCapabilities.supportsRayTracing;
+				bool supportsRayTracingPipeline = _supportedExtensions.vk_KHR_ray_tracing_pipeline.enabled;
+				rtpFeatures->rayTracingPipeline = supportsRayTracingPipeline;
 				rtpFeatures->rayTracingPipelineShaderGroupHandleCaptureReplay = false;
 				rtpFeatures->rayTracingPipelineShaderGroupHandleCaptureReplayMixed = false;
-				rtpFeatures->rayTracingPipelineTraceRaysIndirect = false;
-				rtpFeatures->rayTraversalPrimitiveCulling = _gpuCapabilities.supportsRayTracing;
+				rtpFeatures->rayTracingPipelineTraceRaysIndirect = supportsRayTracingPipeline;
+				rtpFeatures->rayTraversalPrimitiveCulling = supportsRayTracingPipeline;
 				break;
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_ID_FEATURES_KHR: {
@@ -1130,14 +1134,14 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_PROPERTIES_KHR: {
 				auto* rtpProps = (VkPhysicalDeviceRayTracingPipelinePropertiesKHR*)next;
-				rtpProps->shaderGroupHandleSize = 32;
-				rtpProps->maxRayRecursionDepth = 1;
+				rtpProps->shaderGroupHandleSize = kMVKRayTracingShaderGroupHandleSize;
+				rtpProps->maxRayRecursionDepth = kMVKRayTracingMaxRecursionDepth;
 				rtpProps->maxShaderGroupStride = 4096;
 				rtpProps->shaderGroupBaseAlignment = 64;
 				rtpProps->shaderGroupHandleCaptureReplaySize = 0;
-				rtpProps->maxRayDispatchInvocationCount = 1073741824;
-				rtpProps->shaderGroupHandleAlignment = 32;
-				rtpProps->maxRayHitAttributeSize = 32;
+				rtpProps->maxRayDispatchInvocationCount = 1 << 30;
+				rtpProps->shaderGroupHandleAlignment = kMVKRayTracingShaderGroupHandleSize;
+				rtpProps->maxRayHitAttributeSize = kMVKRayTracingMaxHitAttributeSize;
 				break;
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_STENCIL_RESOLVE_PROPERTIES: {
@@ -3658,9 +3662,14 @@ void MVKPhysicalDevice::initExtensions() {
 		pWritableExtns->vk_KHR_buffer_device_address.enabled &&
 		pWritableExtns->vk_KHR_deferred_host_operations.enabled &&
 		pWritableExtns->vk_KHR_spirv_1_4.enabled;
-	pWritableExtns->vk_KHR_acceleration_structure.enabled = supportsVulkanRayTracing;
-	pWritableExtns->vk_KHR_ray_query.enabled = supportsVulkanRayTracing;
-	pWritableExtns->vk_KHR_ray_tracing_pipeline.enabled = supportsVulkanRayTracing;
+	pWritableExtns->vk_KHR_acceleration_structure.enabled = pWritableExtns->vk_KHR_acceleration_structure.enabled && supportsVulkanRayTracing;
+	pWritableExtns->vk_KHR_ray_query.enabled = pWritableExtns->vk_KHR_ray_query.enabled && supportsVulkanRayTracing;
+
+	// Ray tracing pipelines call shaders through visible function tables, and read descriptor sets through argument buffers.
+	pWritableExtns->vk_KHR_ray_tracing_pipeline.enabled = (pWritableExtns->vk_KHR_ray_tracing_pipeline.enabled &&
+														   pWritableExtns->vk_KHR_acceleration_structure.enabled &&
+														   _gpuCapabilities.supportsFunctionPointers &&
+														   _isUsingMetalArgumentBuffers);
 
 	if (!_gpuCapabilities.isAppleGPU) {
 		pWritableExtns->vk_AMD_shader_image_load_store_lod.enabled = false;
@@ -4757,6 +4766,35 @@ void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVK
 	}
 }
 
+void MVKDevice::encodeAccelerationStructures(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
+	MVKAccelerationStructure::encodeAccelerationStructures(this, resources, stage);
+}
+
+id<MTLFunction> MVKDevice::getGeneratedMTLFunction(const string& msl, const char* funcName, MVKVulkanAPIDeviceObject* owner) {
+	{
+		lock_guard<mutex> lock(_generatedMTLFunctionsLock);
+		auto iter = _generatedMTLFunctions.find(msl);
+		if (iter != _generatedMTLFunctions.end()) { return iter->second; }
+	}
+
+	// Compile outside the lock, so other functions can be compiled concurrently.
+	MVKShaderLibraryCompiler* slc = new MVKShaderLibraryCompiler(owner);
+	NSString* nsSrc = [[NSString alloc] initWithUTF8String: msl.c_str()];	// temp retained
+	id<MTLLibrary> mtlLib = slc->newMTLLibrary(nsSrc, mvk::SPIRVToMSLConversionResultInfo(), {});	// retained
+	[nsSrc release];																			// release temp string
+	slc->destroy();
+	NSString* nsFuncName = [[NSString alloc] initWithUTF8String: funcName];						// temp retained
+	id<MTLFunction> mtlFunc = [mtlLib newFunctionWithName: nsFuncName];							// retained
+	[nsFuncName release];																		// release temp string
+	[mtlLib release];
+	if ( !mtlFunc ) { return nil; }
+
+	lock_guard<mutex> lock(_generatedMTLFunctionsLock);
+	auto rslt = _generatedMTLFunctions.emplace(msl, mtlFunc);
+	if ( !rslt.second ) { [mtlFunc release]; }		// Another thread compiled it first.
+	return rslt.first->second;
+}
+
 MVKImage* MVKDevice::addImage(MVKImage* mvkImg) {
 	if ( !mvkImg ) { return mvkImg; }
 
@@ -5707,6 +5745,7 @@ MVKDevice::~MVKDevice() {
 #endif
 	[_defaultMTLSamplerState release];
 	[_dummyBlitMTLBuffer release];
+	for (auto& genFunc : _generatedMTLFunctions) { [genFunc.second release]; }
 
 	stopAutoGPUCapture(MVK_CONFIG_AUTO_GPU_CAPTURE_SCOPE_DEVICE);
 

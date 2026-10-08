@@ -340,6 +340,9 @@ public:
     /** Called by each compute dispatch command to establish any outstanding state just prior to performing the dispatch. */
     void finalizeDispatchState();
 
+	/** Called by each ray tracing command to establish any outstanding state just prior to tracing rays. */
+	void finalizeRayTracingDispatchState();
+
 	/** Ends the current renderpass. */
 	void endRenderpass();
 
@@ -412,11 +415,8 @@ public:
 	/** Returns the compute pipeline. */
 	MVKComputePipeline* getComputePipeline() { return getVkCompute()._pipeline; }
 
-	/** Returns the currently bound ray tracing pipeline. */
-	MVKRayTracingPipeline* getRayTracingPipeline() { return _rtPipeline; }
-
-	/** Sets the bound ray tracing pipeline. */
-	void setRayTracingPipeline(MVKRayTracingPipeline* pipeline) { _rtPipeline = pipeline; }
+	/** Returns the ray tracing pipeline. */
+	MVKRayTracingPipeline* getRayTracingPipeline() { return _state.vkRayTracing()._pipeline; }
 
     /**
 	 * Copy bytes into the Metal encoder at a Metal vertex buffer index, and optionally indicate
@@ -552,7 +552,6 @@ protected:
 	id<MTLComputeCommandEncoder> _mtlComputeEncoder;
 	id<MTLBlitCommandEncoder> _mtlBlitEncoder;
 	id<MTLFence> _stageCountersMTLFence;
-	MVKRayTracingPipeline* _rtPipeline = nullptr;
 	MVKPrefillMetalCommandBuffersStyle _prefillStyle;
 	VkSubpassContents _subpassContents;
 	uint32_t _renderSubpassIndex;

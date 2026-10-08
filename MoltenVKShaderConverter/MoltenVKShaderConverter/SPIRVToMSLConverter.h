@@ -40,6 +40,7 @@ namespace mvk {
 	typedef struct SPIRVToMSLConversionOptions {
 		SPIRV_CROSS_NAMESPACE::CompilerMSL::Options mslOptions;
 		std::string entryPointName;
+		std::string mslEntryPointName;		/**< If not empty, the MSL function name given to the entry point. */
 		spv::ExecutionModel entryPointStage = spv::ExecutionModelMax;
 		spv::ExecutionMode tessPatchKind = spv::ExecutionModeMax;
 		uint32_t numTessControlPoints = 0;
@@ -263,6 +264,7 @@ namespace mvk {
 		bool needsDrawId = false;
 		bool needsDepthClipStateBuffer = false;
 		bool usesPhysicalStorageBufferAddressesCapability = false;
+		bool usesAccelerationStructures = false;
 		std::map<uint32_t, MSLSpecializationMacroInfo> specializationMacros;
 
 	} SPIRVToMSLConversionResultInfo;
@@ -321,6 +323,7 @@ namespace mvk {
 		void populateWorkgroupDimension(SPIRVWorkgroupSizeDimension& wgDim, uint32_t size, SPIRV_CROSS_NAMESPACE::SpecializationConstant& spvSpecConst);
 		void populateEntryPoint(SPIRV_CROSS_NAMESPACE::CompilerMSL* pMSLCompiler, SPIRVToMSLConversionOptions& options, SPIRVEntryPoint& entryPoint);
 		bool usesPhysicalStorageBufferAddressesCapability(SPIRV_CROSS_NAMESPACE::Compiler* pCompiler);
+		bool usesAccelerationStructures(SPIRV_CROSS_NAMESPACE::Compiler* pCompiler);
 		void populateSpecializationMacros(SPIRV_CROSS_NAMESPACE::CompilerMSL* pMSLCompiler, std::map<uint32_t, MSLSpecializationMacroInfo>& specializationMacros);
 
 		std::vector<uint32_t> _spirv;
