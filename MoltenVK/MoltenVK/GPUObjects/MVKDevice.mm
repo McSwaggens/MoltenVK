@@ -585,7 +585,8 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 				asFeatures->accelerationStructureCaptureReplay = false;
 				asFeatures->accelerationStructureIndirectBuild = false;
 				asFeatures->accelerationStructureHostCommands = false;
-				asFeatures->descriptorBindingAccelerationStructureUpdateAfterBind = false;
+				// Acceleration structure descriptors are buffer descriptors of acceleration structure headers.
+				asFeatures->descriptorBindingAccelerationStructureUpdateAfterBind = supportedFeats12.descriptorBindingStorageBufferUpdateAfterBind;
 				break;
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
@@ -1261,10 +1262,12 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 				asProps->maxGeometryCount = (1ull << 24) - 1;
 				asProps->maxInstanceCount = (1ull << 24) - 1;
 				asProps->maxPrimitiveCount = (1ull << 29) - 1;
+				// Acceleration structure descriptors are buffer descriptors of acceleration structure headers.
+				// Vulkan requires at least 500000 update-after-bind acceleration structure descriptors.
 				asProps->maxPerStageDescriptorAccelerationStructures = 16;
-				asProps->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = 16;
+				asProps->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = max(supportedProps12.maxPerStageDescriptorUpdateAfterBindStorageBuffers, 500000u);
 				asProps->maxDescriptorSetAccelerationStructures = 16;
-				asProps->maxDescriptorSetUpdateAfterBindAccelerationStructures = 16;
+				asProps->maxDescriptorSetUpdateAfterBindAccelerationStructures = max(supportedProps12.maxDescriptorSetUpdateAfterBindStorageBuffers, 500000u);
 				asProps->minAccelerationStructureScratchOffsetAlignment = 256;
 				break;
 			}
@@ -5383,7 +5386,8 @@ bool MVKDevice::shouldPrefillMTLCommandBuffers() {
 			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind ||
 			  _enabledDescriptorIndexingFeatures.descriptorBindingUniformTexelBufferUpdateAfterBind ||
 			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageTexelBufferUpdateAfterBind ||
-			  _enabledInlineUniformBlockFeatures.descriptorBindingInlineUniformBlockUpdateAfterBind));
+			  _enabledInlineUniformBlockFeatures.descriptorBindingInlineUniformBlockUpdateAfterBind ||
+			  _enabledAccelerationStructureFeatures.descriptorBindingAccelerationStructureUpdateAfterBind));
 }
 
 void MVKDevice::startAutoGPUCapture(MVKConfigAutoGPUCaptureScope autoGPUCaptureScope, id mtlCaptureObject) {
