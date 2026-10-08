@@ -335,6 +335,7 @@ In addition to core *Vulkan* functionality, **MoltenVK**  also supports the foll
 - `VK_EXT_debug_report`
 - `VK_EXT_debug_utils`
 - `VK_EXT_depth_clip_control`
+- `VK_EXT_depth_clip_enable`
 - `VK_EXT_descriptor_indexing`
   - *Initial release limited to Metal Tier 1: 96/128 textures,
     16 samplers, except macOS 11.0 (Big Sur) or later, or on older versions of macOS using
@@ -370,6 +371,8 @@ In addition to core *Vulkan* functionality, **MoltenVK**  also supports the foll
   - *Requires Metal 2.0.*
 - `VK_EXT_metal_objects`
 - `VK_EXT_metal_surface`
+- `VK_EXT_multi_draw`
+- `VK_EXT_nested_command_buffer`
 - `VK_EXT_non_seamless_cube_map`
   - *Requires a build of MoltenVK with `MVK_USE_METAL_PRIVATE_API` enabled.*
 - `VK_EXT_pipeline_creation_cache_control`
@@ -410,6 +413,7 @@ In addition to core *Vulkan* functionality, **MoltenVK**  also supports the foll
   - *iOS and macOS, requires family 6 (A13) or better Apple GPU.*
 - `VK_EXT_tooling_info`
 - `VK_EXT_vertex_attribute_divisor`
+- `VK_EXT_ycbcr_2plane_444_formats`
 - `VK_AMD_gpu_shader_half_float`
 - `VK_AMD_negative_viewport_height`
 - `VK_AMD_shader_image_load_store_lod`

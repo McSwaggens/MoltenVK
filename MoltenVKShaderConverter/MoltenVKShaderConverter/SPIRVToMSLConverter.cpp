@@ -368,6 +368,7 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
 		conversionResult.resultInfo.needsDispatchBaseBuffer = pMSLCompiler->needs_dispatch_base_buffer();
 		conversionResult.resultInfo.needsViewRangeBuffer = pMSLCompiler->needs_view_mask_buffer();
 		conversionResult.resultInfo.needsDrawId = pMSLCompiler->has_active_builtin(spv::BuiltInDrawIndex, spv::StorageClassInput);
+		conversionResult.resultInfo.needsDepthClipStateBuffer = pMSLCompiler->needs_depth_clip_state_buffer();
 		conversionResult.resultInfo.usesPhysicalStorageBufferAddressesCapability = usesPhysicalStorageBufferAddressesCapability(pMSLCompiler);
 		populateSpecializationMacros(pMSLCompiler, conversionResult.resultInfo.specializationMacros);
 

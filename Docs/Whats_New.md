@@ -18,7 +18,16 @@ MoltenVK 1.4.3
 
 Released TBD
 
-- 
+- Add support for the following extensions:
+  - `VK_EXT_depth_clip_enable`
+  - `VK_EXT_multi_draw`
+  - `VK_EXT_nested_command_buffer`
+  - `VK_EXT_ycbcr_2plane_444_formats`
+- Fix inconsistent image `memoryTypeBits` when `VK_IMAGE_USAGE_INPUT_ATTACHMENT_BIT` is used.
+- Fix shader stage interface matching of 16-bit floating point variables.
+- Fix spurious warning about blending on attachment formats that do not support it.
+- Fix `VkDeviceMemory` imported from a `MTLTexture` not backing the image bound to it, and over-releasing that texture.
+- Fix leak of the `MTLBuffer` of a host-coherent `VkDeviceMemory` that also holds a `MTLTexture`.
 
 
 

@@ -709,6 +709,11 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 				depthFeatures->depthClipControl = true;
 				break;
 			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DEPTH_CLIP_ENABLE_FEATURES_EXT: {
+				auto* depthFeatures = (VkPhysicalDeviceDepthClipEnableFeaturesEXT*)next;
+				depthFeatures->depthClipEnable = true;
+				break;
+			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTENDED_DYNAMIC_STATE_FEATURES_EXT: {
 				auto* extDynState = (VkPhysicalDeviceExtendedDynamicStateFeaturesEXT*)next;
 				extDynState->extendedDynamicState = true;
@@ -774,6 +779,21 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 				legacyDitheringFeatures->legacyDithering = getMVKConfig().useMetalPrivateAPI;
 				break;
 			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_FEATURES_EXT: {
+				auto* multiDrawFeatures = (VkPhysicalDeviceMultiDrawFeaturesEXT*)next;
+				multiDrawFeatures->multiDraw = true;
+				break;
+			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_FEATURES_EXT: {
+				auto* nestedCmdBuffFeatures = (VkPhysicalDeviceNestedCommandBufferFeaturesEXT*)next;
+				// Secondary command buffers are encoded by replaying their commands onto the
+				// command encoder, which is inherently recursive, and does not modify the
+				// secondary command buffer, so it can also be executing elsewhere.
+				nestedCmdBuffFeatures->nestedCommandBuffer = true;
+				nestedCmdBuffFeatures->nestedCommandBufferRendering = true;
+				nestedCmdBuffFeatures->nestedCommandBufferSimultaneousUse = true;
+				break;
+			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NON_SEAMLESS_CUBE_MAP_FEATURES_EXT: {
 				auto* nonSeamlessFeatures = (VkPhysicalDeviceNonSeamlessCubeMapFeaturesEXT*)next;
 				nonSeamlessFeatures->nonSeamlessCubeMap = getMVKConfig().useMetalPrivateAPI;
@@ -811,6 +831,11 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_TEXEL_BUFFER_ALIGNMENT_FEATURES_EXT: {
 				auto* texelBuffAlignFeatures = (VkPhysicalDeviceTexelBufferAlignmentFeaturesEXT*)next;
 				texelBuffAlignFeatures->texelBufferAlignment = true;
+				break;
+			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_YCBCR_2_PLANE_444_FORMATS_FEATURES_EXT: {
+				auto* ycbcr2Plane444Features = (VkPhysicalDeviceYcbcr2Plane444FormatsFeaturesEXT*)next;
+				ycbcr2Plane444Features->ycbcr2plane444Formats = true;
 				break;
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INTEGER_FUNCTIONS_2_FEATURES_INTEL: {
@@ -1329,6 +1354,18 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_MEMORY_HOST_PROPERTIES_EXT: {
 				auto* extMemHostProps = (VkPhysicalDeviceExternalMemoryHostPropertiesEXT*)next;
 				extMemHostProps->minImportedHostPointerAlignment = _metalFeatures.hostMemoryPageSize;
+				break;
+			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_NESTED_COMMAND_BUFFER_PROPERTIES_EXT: {
+				auto* nestedCmdBuffProps = (VkPhysicalDeviceNestedCommandBufferPropertiesEXT*)next;
+				// Nesting is handled by recursion on the host, so no limit is imposed.
+				nestedCmdBuffProps->maxCommandBufferNestingLevel = std::numeric_limits<uint32_t>::max();
+				break;
+			}
+			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MULTI_DRAW_PROPERTIES_EXT: {
+				auto* multiDrawProps = (VkPhysicalDeviceMultiDrawPropertiesEXT*)next;
+				// Each draw is encoded as a separate command, so no limit is imposed.
+				multiDrawProps->maxMultiDrawCount = std::numeric_limits<uint32_t>::max();
 				break;
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_PROPERTIES_KHR: {
@@ -4115,7 +4152,14 @@ VkResult MVKDevice::getMemoryHostPointerProperties(VkExternalMemoryHandleTypeFla
 		switch (handleType) {
 			case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT:
 			case VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT:
-				pMemHostPtrProps->memoryTypeBits = _physicalDevice->getHostVisibleMemoryTypes();
+				// Imported host memory is wrapped in a shared MTLBuffer, so any memory type
+				// except lazily allocated ones can use it. A private type then becomes shared,
+				// which non-Apple GPUs do not support for textures, so exclude it there.
+				pMemHostPtrProps->memoryTypeBits = _physicalDevice->getAllMemoryTypes();
+				mvkDisableFlags(pMemHostPtrProps->memoryTypeBits, _physicalDevice->getLazilyAllocatedMemoryTypes());
+				if ( !_physicalDevice->getMTLDeviceCapabilities().isAppleGPU ) {
+					mvkDisableFlags(pMemHostPtrProps->memoryTypeBits, _physicalDevice->getPrivateMemoryTypes());
+				}
 				break;
 			default:
 				pMemHostPtrProps->memoryTypeBits = 0;

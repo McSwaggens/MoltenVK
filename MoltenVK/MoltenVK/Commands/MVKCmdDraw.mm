@@ -114,11 +114,13 @@ VkResult MVKCmdDraw::setContent(MVKCommandBuffer* cmdBuff,
 								uint32_t vertexCount,
 								uint32_t instanceCount,
 								uint32_t firstVertex,
-								uint32_t firstInstance) {
+								uint32_t firstInstance,
+								uint32_t drawIndex) {
 	_vertexCount = vertexCount;
 	_instanceCount = instanceCount;
 	_firstVertex = firstVertex;
 	_firstInstance = firstInstance;
+	_drawIndex = drawIndex;
 
     // Validate
     if ((_firstInstance != 0) && !(cmdBuff->getMetalFeatures().baseVertexInstanceDrawing)) {
@@ -206,8 +208,8 @@ void MVKCmdDraw::encode(MVKCommandEncoder* cmdEncoder) {
     if (pipeline->needsDrawIdBuffer()) {
         tempDrawIDBuff = cmdEncoder->getTempMTLBuffer(sizeof(uint32_t));
 
-        // We don't currently support non-indirect multi-draw commands, so just 0.
-        memset([tempDrawIDBuff->_mtlBuffer contents], 0, sizeof(uint32_t));
+        // Zero for a single draw, or the index of this draw within a vkCmdDrawMulti*EXT() call.
+        *(uint32_t*)tempDrawIDBuff->getContents() = _drawIndex;
     }
     for (uint32_t s : stages) {
         auto stage = MVKGraphicsStage(s);
@@ -353,12 +355,14 @@ VkResult MVKCmdDrawIndexed::setContent(MVKCommandBuffer* cmdBuff,
 									   uint32_t instanceCount,
 									   uint32_t firstIndex,
 									   int32_t vertexOffset,
-									   uint32_t firstInstance) {
+									   uint32_t firstInstance,
+									   uint32_t drawIndex) {
 	_indexCount = indexCount;
 	_instanceCount = instanceCount;
 	_firstIndex = firstIndex;
 	_vertexOffset = vertexOffset;
 	_firstInstance = firstInstance;
+	_drawIndex = drawIndex;
 
     // Validate
 	auto& mtlFeats = cmdBuff->getMetalFeatures();
@@ -488,8 +492,8 @@ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
     if (pipeline->needsDrawIdBuffer()) {
         tempDrawIDBuff = cmdEncoder->getTempMTLBuffer(sizeof(uint32_t));
 
-        // We don't currently support non-indirect multi-draw commands, so just 0.
-        memset([tempDrawIDBuff->_mtlBuffer contents], 0, sizeof(uint32_t));
+        // Zero for a single draw, or the index of this draw within a vkCmdDrawMulti*EXT() call.
+        *(uint32_t*)tempDrawIDBuff->getContents() = _drawIndex;
     }
     for (uint32_t s : stages) {
         auto stage = MVKGraphicsStage(s);
@@ -641,7 +645,7 @@ void MVKCmdDrawIndexed::encode(MVKCommandEncoder* cmdEncoder) {
 // there are at encoding time. And this will probably be inadequate for large instanced draws.
 // TODO: Consider breaking up such draws using different base instance values. But this will
 // require yet more munging of the indirect buffers...
-static const uint32_t kMVKMaxDrawIndirectVertexCount = 128 * KIBI;
+static const uint32_t kMVKMaxDrawIndirectVertexCount = 1024 * KIBI;
 
 static const MVKMTLBufferAllocation* encodeIndirectCountConversion(
 		MVKCommandEncoder* cmdEncoder,
@@ -1033,7 +1037,9 @@ void MVKCmdDrawIndirect::encode(MVKCommandEncoder* cmdEncoder) {
                 cmdEncoder->beginMetalRenderPass(kMVKCommandUseRestartSubpass);
             }
 
-            cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+            if (drawIdx == 0 || pipeline->isTessellationPipeline() || needsInstanceAdjustment) {
+                cmdEncoder->finalizeDrawState(stage);	// Ensure all updated state has been submitted to Metal
+            }
 
 			if ( !pipeline->hasValidMTLPipelineStates() ) { return; }	// Abort if this pipeline stage could not be compiled.
 
@@ -1385,7 +1391,7 @@ void MVKCmdDrawIndexedIndirect::encode(MVKCommandEncoder* cmdEncoder, const MVKI
                 state.bindBuffer(mtlTessCtlEncoder, vtxIndexBuff->_mtlBuffer, vtxIndexBuff->_offset, 1);
                 state.bindBuffer(mtlTessCtlEncoder, indirectBuffer,            mtlIndBuffOfst,        2);
                 [mtlTessCtlEncoder dispatchThreadgroupsWithIndirectBuffer: mtlIndBuff
-													 indirectBufferOffset: mtlTempIndBuffOfst
+													 indirectBufferOffset: mtlTempIndBuffOfst + sizeof(MTLStageInRegionIndirectArguments)
                                                     threadsPerThreadgroup: MTLSizeMake(vtxThreadExecWidth, 1, 1)];
 				mtlIndBuffOfst += sizeof(MTLDrawIndexedPrimitivesIndirectArguments);
             } else if (drawIdx == 0 && vtxAdjmts.needsAdjustment()) {
