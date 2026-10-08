@@ -667,7 +667,7 @@ static void bindMetalResources(id<MTLCommandEncoder> encoder,
 	if (resources.usesPhysicalStorageBufferAddresses && addUseResourceStage(mtlShared._gpuAddressableResourceStages, useResourceStage))
 		mvkEncoder.getDevice()->encodeGPUAddressableBuffers(mtlShared._useResource, useResourceStage);
 	if (resources.usesAccelerationStructures && addUseResourceStage(mtlShared._accelerationStructureStages, useResourceStage))
-		mvkEncoder.getDevice()->encodeAccelerationStructures(mtlShared._useResource, useResourceStage);
+		mvkEncoder.getDevice()->encodeAccelerationStructures(encoder, binder.useResource, mtlShared._useResource, mtlShared._accelerationStructureStages);
 
 	const MVKShaderStageResourceBinding& resourceCounts = common._layout->getResourceCounts().stages[vkStage];
 	for (MVKImplicitBuffer buffer : resources.implicitBuffers.needed & MVKNonVolatileImplicitBuffers) {

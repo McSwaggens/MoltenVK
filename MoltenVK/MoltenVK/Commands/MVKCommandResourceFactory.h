@@ -400,6 +400,9 @@ public:
 	/** Returns a new MTLComputePipelineState for converting Vulkan acceleration structure bounding boxes for Metal. */
 	id<MTLComputePipelineState> newCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 
+	/** Returns a new MTLComputePipelineState for copying the instance data of a top-level acceleration structure. */
+	id<MTLComputePipelineState> newCmdCopyAccelerationStructureInstanceDataMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
 
 #pragma mark Construction
 

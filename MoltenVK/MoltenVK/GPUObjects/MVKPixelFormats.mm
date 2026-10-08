@@ -1558,7 +1558,6 @@ typedef enum : VkFormatFeatureFlags2 {
 	kMVKVkFormatFeatureFlagsBufVertex   = (VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT),
 } MVKVkFormatFeatureFlags;
 
-// Sets the VkFormatProperties (optimal/linear/buffer) for the Vulkan format.
 // Metal builds acceleration structures from vertices of two to four float, half, or normalized components.
 static bool isAccelerationStructureVertexFormat(MTLVertexFormat mtlVtxFmt) {
 	switch (mtlVtxFmt) {
@@ -1588,6 +1587,7 @@ static bool isAccelerationStructureVertexFormat(MTLVertexFormat mtlVtxFmt) {
 	}
 }
 
+// Sets the VkFormatProperties (optimal/linear/buffer) for the Vulkan format.
 void MVKPixelFormats::setFormatProperties(MVKVkFormatDesc& vkDesc, const MVKMTLDeviceCapabilities& gpuCaps) {
 
 #	define enableFormatFeatures(CAP, TYPE, MTL_FMT_CAPS, VK_FEATS)        \

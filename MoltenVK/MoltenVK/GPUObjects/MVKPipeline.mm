@@ -2368,7 +2368,7 @@ MVKGraphicsPipeline::~MVKGraphicsPipeline() {
 
 // Shaders access acceleration structures in the representation used by the descriptors of the device.
 bool MVKPipeline::usesAccelerationStructureHeaders() {
-	return getEnabledExtensions().vk_KHR_acceleration_structure.enabled && _device->useAccelerationStructureHeaders();
+	return getEnabledExtensions().vk_KHR_acceleration_structure.enabled;
 }
 
 // Initializes the shader conversion config of the shader stages that run in a Metal compute pipeline,
