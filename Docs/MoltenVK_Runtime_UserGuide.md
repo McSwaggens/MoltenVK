@@ -233,6 +233,8 @@ In addition to core *Vulkan* functionality, **MoltenVK**  also supports the foll
 
 - `VK_KHR_16bit_storage`
 - `VK_KHR_8bit_storage`
+- `VK_KHR_acceleration_structure`
+  - *Requires macOS 14 or iOS 17, and a GPU that supports Metal ray tracing.*
 - `VK_KHR_bind_memory2`
 - `VK_KHR_buffer_device_address`
   - *Requires GPU Tier 2 argument buffers support.*
@@ -280,12 +282,18 @@ In addition to core *Vulkan* functionality, **MoltenVK**  also supports the foll
 - `VK_KHR_maintenance9`
 - `VK_KHR_map_memory2`
 - `VK_KHR_multiview`
+- `VK_KHR_pipeline_library`
+  - *Ray tracing pipelines only.*
 - `VK_KHR_portability_subset`
 - `VK_KHR_present_id`
 - `VK_KHR_present_id2`
 - `VK_KHR_present_wait`
 - `VK_KHR_present_wait2`
 - `VK_KHR_push_descriptor`
+- `VK_KHR_ray_query`
+  - *Requires macOS 14 or iOS 17, and a GPU that supports Metal ray tracing.*
+- `VK_KHR_ray_tracing_pipeline`
+  - *Requires macOS 14 or iOS 17, a GPU that supports Metal ray tracing and function pointers, and Metal argument buffers.*
 - `VK_KHR_relaxed_block_layout`
 - `VK_KHR_robustness2`
 - `VK_KHR_sampler_mirror_clamp_to_edge`
@@ -377,6 +385,8 @@ In addition to core *Vulkan* functionality, **MoltenVK**  also supports the foll
   - *Requires a build of MoltenVK with `MVK_USE_METAL_PRIVATE_API` enabled.*
 - `VK_EXT_pipeline_creation_cache_control`
 - `VK_EXT_pipeline_creation_feedback`
+- `VK_EXT_pipeline_library_group_handles`
+  - *Ray tracing pipelines only.*
 - `VK_EXT_pipeline_robustness`
 - `VK_EXT_post_depth_coverage`
   - *iOS and macOS, requires family 4 (A11) or better Apple GPU.*
@@ -685,6 +695,19 @@ Known **MoltenVK** Limitations
 This section documents the known limitations in this version of **MoltenVK**.
 
 - See [above](#interaction) for known limitations for specific Vulkan extensions.
+
+- Ray tracing:
+  - Acceleration structure serialization (`vkCmdCopyAccelerationStructureToMemoryKHR`,
+    `vkCmdCopyMemoryToAccelerationStructureKHR`, and serialization size queries) is not supported,
+    because *Metal* provides no access to acceleration structure contents.
+  - Host acceleration structure commands, indirect acceleration structure builds, capture/replay
+    of shader group handles and acceleration structure addresses, `VK_KHR_ray_tracing_maintenance1`,
+    and `VK_KHR_ray_tracing_position_fetch` are not supported.
+  - *Metal* allocates acceleration structure memory itself, so the `VkBuffer` an acceleration structure is
+    created on is not used for its contents, and the relative device addresses of acceleration structures
+    created on the same `VkBuffer` are not preserved.
+  - Executing callable shaders is limited to 16 nested `executeCallableEXT()` calls.
+  - Ray tracing shaders cannot use subgroup operations.
 
 - Image content in `PVRTC` compressed formats must be loaded directly into a `VkImage` using
   host-visible memory mapping. Loading via a staging buffer will result in malformed image content.
