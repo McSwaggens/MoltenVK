@@ -147,6 +147,20 @@ protected:
 
 
 #pragma mark -
+#pragma mark MVKCmdBindRayTracingPipeline
+
+class MVKCmdBindRayTracingPipeline : public MVKCmdBindPipeline {
+
+public:
+	void encode(MVKCommandEncoder* cmdEncoder) override;
+
+protected:
+	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+
+};
+
+
+#pragma mark -
 #pragma mark MVKCmdBindDescriptorSetsStatic
 
 /**

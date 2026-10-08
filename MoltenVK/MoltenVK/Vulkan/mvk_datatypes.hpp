@@ -77,6 +77,17 @@ MTLMultisampleStencilResolveFilter mvkMTLMultisampleStencilResolveFilterFromVkRe
 MVKShaderStage mvkShaderStageFromVkShaderStageFlagBitsInObj(VkShaderStageFlagBits vkStage, MVKBaseObject* mvkObj);
 #define mvkShaderStageFromVkShaderStageFlagBits(vkStage) mvkShaderStageFromVkShaderStageFlagBitsInObj(vkStage, this)
 
+/** The Vulkan shader stages of ray tracing pipelines. */
+static constexpr VkShaderStageFlags kMVKRayTracingShaderStageFlags = (VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
+																	   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR | VK_SHADER_STAGE_MISS_BIT_KHR |
+																	   VK_SHADER_STAGE_INTERSECTION_BIT_KHR | VK_SHADER_STAGE_CALLABLE_BIT_KHR);
+
+/**
+ * Returns the Vulkan shader stages whose resources are bound to the specified MoltenVK shader stage.
+ * Ray tracing shaders run in Metal compute pipelines, and share the resource bindings of the compute stage.
+ */
+VkShaderStageFlags mvkVkShaderStageFlagsBoundToMVKShaderStage(MVKShaderStage mvkStage);
+
 MTLWinding mvkMTLWindingFromSpvExecutionModeInObj(uint32_t spvMode, MVKBaseObject* mvkObj);
 #define mvkMTLWindingFromSpvExecutionMode(spvMode) mvkMTLWindingFromSpvExecutionModeInObj(spvMode, this)
 

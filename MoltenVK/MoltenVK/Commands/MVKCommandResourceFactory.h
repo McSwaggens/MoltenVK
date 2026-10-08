@@ -385,6 +385,21 @@ public:
 	/** Returns a new MTLComputePipelineState for converting a Uint8 index buffer to Uint16. */
 	id<MTLComputePipelineState> newConvertUint8IndicesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 
+	/** Returns a new MTLComputePipelineState for converting the launch size of an indirect ray trace to threadgroup counts. */
+	id<MTLComputePipelineState> newCmdTraceRaysIndirectConvertBuffersMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
+	/** Returns a new MTLComputePipelineState for converting Vulkan acceleration structure instances to Metal instance descriptors. */
+	id<MTLComputePipelineState> newCmdConvertAccelerationStructureInstancesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
+	/** Returns a new MTLComputePipelineState for converting Vulkan acceleration structure geometry transforms to Metal matrices. */
+	id<MTLComputePipelineState> newCmdConvertAccelerationStructureTransformsMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
+	/** Returns a new MTLComputePipelineState for copying acceleration structure vertices to a buffer that Metal can read them from. */
+	id<MTLComputePipelineState> newCmdCopyAccelerationStructureVerticesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
+	/** Returns a new MTLComputePipelineState for converting Vulkan acceleration structure bounding boxes for Metal. */
+	id<MTLComputePipelineState> newCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
 
 #pragma mark Construction
 
@@ -399,13 +414,17 @@ protected:
 	id<MTLFunction> newClearVertFunction(MVKRPSKeyClearAtt& attKey);
 	id<MTLFunction> newClearFragFunction(MVKRPSKeyClearAtt& attKey);
 	NSString* getMTLFormatTypeString(MTLPixelFormat mtlPixFmt);
-    id<MTLFunction> newFunctionNamed(const char* funcName);
+    id<MTLFunction> newFunctionNamed(const char* funcName, id<MTLLibrary> mtlLibrary = nil);
+	id<MTLLibrary> getAccelerationStructureMTLLibrary();
 	id<MTLFunction> newMTLFunction(NSString* mslSrcCode, NSString* funcName);
 	id<MTLRenderPipelineState> newMTLRenderPipelineState(MTLRenderPipelineDescriptor* plDesc,
 														 MVKVulkanAPIDeviceObject* owner);
 	id<MTLComputePipelineState> newMTLComputePipelineState(const char* funcName,
-														   MVKVulkanAPIDeviceObject* owner);
+														   MVKVulkanAPIDeviceObject* owner,
+														   id<MTLLibrary> mtlLibrary = nil);
 
 	id<MTLLibrary> _mtlLibrary;
+	id<MTLLibrary> _mtlAccelerationStructureLibrary = nil;
 	MVKDeviceMemory* _transferImageMemory;
+	std::mutex _accelerationStructureLibraryLock;
 };

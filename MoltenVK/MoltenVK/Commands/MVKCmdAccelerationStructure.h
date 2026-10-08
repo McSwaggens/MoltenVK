@@ -27,6 +27,7 @@
 #pragma mark -
 #pragma mark MVKCmdBuildAccelerationStructures
 
+/** Vulkan command to build or update acceleration structures. */
 class MVKCmdBuildAccelerationStructures : public MVKCommand {
 
 public:
@@ -39,20 +40,37 @@ public:
 
 protected:
 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
+	const VkAccelerationStructureBuildRangeInfoKHR* getRangeInfos(const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo);
+	void encodeInputConversions(MVKCommandEncoder* cmdEncoder, MTLAccelerationStructureDescriptor* const* mtlDescs);
+	void encodeInstanceConversion(MVKCommandEncoder* cmdEncoder,
+								  id<MTLComputeCommandEncoder> mtlComputeEnc,
+								  const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+								  MTLInstanceAccelerationStructureDescriptor* mtlInstDesc);
+	void encodeTransformConversion(MVKCommandEncoder* cmdEncoder,
+								   id<MTLComputeCommandEncoder> mtlComputeEnc,
+								   const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+								   MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
+	void encodeVertexAlignment(MVKCommandEncoder* cmdEncoder,
+							   id<MTLComputeCommandEncoder> mtlComputeEnc,
+							   const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+							   MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
+	void encodeBoundingBoxConversion(MVKCommandEncoder* cmdEncoder,
+									 id<MTLComputeCommandEncoder> mtlComputeEnc,
+									 const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+									 MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
+	void encodeBuilds(MVKCommandEncoder* cmdEncoder, MTLAccelerationStructureDescriptor* const* mtlDescs);
 
-	struct BuildInfo {
-		VkAccelerationStructureBuildGeometryInfoKHR geometryInfo;
-		MVKSmallVector<VkAccelerationStructureGeometryKHR> geometries;
-		MVKSmallVector<VkAccelerationStructureBuildRangeInfoKHR> buildRangeInfos;
-	};
-
-	MVKSmallVector<BuildInfo> _buildInfos;
+	// The geometries and build ranges of all build infos, which reference their geometries in _geometries.
+	MVKSmallVector<VkAccelerationStructureBuildGeometryInfoKHR, 1> _buildInfos;
+	MVKSmallVector<VkAccelerationStructureGeometryKHR, 1> _geometries;
+	MVKSmallVector<VkAccelerationStructureBuildRangeInfoKHR, 1> _rangeInfos;
 };
 
 
 #pragma mark -
 #pragma mark MVKCmdCopyAccelerationStructure
 
+/** Vulkan command to copy or compact an acceleration structure. */
 class MVKCmdCopyAccelerationStructure : public MVKCommand {
 
 public:
@@ -73,6 +91,7 @@ protected:
 #pragma mark -
 #pragma mark MVKCmdWriteAccelerationStructuresProperties
 
+/** Vulkan command to write the properties of acceleration structures to queries. */
 class MVKCmdWriteAccelerationStructuresProperties : public MVKCommand {
 
 public:
@@ -88,8 +107,7 @@ public:
 protected:
 	MVKCommandTypePool<MVKCommand>* getTypePool(MVKCommandPool* cmdPool) override;
 
-	MVKSmallVector<VkAccelerationStructureKHR> _accelerationStructures;
-	VkQueryType _queryType;
+	MVKSmallVector<VkAccelerationStructureKHR, 1> _accelerationStructures;
 	VkQueryPool _queryPool;
 	uint32_t _firstQuery;
 };

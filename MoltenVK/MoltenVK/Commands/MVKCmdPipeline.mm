@@ -270,6 +270,14 @@ void MVKCmdBindComputePipeline::encode(MVKCommandEncoder* cmdEncoder) {
 
 
 #pragma mark -
+#pragma mark MVKCmdBindRayTracingPipeline
+
+void MVKCmdBindRayTracingPipeline::encode(MVKCommandEncoder* cmdEncoder) {
+	cmdEncoder->bindPipeline(VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR, _pipeline);
+}
+
+
+#pragma mark -
 #pragma mark MVKCmdBindDescriptorSetsStatic
 
 template <size_t N>
@@ -442,7 +450,7 @@ VkResult MVKCmdPushDescriptorSet::setContent(MVKCommandBuffer* cmdBuff,
 }
 
 void MVKCmdPushDescriptorSet::encode(MVKCommandEncoder* cmdEncoder) {
-	cmdEncoder->getState().pushDescriptorSet(_pipelineBindPoint, _pipelineLayout, _set, static_cast<uint32_t>(_descriptorWrites.size()), _descriptorWrites.data());
+	cmdEncoder->getState().pushDescriptorSet(*cmdEncoder, _pipelineBindPoint, _pipelineLayout, _set, static_cast<uint32_t>(_descriptorWrites.size()), _descriptorWrites.data());
 }
 
 MVKCmdPushDescriptorSet::~MVKCmdPushDescriptorSet() {
@@ -501,7 +509,7 @@ VkResult MVKCmdPushDescriptorSetWithTemplate::setContent(MVKCommandBuffer* cmdBu
 }
 
 void MVKCmdPushDescriptorSetWithTemplate::encode(MVKCommandEncoder* cmdEncoder) {
-	cmdEncoder->getState().pushDescriptorSet(_descUpdateTemplate, _pipelineLayout, _set, _pData);
+	cmdEncoder->getState().pushDescriptorSet(*cmdEncoder, _descUpdateTemplate, _pipelineLayout, _set, _pData);
 }
 
 MVKCmdPushDescriptorSetWithTemplate::~MVKCmdPushDescriptorSetWithTemplate() {

@@ -340,6 +340,9 @@ public:
     /** Called by each compute dispatch command to establish any outstanding state just prior to performing the dispatch. */
     void finalizeDispatchState();
 
+	/** Called by each ray tracing command to establish any outstanding state just prior to tracing rays. */
+	void finalizeRayTracingDispatchState();
+
 	/** Ends the current renderpass. */
 	void endRenderpass();
 
@@ -377,8 +380,17 @@ public:
 	id<MTLBlitCommandEncoder> getMTLBlitEncoder(MVKCommandUse cmdUse);
 
 	/**
-	 * Returns the current Metal encoder, which may be any of the Metal render,
-	 * compute, or Blit encoders, or nil if no encoding is currently occurring.
+	 * Returns the current Metal acceleration structure encoder for the specified use,
+	 * which determines the label assigned to the returned encoder.
+	 *
+	 * If the current encoder is not an acceleration structure encoder, this function
+	 * ends the current encoder before beginning acceleration structure encoding.
+	 */
+	id<MTLAccelerationStructureCommandEncoder> getMTLAccelerationStructureEncoder(MVKCommandUse cmdUse);
+
+	/**
+	 * Returns the current Metal encoder, which may be any of the Metal render, compute,
+	 * Blit, or acceleration structure encoders, or nil if no encoding is currently occurring.
 	 */
 	id<MTLCommandEncoder> getMTLEncoder();
 
@@ -412,11 +424,8 @@ public:
 	/** Returns the compute pipeline. */
 	MVKComputePipeline* getComputePipeline() { return getVkCompute()._pipeline; }
 
-	/** Returns the currently bound ray tracing pipeline. */
-	MVKRayTracingPipeline* getRayTracingPipeline() { return _rtPipeline; }
-
-	/** Sets the bound ray tracing pipeline. */
-	void setRayTracingPipeline(MVKRayTracingPipeline* pipeline) { _rtPipeline = pipeline; }
+	/** Returns the ray tracing pipeline. */
+	MVKRayTracingPipeline* getRayTracingPipeline() { return _state.vkRayTracing()._pipeline; }
 
     /**
 	 * Copy bytes into the Metal encoder at a Metal vertex buffer index, and optionally indicate
@@ -466,11 +475,13 @@ public:
 	void barrierWait(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages beforeStages);
 	void barrierWait(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder);
 	void barrierWait(MVKBarrierStage stage, id<MTLComputeCommandEncoder> mtlEncoder);
+	void barrierWait(MVKBarrierStage stage, id<MTLAccelerationStructureCommandEncoder> mtlEncoder);
 
 	/** Encode update for a specific stage in given encoder. */
 	void barrierUpdate(MVKBarrierStage stage, id<MTLRenderCommandEncoder> mtlEncoder, MTLRenderStages afterStages);
 	void barrierUpdate(MVKBarrierStage stage, id<MTLBlitCommandEncoder> mtlEncoder);
 	void barrierUpdate(MVKBarrierStage stage, id<MTLComputeCommandEncoder> mtlEncoder);
+	void barrierUpdate(MVKBarrierStage stage, id<MTLAccelerationStructureCommandEncoder> mtlEncoder);
 
 #pragma mark Queries
 
@@ -551,8 +562,8 @@ protected:
 	MVKSmallVector<MVKImageView*, kMVKDefaultAttachmentCount> _attachments;
 	id<MTLComputeCommandEncoder> _mtlComputeEncoder;
 	id<MTLBlitCommandEncoder> _mtlBlitEncoder;
+	id<MTLAccelerationStructureCommandEncoder> _mtlAccelerationStructureEncoder;
 	id<MTLFence> _stageCountersMTLFence;
-	MVKRayTracingPipeline* _rtPipeline = nullptr;
 	MVKPrefillMetalCommandBuffersStyle _prefillStyle;
 	VkSubpassContents _subpassContents;
 	uint32_t _renderSubpassIndex;
@@ -561,6 +572,7 @@ protected:
 	MVKCommandUse _mtlComputeEncoderUse;
 	uint32_t _mtlComputeEncoderStages;
 	MVKCommandUse _mtlBlitEncoderUse;
+	MVKCommandUse _mtlAccelerationStructureEncoderUse;
 	bool _isRenderingEntireAttachment;
 	bool _hasMTLRenderEncoderVisibilityResultBuffer;
 };
@@ -577,3 +589,6 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse);
 
 /** Returns a name, suitable for use as a MTLComputeCommandEncoder label, based on the MVKCommandUse. */
 NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse);
+
+/** Returns a name, suitable for use as a MTLAccelerationStructureCommandEncoder label, based on the MVKCommandUse. */
+NSString* mvkMTLAccelerationStructureCommandEncoderLabel(MVKCommandUse cmdUse);

@@ -1559,6 +1559,35 @@ typedef enum : VkFormatFeatureFlags2 {
 } MVKVkFormatFeatureFlags;
 
 // Sets the VkFormatProperties (optimal/linear/buffer) for the Vulkan format.
+// Metal builds acceleration structures from vertices of two to four float, half, or normalized components.
+static bool isAccelerationStructureVertexFormat(MTLVertexFormat mtlVtxFmt) {
+	switch (mtlVtxFmt) {
+		case MTLVertexFormatFloat2:
+		case MTLVertexFormatFloat3:
+		case MTLVertexFormatFloat4:
+		case MTLVertexFormatHalf2:
+		case MTLVertexFormatHalf3:
+		case MTLVertexFormatHalf4:
+		case MTLVertexFormatChar2Normalized:
+		case MTLVertexFormatChar3Normalized:
+		case MTLVertexFormatChar4Normalized:
+		case MTLVertexFormatUChar2Normalized:
+		case MTLVertexFormatUChar3Normalized:
+		case MTLVertexFormatUChar4Normalized:
+		case MTLVertexFormatShort2Normalized:
+		case MTLVertexFormatShort3Normalized:
+		case MTLVertexFormatShort4Normalized:
+		case MTLVertexFormatUShort2Normalized:
+		case MTLVertexFormatUShort3Normalized:
+		case MTLVertexFormatUShort4Normalized:
+		case MTLVertexFormatInt1010102Normalized:
+		case MTLVertexFormatUInt1010102Normalized:
+			return true;
+		default:
+			return false;
+	}
+}
+
 void MVKPixelFormats::setFormatProperties(MVKVkFormatDesc& vkDesc, const MVKMTLDeviceCapabilities& gpuCaps) {
 
 #	define enableFormatFeatures(CAP, TYPE, MTL_FMT_CAPS, VK_FEATS)        \
@@ -1642,10 +1671,8 @@ void MVKPixelFormats::setFormatProperties(MVKVkFormatDesc& vkDesc, const MVKMTLD
 		enableFormatFeatures(Atomic, Buf, mtlPixFmtCaps, vkProps.bufferFeatures);
 		enableFormatFeatures(Vertex, Buf, getMTLVertexFormatDesc(vkDesc.mtlVertexFormat).mtlFmtCaps, vkProps.bufferFeatures);
 
-		// Acceleration structure vertex buffer support for ray tracing
-		if (gpuCaps.supportsRayTracing &&
-			mvkAreAllFlagsEnabled(vkProps.bufferFeatures, VK_FORMAT_FEATURE_2_VERTEX_BUFFER_BIT)) {
-			mvkEnableFlags(vkProps.bufferFeatures, (VkFormatFeatureFlags)VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR);
+		if (gpuCaps.supportsRayTracing && isAccelerationStructureVertexFormat(vkDesc.mtlVertexFormat)) {
+			mvkEnableFlags(vkProps.bufferFeatures, VK_FORMAT_FEATURE_2_ACCELERATION_STRUCTURE_VERTEX_BUFFER_BIT_KHR);
 		}
 	}
 }

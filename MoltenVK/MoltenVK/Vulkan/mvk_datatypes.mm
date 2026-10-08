@@ -774,17 +774,10 @@ MVK_PUBLIC_SYMBOL VkShaderStageFlagBits mvkVkShaderStageFlagBitsFromMVKShaderSta
 	}
 }
 
-MVK_PUBLIC_SYMBOL VkShaderStageFlags mvkVkShaderStageFlagsFromMVKShaderStage(MVKShaderStage mvkStage) {
-	VkShaderStageFlags stages = mvkVkShaderStageFlagBitsFromMVKShaderStage(mvkStage);
-	if (mvkStage != kMVKShaderStageCompute) { return stages; }
-
-	return stages |
-		   VK_SHADER_STAGE_RAYGEN_BIT_KHR |
-		   VK_SHADER_STAGE_ANY_HIT_BIT_KHR |
-		   VK_SHADER_STAGE_CLOSEST_HIT_BIT_KHR |
-		   VK_SHADER_STAGE_MISS_BIT_KHR |
-		   VK_SHADER_STAGE_INTERSECTION_BIT_KHR |
-		   VK_SHADER_STAGE_CALLABLE_BIT_KHR;
+VkShaderStageFlags mvkVkShaderStageFlagsBoundToMVKShaderStage(MVKShaderStage mvkStage) {
+	VkShaderStageFlags vkStages = mvkVkShaderStageFlagBitsFromMVKShaderStage(mvkStage);
+	if (mvkStage == kMVKShaderStageCompute) { mvkEnableFlags(vkStages, kMVKRayTracingShaderStageFlags); }
+	return vkStages;
 }
 
 #undef mvkMTLWindingFromSpvExecutionMode
@@ -885,13 +878,15 @@ uint64_t mvkBarrierStagesFromPipelineStageFlags(VkPipelineStageFlags2 flags) {
                  VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT))
         result |= 1 << kMVKBarrierStageFragment;
 
-    if (flags & (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT |
-                 VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT))
+    if (flags & (VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT |
+                 VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT | VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT))
         result |= 1 << kMVKBarrierStageCompute;
 
+    // Acceleration structure builds and copies are encoded like transfers, with the same barrier stage.
     if (flags & (VK_PIPELINE_STAGE_2_BLIT_BIT | VK_PIPELINE_STAGE_2_COPY_BIT | VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT |
                  VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT | VK_PIPELINE_STAGE_2_TRANSFER_BIT | VK_PIPELINE_STAGE_2_RESOLVE_BIT |
-                 VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR | VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT |
+                 VK_PIPELINE_STAGE_2_CLEAR_BIT | VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR |
+                 VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR | VK_PIPELINE_STAGE_2_TOP_OF_PIPE_BIT |
                  VK_PIPELINE_STAGE_2_BOTTOM_OF_PIPE_BIT))
         result |= 1 << kMVKBarrierStageCopy;
 

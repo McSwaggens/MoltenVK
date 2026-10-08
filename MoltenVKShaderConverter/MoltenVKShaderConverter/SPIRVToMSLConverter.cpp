@@ -50,6 +50,7 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConversionOptions::matches(const SPIRVToMSLConv
 	if (memcmp(&mslOptions, &other.mslOptions, sizeof(mslOptions)) != 0) { return false; }
 	if (entryPointStage != other.entryPointStage) { return false; }
 	if (entryPointName != other.entryPointName) { return false; }
+	if (mslEntryPointName != other.mslEntryPointName) { return false; }
 	if (tessPatchKind != other.tessPatchKind) { return false; }
 	if (numTessControlPoints != other.numTessControlPoints) { return false; }
 	if (shouldFlipVertexY != other.shouldFlipVertexY) { return false; }
@@ -280,6 +281,9 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
 
 		if (shaderConfig.options.hasEntryPoint()) {
 			pMSLCompiler->set_entry_point(shaderConfig.options.entryPointName, shaderConfig.options.entryPointStage);
+			if ( !shaderConfig.options.mslEntryPointName.empty() ) {
+				pMSLCompiler->rename_entry_point(shaderConfig.options.entryPointName, shaderConfig.options.mslEntryPointName, shaderConfig.options.entryPointStage);
+			}
 		}
 
 		// Set up tessellation parameters if needed.
@@ -370,6 +374,7 @@ MVK_PUBLIC_SYMBOL bool SPIRVToMSLConverter::convert(SPIRVToMSLConversionConfigur
 		conversionResult.resultInfo.needsDrawId = pMSLCompiler->has_active_builtin(spv::BuiltInDrawIndex, spv::StorageClassInput);
 		conversionResult.resultInfo.needsDepthClipStateBuffer = pMSLCompiler->needs_depth_clip_state_buffer();
 		conversionResult.resultInfo.usesPhysicalStorageBufferAddressesCapability = usesPhysicalStorageBufferAddressesCapability(pMSLCompiler);
+		conversionResult.resultInfo.usesAccelerationStructures = usesAccelerationStructures(pMSLCompiler);
 		populateSpecializationMacros(pMSLCompiler, conversionResult.resultInfo.specializationMacros);
 
 		// When using Metal argument buffers, if the shader is provided with dynamic buffer offsets,
@@ -535,7 +540,9 @@ void SPIRVToMSLConverter::populateEntryPoint(CompilerMSL* pMSLCompiler,
 
 	SPIREntryPoint spvEP;
 	if (options.hasEntryPoint()) {
-		spvEP = pMSLCompiler->get_entry_point(options.entryPointName, options.entryPointStage);
+		// The entry point may have been renamed.
+		spvEP = pMSLCompiler->get_entry_point(options.mslEntryPointName.empty() ? options.entryPointName : options.mslEntryPointName,
+											  options.entryPointStage);
 	} else {
 		const auto& entryPoints = pMSLCompiler->get_entry_points_and_stages();
 		if ( !entryPoints.empty() ) {
@@ -565,6 +572,22 @@ bool SPIRVToMSLConverter::usesPhysicalStorageBufferAddressesCapability(Compiler*
 		for(auto dc: declaredCapabilities) {
 			if (dc == CapabilityPhysicalStorageBufferAddresses) {
 				return true;
+			}
+		}
+	}
+	return false;
+}
+
+// Ray queries and ray tracing pipeline stages access acceleration structures.
+bool SPIRVToMSLConverter::usesAccelerationStructures(Compiler* pCompiler) {
+	if (pCompiler) {
+		for (auto dc : pCompiler->get_declared_capabilities()) {
+			switch (dc) {
+				case CapabilityRayQueryKHR:
+				case CapabilityRayTracingKHR:
+					return true;
+				default:
+					break;
 			}
 		}
 	}

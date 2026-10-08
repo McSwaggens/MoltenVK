@@ -195,6 +195,9 @@ enum class MVKImplicitBuffer : uint32_t {
 	Index,
 	DispatchBase,
 	DrawId,
+	RayTracingDispatchParams,
+	RayTracingGroupTable,
+	RayTracingFunctionTable,
 	Count,
 };
 
