@@ -206,8 +206,10 @@ protected:
 	void propagateDebugName() override {}
 	void initComputeShaderConversionConfig(mvk::SPIRVToMSLConversionConfiguration& shaderConfig,
 										   MVKImplicitBufferBindings& implicitBuffers,
-										   const VkPipelineShaderStageCreateInfo* pShaderStage,
-										   spv::ExecutionModel execModel);
+										   bool isRayTracing);
+	void setComputeShaderStage(mvk::SPIRVToMSLConversionConfiguration& shaderConfig,
+							   const VkPipelineShaderStageCreateInfo* pShaderStage,
+							   spv::ExecutionModel execModel);
 	uint32_t getComputeImplicitBufferIndex(uint32_t bufferIndexOffset);
 	bool usesAccelerationStructureHeaders();
 
@@ -510,11 +512,14 @@ public:
 	/** Returns info about the resources used by the shader stages of this pipeline, which all run in the Metal compute stage. */
 	const MVKPipelineStageResourceInfo& getStageResources() const { return _stageResources; }
 
-	/** Returns the threadgroup size of an indirect dispatch. */
-	MTLSize getThreadgroupSize() const { return _mtlThreadgroupSize; }
-
 	/** Returns the threadgroup size of a dispatch with the given launch size. */
 	MTLSize getThreadgroupSize(MTLSize launchSize) const;
+
+	/**
+	 * Returns the threadgroup size of an indirect dispatch. The launch size of an indirect dispatch is only known
+	 * on the GPU, so the dispatch is one-dimensional, and the pipeline maps its threads to launch IDs.
+	 */
+	MTLSize getIndirectThreadgroupSize() const { return MTLSizeMake(_threadgroupThreadCount, 1, 1); }
 
 	/** Returns the maximum recursion depth of the rays traced by this pipeline. */
 	uint32_t getMaxRecursionDepth() const { return _maxRecursionDepth; }
@@ -544,27 +549,44 @@ protected:
 		VkRayTracingShaderGroupTypeKHR type;
 	};
 
+	/** The resources used by the shader stages of a pipeline library, which the pipelines that link it also use. */
+	struct LibraryResourceUsage {
+		MVKSmallVector<uint64_t> usedBindings;	/**< The used descriptor bindings, as (descriptor set << 32) | binding. */
+		bool needsSwizzleBuffer = false;
+		bool needsBufferSizeBuffer = false;
+		bool needsDynamicOffsetBuffer = false;
+	};
+
+	bool isLibrary() const { return mvkIsAnyFlagEnabled(_flags, VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR); }
 	bool validateLayout();
 	bool compileStages(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
-					   const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo);
+					   const VkPipelineCreationFeedbackCreateInfo* pFeedbackInfo,
+					   mvk::SPIRVToMSLConversionConfiguration& resourceConfig,
+					   mvk::SPIRVToMSLConversionResultInfo& resourceResults);
 	uint32_t findFunction(const std::string& funcName);
-	void addShaderGroups(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo);
-	bool initResourceUsage();
+	void linkLibraries(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo,
+					   mvk::SPIRVToMSLConversionConfiguration& resourceConfig,
+					   mvk::SPIRVToMSLConversionResultInfo& resourceResults,
+					   MVKSmallVector<ShaderGroup>& libraryGroups);
+	void addShaderGroups(const VkRayTracingPipelineCreateInfoKHR* pCreateInfo, const MVKSmallVector<ShaderGroup>& libraryGroups);
+	void initLibraryResourceUsage(const mvk::SPIRVToMSLConversionConfiguration& resourceConfig,
+								  const mvk::SPIRVToMSLConversionResultInfo& resourceResults);
+	bool initResourceUsage(mvk::SPIRVToMSLConversionConfiguration& resourceConfig,
+						   mvk::SPIRVToMSLConversionResultInfo& resourceResults);
 	std::string getKernelMSL();
 	bool initMTLPipelineState();
-	void initGroupTable();
+	bool initGroupTable();
 
 	id<MTLComputePipelineState> _mtlPipelineState = nil;
 	id<MTLVisibleFunctionTable> _mtlFunctionTable = nil;
 	id<MTLBuffer> _mtlGroupTable = nil;
 	MVKPipelineStageResourceInfo _stageResources = {};
-	MVKSmallVector<MVKMTLFunction> _functions;
-	MVKSmallVector<uint32_t> _stageFunctionIndices;
+	MVKSmallVector<MVKMTLFunction> _functions;				// Only kept after construction by pipeline libraries.
+	MVKSmallVector<uint32_t> _stageFunctionIndices;			// Only kept after construction by pipeline libraries.
 	MVKSmallVector<ShaderGroup> _shaderGroups;
-	mvk::SPIRVToMSLConversionConfiguration _resourceConfig;
-	mvk::SPIRVToMSLConversionResultInfo _resourceResults;
-	MVKSmallVector<MVKShaderModule*> _ownedModules;
-	MTLSize _mtlThreadgroupSize = MTLSizeMake(1, 1, 1);
+	MVKSmallVector<MVKRayTracingPipeline*> _libraries;		// Retained, so the group handles they reserved stay reserved.
+	LibraryResourceUsage _libraryResourceUsage;				// Only populated by pipeline libraries.
+	uint32_t _threadgroupThreadCount = 1;
 	uint32_t _firstReservedGroupHandle = 0;
 	uint32_t _reservedGroupHandleCount = 0;
 	uint32_t _maxRecursionDepth = 0;

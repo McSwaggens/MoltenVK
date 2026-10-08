@@ -585,7 +585,8 @@ void MVKPhysicalDevice::getFeatures(VkPhysicalDeviceFeatures2* features) {
 				asFeatures->accelerationStructureCaptureReplay = false;
 				asFeatures->accelerationStructureIndirectBuild = false;
 				asFeatures->accelerationStructureHostCommands = false;
-				asFeatures->descriptorBindingAccelerationStructureUpdateAfterBind = false;
+				// Acceleration structure descriptors are buffer descriptors of acceleration structure headers.
+				asFeatures->descriptorBindingAccelerationStructureUpdateAfterBind = supportedFeats12.descriptorBindingStorageBufferUpdateAfterBind;
 				break;
 			}
 			case VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FRAGMENT_SHADER_BARYCENTRIC_FEATURES_KHR: {
@@ -1261,10 +1262,12 @@ void MVKPhysicalDevice::getProperties(VkPhysicalDeviceProperties2* properties) {
 				asProps->maxGeometryCount = (1ull << 24) - 1;
 				asProps->maxInstanceCount = (1ull << 24) - 1;
 				asProps->maxPrimitiveCount = (1ull << 29) - 1;
+				// Acceleration structure descriptors are buffer descriptors of acceleration structure headers.
+				// Vulkan requires at least 500000 update-after-bind acceleration structure descriptors.
 				asProps->maxPerStageDescriptorAccelerationStructures = 16;
-				asProps->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = 16;
+				asProps->maxPerStageDescriptorUpdateAfterBindAccelerationStructures = max(supportedProps12.maxPerStageDescriptorUpdateAfterBindStorageBuffers, 500000u);
 				asProps->maxDescriptorSetAccelerationStructures = 16;
-				asProps->maxDescriptorSetUpdateAfterBindAccelerationStructures = 16;
+				asProps->maxDescriptorSetUpdateAfterBindAccelerationStructures = max(supportedProps12.maxDescriptorSetUpdateAfterBindStorageBuffers, 500000u);
 				asProps->minAccelerationStructureScratchOffsetAlignment = 256;
 				break;
 			}
@@ -4534,6 +4537,19 @@ MTLAccelerationStructureGeometryDescriptor* MVKDevice::getMTLAccelerationStructu
 				mtlTriDesc.vertexBuffer = getMTLBufferForDeviceAddress(vtxAddr, &vtxOffset);
 				mtlTriDesc.vertexBufferOffset = vtxOffset;
 				if ( !mtlTriDesc.vertexBuffer ) { return nil; }
+#if MVK_XCODE_16 && MVK_MACOS_OR_IOS
+				// Where Metal can read Vulkan's row-major transforms, use them directly.
+				// Otherwise, the build converts them to the default column-major layout.
+				if (triangles.transformData.deviceAddress) {
+					if (@available(macOS 15.0, iOS 18.0, *)) {
+						VkDeviceSize xfmOffset = 0;
+						mtlTriDesc.transformationMatrixBuffer = getMTLBufferForDeviceAddress(triangles.transformData.deviceAddress + rangeInfo.transformOffset, &xfmOffset);
+						mtlTriDesc.transformationMatrixBufferOffset = xfmOffset;
+						mtlTriDesc.transformationMatrixLayout = MTLMatrixLayoutRowMajor;
+						if ( !mtlTriDesc.transformationMatrixBuffer ) { return nil; }
+					}
+				}
+#endif
 			}
 			mtlGeoDesc = mtlTriDesc;
 			break;
@@ -4944,11 +4960,12 @@ void MVKDevice::encodeGPUAddressableBuffers(MVKUseResourceHelper& resources, MVK
 	}
 }
 
-void MVKDevice::encodeAccelerationStructures(MVKUseResourceHelper& resources, MVKResourceUsageStages stage) {
+void MVKDevice::encodeAccelerationStructures(id<MTLCommandEncoder> mtlEncoder, MVKUseMTLResourceFunction useResource,
+											 MVKUseResourceHelper& resources, MVKResourceUsageStages stages) {
 	// Acceleration structures, their headers and instance data are added to the residency set when created.
 	if (hasResidencySet()) { return; }
 
-	_accelerationStructureHeaderPool->encodeResourceUsage(resources, stage);
+	_accelerationStructureHeaderPool->useResources(mtlEncoder, useResource, resources, stages);
 }
 
 id<MTLFunction> MVKDevice::getGeneratedMTLFunction(const string& msl, const char* funcName, MVKVulkanAPIDeviceObject* owner) {
@@ -5383,7 +5400,8 @@ bool MVKDevice::shouldPrefillMTLCommandBuffers() {
 			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind ||
 			  _enabledDescriptorIndexingFeatures.descriptorBindingUniformTexelBufferUpdateAfterBind ||
 			  _enabledDescriptorIndexingFeatures.descriptorBindingStorageTexelBufferUpdateAfterBind ||
-			  _enabledInlineUniformBlockFeatures.descriptorBindingInlineUniformBlockUpdateAfterBind));
+			  _enabledInlineUniformBlockFeatures.descriptorBindingInlineUniformBlockUpdateAfterBind ||
+			  _enabledAccelerationStructureFeatures.descriptorBindingAccelerationStructureUpdateAfterBind));
 }
 
 void MVKDevice::startAutoGPUCapture(MVKConfigAutoGPUCaptureScope autoGPUCaptureScope, id mtlCaptureObject) {

@@ -223,9 +223,8 @@ struct MVKVulkanGraphicsCommandEncoderState: public MVKVulkanCommonEncoderState 
 	                        const uint32_t* dynamicOffsets);
 };
 
-/** Tracks the state of a Vulkan compute encoder. */
-struct MVKVulkanComputeCommandEncoderState: public MVKVulkanCommonEncoderState {
-	MVKComputePipeline* _pipeline = nullptr;
+/** Tracks the state of a Vulkan bind point whose shaders run in the Metal compute stage, using the resources of the Vulkan compute stage. */
+struct MVKVulkanComputeStageEncoderState: public MVKVulkanCommonEncoderState {
 	MVKImplicitBufferData _implicitBufferData;
 
 	/** Bind the given descriptor sets, placing their bindings into `_descriptorSetBindings`. */
@@ -237,18 +236,14 @@ struct MVKVulkanComputeCommandEncoderState: public MVKVulkanCommonEncoderState {
 	                        const uint32_t* dynamicOffsets);
 };
 
-/** Tracks the state of the Vulkan ray tracing bind point, which runs on a Metal compute encoder. */
-struct MVKVulkanRayTracingCommandEncoderState: public MVKVulkanCommonEncoderState {
-	MVKRayTracingPipeline* _pipeline = nullptr;
-	MVKImplicitBufferData _implicitBufferData;
+/** Tracks the state of a Vulkan compute encoder. */
+struct MVKVulkanComputeCommandEncoderState: public MVKVulkanComputeStageEncoderState {
+	MVKComputePipeline* _pipeline = nullptr;
+};
 
-	/** Bind the given descriptor sets, placing their bindings into `_descriptorSetBindings`. */
-	void bindDescriptorSets(MVKPipelineLayout* layout,
-	                        uint32_t firstSet,
-	                        uint32_t setCount,
-	                        MVKDescriptorSet*const* sets,
-	                        uint32_t dynamicOffsetCount,
-	                        const uint32_t* dynamicOffsets);
+/** Tracks the state of the Vulkan ray tracing bind point, whose shaders run in a Metal compute pipeline. */
+struct MVKVulkanRayTracingCommandEncoderState: public MVKVulkanComputeStageEncoderState {
+	MVKRayTracingPipeline* _pipeline = nullptr;
 };
 
 struct MVKMetalSharedCommandEncoderState {
@@ -261,7 +256,7 @@ struct MVKMetalSharedCommandEncoderState {
 	/** Which GPU addressable resources have been added to `_useResource`. */
 	MVKResourceUsageStages _gpuAddressableResourceStages;
 
-	/** Which acceleration structure resources have been added to `_useResource`. */
+	/** Which stages acceleration structure resources have been used for, in the current Metal encoder. */
 	MVKResourceUsageStages _accelerationStructureStages;
 
 	void reset() {
@@ -434,6 +429,7 @@ struct MVKMetalComputeCommandEncoderState {
 	void bindBytes(id<MTLComputeCommandEncoder> encoder, const void* data, size_t size, NSUInteger index);
 	void bindTexture(id<MTLComputeCommandEncoder> encoder, id<MTLTexture> texture, NSUInteger index);
 	void bindSampler(id<MTLComputeCommandEncoder> encoder, id<MTLSamplerState> sampler, NSUInteger index);
+	void bindVisibleFunctionTable(id<MTLComputeCommandEncoder> encoder, id<MTLVisibleFunctionTable> table, NSUInteger index);
 	template <typename T> void bindStructBytes(id<MTLComputeCommandEncoder> encoder, const T* t, NSUInteger index) { bindBytes(encoder, t, sizeof(T), index); }
 	void prepareComputeDispatch(id<MTLComputeCommandEncoder> encoder, MVKCommandEncoder& mvkEncoder, const MVKVulkanComputeCommandEncoderState& vkState, const MVKVulkanSharedCommandEncoderState& vkShared);
 	void prepareRayTracingDispatch(id<MTLComputeCommandEncoder> encoder, MVKCommandEncoder& mvkEncoder, const MVKVulkanRayTracingCommandEncoderState& vkState, const MVKVulkanSharedCommandEncoderState& vkShared);
@@ -446,6 +442,10 @@ struct MVKMetalComputeCommandEncoderState {
 	VkPipelineBindPoint getVkBindPoint() const;
 
 	void reset();
+
+private:
+	template <typename VkState>
+	bool bindVulkanComputeStage(id<MTLComputeCommandEncoder> encoder, MVKCommandEncoder& mvkEncoder, const VkState& vkState, const MVKVulkanSharedCommandEncoderState& vkShared, bool isVkRayTracing);
 };
 
 #pragma mark - MVKCommandEncoderState
@@ -469,6 +469,7 @@ class MVKCommandEncoderState {
 
 	/** Get the encoder state associated with the given bind point, or nullptr if the bindPoint isn't supported. */
 	MVKVulkanCommonEncoderState* getVkEncoderState(VkPipelineBindPoint bindPoint);
+	void bindPipelineLayout(VkPipelineBindPoint bindPoint, MVKVulkanCommonEncoderState& vkState, MVKPipelineLayout* layout);
 	const MVKDescriptorSet* preparePushDescriptorArgumentBuffer(MVKCommandEncoder& mvkEncoder, VkPipelineBindPoint bindPoint,
 																MVKDescriptorSetLayout* dsl, uint32_t set);
 

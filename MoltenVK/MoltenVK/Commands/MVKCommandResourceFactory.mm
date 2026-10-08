@@ -653,6 +653,10 @@ id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdConvertAcceleration
 	return newMTLComputePipelineState("cmdConvertAccelerationStructureBoundingBoxes", owner, getAccelerationStructureMTLLibrary());
 }
 
+id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdCopyAccelerationStructureInstanceDataMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
+	return newMTLComputePipelineState("cmdCopyAccelerationStructureInstanceData", owner, getAccelerationStructureMTLLibrary());
+}
+
 
 #pragma mark Support methods
 
@@ -740,15 +744,27 @@ void MVKCommandResourceFactory::initMTLLibrary() {
 }
 
 // The acceleration structure command shaders require MSL 3.1, which is available wherever
-// acceleration structures are supported, so they are compiled when first used.
+// acceleration structures are supported, so they are compiled when first used. They must
+// preserve NaN bounding box coordinates, so they are never compiled with fast math.
 id<MTLLibrary> MVKCommandResourceFactory::getAccelerationStructureMTLLibrary() {
 	lock_guard<mutex> lock(_accelerationStructureLibraryLock);
 	if ( !_mtlAccelerationStructureLibrary ) {
 		@autoreleasepool {
+			MTLCompileOptions* mtlCompOpts = getDevice()->getMTLCompileOptions(0);
+#if MVK_XCODE_16
+			if ([mtlCompOpts respondsToSelector: @selector(mathMode)]) {
+				mtlCompOpts.mathMode = MTLMathModeSafe;
+				mtlCompOpts.mathFloatingPointFunctions = MTLMathFloatingPointFunctionsPrecise;
+			} else
+#endif
+			{
+				mtlCompOpts.fastMathEnabled = false;
+			}
+
 			NSError* err = nil;
 			uint64_t startTime = getPerformanceTimestamp();
 			_mtlAccelerationStructureLibrary = [getMTLDevice() newLibraryWithSource: _MVKStaticAccelerationStructureShaderSource
-																			options: getDevice()->getMTLCompileOptions()
+																			options: mtlCompOpts
 																			  error: &err];    // retained
 			if (err) {
 				reportError(VK_ERROR_INITIALIZATION_FAILED, "Could not compile acceleration structure command shaders (Error code %li):\n%s",

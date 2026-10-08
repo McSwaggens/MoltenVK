@@ -1484,7 +1484,6 @@ NSString* mvkMTLBlitCommandEncoderLabel(MVKCommandUse cmdUse) {
         case kMVKCommandUseResetQueryPool:                  return @"vkCmdResetQueryPool BlitEncoder";
         case kMVKCommandUseCopyQueryPoolResults:            return @"vkCmdCopyQueryPoolResults BlitEncoder";
 		case kMVKCommandUseRecordGPUCounterSample:          return @"Record GPU Counter Sample BlitEncoder";
-		case kMVKCommandUseCopyAccelerationStructure:       return @"vkCmdCopyAccelerationStructureKHR BlitEncoder";
         default:                                            return @"Unknown Use BlitEncoder";
     }
 }
@@ -1505,6 +1504,7 @@ NSString* mvkMTLComputeCommandEncoderLabel(MVKCommandUse cmdUse) {
         case kMVKCommandUseAccumOcclusionQuery:             return @"Post-render-pass occlusion query accumulation ComputeEncoder";
         case kMVKCommandConvertUint8Indices:                return @"Convert Uint8 indices to Uint16 ComputeEncoder";
 		case kMVKCommandUseBuildAccelerationStructures:     return @"vkCmdBuildAccelerationStructuresKHR ComputeEncoder";
+		case kMVKCommandUseCopyAccelerationStructure:       return @"vkCmdCopyAccelerationStructureKHR ComputeEncoder";
         default:                                            return @"Unknown Use ComputeEncoder";
     }
 }

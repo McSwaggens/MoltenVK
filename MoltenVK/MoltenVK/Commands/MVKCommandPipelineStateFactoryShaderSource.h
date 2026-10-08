@@ -548,12 +548,17 @@ kernel void convertUint8IndicesRaw(device uint8_t* src [[ buffer(0) ]],
 	dst[pos] = idx;
 }
 
+// Converts the launch size of an indirect ray tracing dispatch to the threadgroup count of a one-dimensional
+// dispatch, whose threads the ray tracing pipeline maps to launch IDs, from their 32-bit positions in the grid.
 kernel void cmdTraceRaysIndirectConvertBuffers(const device uint32_t* launchSize [[buffer(0)]],
                                                device uint32_t* threadgroupCounts [[buffer(1)]],
-                                               constant uint32_t* threadgroupSize [[buffer(2)]]) {
-	for (uint32_t i = 0; i < 3; i++) {
-		threadgroupCounts[i] = launchSize[i] / threadgroupSize[i] + (launchSize[i] % threadgroupSize[i] ? 1 : 0);
-	}
+                                               constant uint32_t& threadgroupSize [[buffer(2)]]) {
+	const ulong maxThreadCount = 0xFFFFFFFFul;
+	ulong threadCount = min(ulong(launchSize[0]) * launchSize[1], maxThreadCount);
+	threadCount = min(threadCount * launchSize[2], maxThreadCount);
+	threadgroupCounts[0] = uint32_t((threadCount + threadgroupSize - 1) / threadgroupSize);
+	threadgroupCounts[1] = 1;
+	threadgroupCounts[2] = 1;
 }
 )";
 
@@ -573,6 +578,11 @@ typedef struct {
 } MVKAccelerationStructureHeader;
 
 typedef struct {
+	MVKAccelerationStructureHeader header;
+	uint instanceCount;
+} MVKAccelerationStructureHeaderSlot;
+
+typedef struct {
 	float transform[3][4];
 	uint instanceCustomIndexAndMask;
 	uint instanceSBTRecordOffsetAndFlags;
@@ -582,17 +592,18 @@ typedef struct {
 typedef struct {
 	ulong instances;
 	ulong instanceSBTOffsets;
+	uint instanceCount;
 	uint arrayOfPointers;
 } MVKAccelerationStructureInstanceParams;
 
-// Converts Vulkan instances to Metal instance descriptors, and writes their SBT record offsets, and the
-// address of those, to the header of the top-level acceleration structure. Each instance references a
-// bottom-level acceleration structure by the device address of its header. A null reference makes the
-// instance inactive. The Vulkan geometry instance flags have the same values as the Metal instance options.
+// Converts Vulkan instances to Metal instance descriptors, and writes their SBT record offsets, and the address and
+// number of those, to the header slot of the top-level acceleration structure. Each instance references a bottom-level
+// acceleration structure by the device address of its header. A null reference makes the instance inactive.
+// The four Vulkan geometry instance flags that Metal supports have the same values as the Metal instance options.
 kernel void cmdConvertAccelerationStructureInstances(constant MVKAccelerationStructureInstanceParams& params [[buffer(0)]],
                                                      device MTLIndirectAccelerationStructureInstanceDescriptor* mtlInstances [[buffer(1)]],
                                                      device uint* instanceSBTOffsets [[buffer(2)]],
-                                                     device MVKAccelerationStructureHeader& header [[buffer(3)]],
+                                                     device MVKAccelerationStructureHeaderSlot& slot [[buffer(3)]],
                                                      uint idx [[thread_position_in_grid]]) {
 	const device VkAccelerationStructureInstanceKHR& vkInst = params.arrayOfPointers
 		? *reinterpret_cast<const device VkAccelerationStructureInstanceKHR*>(reinterpret_cast<const device ulong*>(params.instances)[idx])
@@ -604,7 +615,7 @@ kernel void cmdConvertAccelerationStructureInstances(constant MVKAccelerationStr
 	}
 	uint sbtOffset = vkInst.instanceSBTRecordOffsetAndFlags & 0xFFFFFF;
 	ulong blasAddress = vkInst.accelerationStructureReference;
-	mtlInst.options = MTLAccelerationStructureInstanceOptions(vkInst.instanceSBTRecordOffsetAndFlags >> 24);
+	mtlInst.options = MTLAccelerationStructureInstanceOptions((vkInst.instanceSBTRecordOffsetAndFlags >> 24) & 0xF);
 	mtlInst.mask = blasAddress ? vkInst.instanceCustomIndexAndMask >> 24 : 0;
 	mtlInst.intersectionFunctionTableOffset = sbtOffset;
 	mtlInst.userID = vkInst.instanceCustomIndexAndMask & 0xFFFFFF;
@@ -612,7 +623,35 @@ kernel void cmdConvertAccelerationStructureInstances(constant MVKAccelerationStr
 	mtlInstances[idx] = mtlInst;
 
 	instanceSBTOffsets[idx] = sbtOffset;
-	if (idx == 0) { header.instanceSBTOffsets = params.instanceSBTOffsets; }
+	if (idx == 0) {
+		slot.header.instanceSBTOffsets = params.instanceSBTOffsets;
+		slot.instanceCount = params.instanceCount;
+	}
+}
+
+typedef struct {
+	ulong dstInstanceSBTOffsets;
+	uint dstCapacity;
+} MVKAccelerationStructureInstanceCopyParams;
+
+// Copies the instance SBT record offsets of a top-level acceleration structure, found through its header slot, to a buffer
+// of the destination, and writes their address and number to the header slot of the destination. If they do not fit in
+// the buffer, the destination references the instance data of the source instead.
+kernel void cmdCopyAccelerationStructureInstanceData(constant MVKAccelerationStructureInstanceCopyParams& params [[buffer(0)]],
+                                                     const device MVKAccelerationStructureHeaderSlot& srcSlot [[buffer(1)]],
+                                                     device MVKAccelerationStructureHeaderSlot& dstSlot [[buffer(2)]],
+                                                     device uint* dstInstanceSBTOffsets [[buffer(3)]],
+                                                     uint idx [[thread_position_in_grid]]) {
+	ulong srcInstanceSBTOffsets = srcSlot.header.instanceSBTOffsets;
+	uint instanceCount = srcInstanceSBTOffsets ? srcSlot.instanceCount : 0;
+	bool fits = instanceCount <= params.dstCapacity;
+	if (fits && idx < instanceCount) {
+		dstInstanceSBTOffsets[idx] = reinterpret_cast<const device uint*>(srcInstanceSBTOffsets)[idx];
+	}
+	if (idx == 0) {
+		dstSlot.header.instanceSBTOffsets = !instanceCount ? 0 : (fits ? params.dstInstanceSBTOffsets : srcInstanceSBTOffsets);
+		dstSlot.instanceCount = instanceCount;
+	}
 }
 
 typedef struct {

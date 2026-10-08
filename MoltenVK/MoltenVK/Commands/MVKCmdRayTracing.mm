@@ -40,6 +40,13 @@ static void setShaderBindingTables(MVKRayTracingDispatchParams& params,
 	params.callableStride = pCallableShaderBindingTable->stride;
 }
 
+// Returns whether the bound ray tracing pipeline has a Metal pipeline to trace rays with.
+// If its creation failed, no rays are traced, rather than dispatching whatever Metal pipeline is bound.
+static bool hasMTLPipelineState(MVKCommandEncoder* cmdEncoder) {
+	MVKRayTracingPipeline* pipeline = cmdEncoder->getRayTracingPipeline();
+	return pipeline && pipeline->getPipelineState();
+}
+
 // Binds the dispatch parameters of the bound ray tracing pipeline, and returns the pipeline.
 static MVKRayTracingPipeline* bindDispatchParams(MVKCommandEncoder* cmdEncoder,
 												 id<MTLComputeCommandEncoder> mtlEncoder,
@@ -75,6 +82,7 @@ VkResult MVKCmdTraceRays::setContent(MVKCommandBuffer* cmdBuff,
 
 void MVKCmdTraceRays::encode(MVKCommandEncoder* cmdEncoder) {
 	if ( !_params.launchWidth || !_params.launchHeight || !_params.launchDepth ) { return; }
+	if ( !hasMTLPipelineState(cmdEncoder) ) { return; }
 
 	cmdEncoder->finalizeRayTracingDispatchState();	// Ensure all updated state has been submitted to Metal
 	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTraceRays);
@@ -107,21 +115,23 @@ VkResult MVKCmdTraceRaysIndirect::setContent(MVKCommandBuffer* cmdBuff,
 }
 
 void MVKCmdTraceRaysIndirect::encode(MVKCommandEncoder* cmdEncoder) {
+	if ( !hasMTLPipelineState(cmdEncoder) ) { return; }
+
 	MVKRayTracingPipeline* pipeline = cmdEncoder->getRayTracingPipeline();
-	MTLSize tgSize = pipeline->getThreadgroupSize();
+	MTLSize tgSize = pipeline->getIndirectThreadgroupSize();
 	id<MTLComputeCommandEncoder> mtlEncoder = cmdEncoder->getMTLComputeEncoder(kMVKCommandUseTraceRays);
 
-	// Convert the launch size to the threadgroup counts of an indirect Metal dispatch.
+	// Convert the launch size to the threadgroup count of a one-dimensional indirect Metal dispatch.
 	const MVKMTLBufferAllocation* tgCounts = cmdEncoder->getTempMTLBuffer(sizeof(MTLDispatchThreadgroupsIndirectArguments), true);
-	uint32_t tgSizes[] = { (uint32_t)tgSize.width, (uint32_t)tgSize.height, (uint32_t)tgSize.depth };
+	uint32_t tgThreadCount = (uint32_t)tgSize.width;
 	MVKMetalComputeCommandEncoderState& mtlCompute = cmdEncoder->getMtlCompute();
 	mtlCompute.bindPipeline(mtlEncoder, cmdEncoder->getCommandEncodingPool()->getCmdTraceRaysIndirectConvertBuffersMTLComputePipelineState());
 	mtlCompute.bindBuffer(mtlEncoder, _mtlIndirectBuffer, _mtlIndirectBufferOffset, 0);
 	mtlCompute.bindBuffer(mtlEncoder, tgCounts->_mtlBuffer, tgCounts->_offset, 1);
-	mtlCompute.bindBytes(mtlEncoder, tgSizes, sizeof(tgSizes), 2);
+	mtlCompute.bindBytes(mtlEncoder, &tgThreadCount, sizeof(tgThreadCount), 2);
 	[mtlEncoder dispatchThreadgroups: MTLSizeMake(1, 1, 1) threadsPerThreadgroup: MTLSizeMake(1, 1, 1)];
 
-	// The pipeline reads the launch size, and skips the threads of partial threadgroups outside it.
+	// The pipeline reads the launch size, maps the threads to launch IDs, and skips the threads outside it.
 	cmdEncoder->finalizeRayTracingDispatchState();
 	bindDispatchParams(cmdEncoder, mtlEncoder, _params);
 	[mtlEncoder dispatchThreadgroupsWithIndirectBuffer: tgCounts->_mtlBuffer

@@ -157,6 +157,9 @@ public:
 	/** Returns a MTLComputePipelineState for converting Vulkan acceleration structure bounding boxes for Metal. */
 	id<MTLComputePipelineState> getCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState();
 
+	/** Returns a MTLComputePipelineState for copying the instance data of a top-level acceleration structure. */
+	id<MTLComputePipelineState> getCmdCopyAccelerationStructureInstanceDataMTLComputePipelineState();
+
 	/** Deletes all the internal resources. */
 	void clear();
 
@@ -204,4 +207,5 @@ protected:
 	id<MTLComputePipelineState> _mtlConvertAccelerationStructureTransformsComputePipelineState = nil;
 	id<MTLComputePipelineState> _mtlCopyAccelerationStructureVerticesComputePipelineState = nil;
 	id<MTLComputePipelineState> _mtlConvertAccelerationStructureBoundingBoxesComputePipelineState = nil;
+	id<MTLComputePipelineState> _mtlCopyAccelerationStructureInstanceDataComputePipelineState = nil;
 };
