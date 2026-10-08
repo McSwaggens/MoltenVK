@@ -50,6 +50,14 @@ protected:
 								   id<MTLComputeCommandEncoder> mtlComputeEnc,
 								   const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
 								   MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
+	void encodeVertexAlignment(MVKCommandEncoder* cmdEncoder,
+							   id<MTLComputeCommandEncoder> mtlComputeEnc,
+							   const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+							   MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
+	void encodeBoundingBoxConversion(MVKCommandEncoder* cmdEncoder,
+									 id<MTLComputeCommandEncoder> mtlComputeEnc,
+									 const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+									 MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc);
 	void encodeBuilds(MVKCommandEncoder* cmdEncoder, MTLAccelerationStructureDescriptor* const* mtlDescs);
 
 	// The geometries and build ranges of all build infos, which reference their geometries in _geometries.

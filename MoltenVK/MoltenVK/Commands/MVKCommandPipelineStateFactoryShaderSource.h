@@ -607,6 +607,40 @@ kernel void cmdConvertAccelerationStructureInstances(constant MVKAccelerationStr
 	if (idx == 0) { header.instanceSBTOffsets = params.instanceSBTOffsets; }
 }
 
+typedef struct {
+	ulong vertices;
+	uint stride;
+	uint vertexSize;
+} MVKAccelerationStructureVertexParams;
+
+// Copies vertices, read from a device address, to a buffer that Metal can build acceleration structures from.
+kernel void cmdCopyAccelerationStructureVertices(constant MVKAccelerationStructureVertexParams& params [[buffer(0)]],
+                                                 device uchar* dstVertices [[buffer(1)]],
+                                                 uint idx [[thread_position_in_grid]]) {
+	const device uchar* srcVertex = reinterpret_cast<const device uchar*>(params.vertices) + idx * params.stride;
+	device uchar* dstVertex = dstVertices + idx * params.stride;
+	for (uint byteIdx = 0; byteIdx < params.vertexSize; byteIdx++) {
+		dstVertex[byteIdx] = srcVertex[byteIdx];
+	}
+}
+
+typedef struct {
+	ulong boundingBoxes;
+	ulong stride;
+} MVKAccelerationStructureBoundingBoxParams;
+
+// Copies bounding boxes, read from a device address, enlarged by about one ULP, so that rays along their faces intersect them.
+// Bounding boxes with a NaN minimum x coordinate are inactive, and remain so.
+kernel void cmdConvertAccelerationStructureBoundingBoxes(constant MVKAccelerationStructureBoundingBoxParams& params [[buffer(0)]],
+                                                         device packed_float3* dstBoxes [[buffer(1)]],
+                                                         uint idx [[thread_position_in_grid]]) {
+	const device packed_float3* srcBox = reinterpret_cast<const device packed_float3*>(params.boundingBoxes + idx * params.stride);
+	float3 minPos = srcBox[0];
+	float3 maxPos = srcBox[1];
+	dstBoxes[2 * idx] = minPos - (abs(minPos) * 1.2e-7f + 1.0e-30f);
+	dstBoxes[2 * idx + 1] = maxPos + (abs(maxPos) * 1.2e-7f + 1.0e-30f);
+}
+
 // Converts Vulkan row-major 3x4 geometry transforms, read from device addresses, to Metal column-major 4x3 matrices.
 kernel void cmdConvertAccelerationStructureTransforms(constant ulong* vkTransforms [[buffer(0)]],
                                                       device MTLPackedFloat4x3* mtlTransforms [[buffer(1)]],

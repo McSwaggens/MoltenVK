@@ -35,6 +35,19 @@ typedef struct {
 	uint32_t arrayOfPointers;
 } MVKAccelerationStructureInstanceParams;
 
+// Must match the vertex copy shader.
+typedef struct {
+	uint64_t vertices;
+	uint32_t stride;
+	uint32_t vertexSize;
+} MVKAccelerationStructureVertexParams;
+
+// Must match the bounding box conversion shader.
+typedef struct {
+	uint64_t boundingBoxes;
+	uint64_t stride;
+} MVKAccelerationStructureBoundingBoxParams;
+
 // Dispatches one thread for each of the specified number of elements.
 static void dispatchThreads(id<MTLComputeCommandEncoder> mtlComputeEnc, id<MTLComputePipelineState> mtlPSO, NSUInteger count) {
 	[mtlComputeEnc dispatchThreads: MTLSizeMake(count, 1, 1)
@@ -45,6 +58,16 @@ static bool hasTransform(const VkAccelerationStructureGeometryKHR& geometry, con
 	return (geometry.geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
 			geometry.geometry.triangles.transformData.deviceAddress &&
 			rangeInfo.primitiveCount);
+}
+
+// Metal requires vertex buffer offsets to be 4-byte aligned, while Vulkan only requires vertex component alignment.
+static bool hasMisalignedVertices(const VkAccelerationStructureGeometryKHR& geometry, MTLAccelerationStructureGeometryDescriptor* mtlGeoDesc) {
+	return (geometry.geometryType == VK_GEOMETRY_TYPE_TRIANGLES_KHR &&
+			((MTLAccelerationStructureTriangleGeometryDescriptor*)mtlGeoDesc).vertexBufferOffset % 4);
+}
+
+static bool hasBoundingBoxes(const VkAccelerationStructureGeometryKHR& geometry, const VkAccelerationStructureBuildRangeInfoKHR& rangeInfo) {
+	return geometry.geometryType == VK_GEOMETRY_TYPE_AABBS_KHR && rangeInfo.primitiveCount;
 }
 
 // Top-level acceleration structure builds read the bottom-level acceleration structures referenced by
@@ -121,9 +144,16 @@ void MVKCmdBuildAccelerationStructures::encodeInputConversions(MVKCommandEncoder
 		const auto& buildInfo = _buildInfos[infoIdx];
 		const auto* pRangeInfos = getRangeInfos(buildInfo);
 		bool isTopLevel = buildInfo.type == VK_ACCELERATION_STRUCTURE_TYPE_TOP_LEVEL_KHR;
+		NSArray<MTLAccelerationStructureGeometryDescriptor*>* mtlGeoDescs = isTopLevel ? nil : ((MTLPrimitiveAccelerationStructureDescriptor*)mtlDescs[infoIdx]).geometryDescriptors;
 		bool needsConversion = false;
 		for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
-			needsConversion |= isTopLevel ? pRangeInfos[geoIdx].primitiveCount : hasTransform(buildInfo.pGeometries[geoIdx], pRangeInfos[geoIdx]);
+			const auto& geometry = buildInfo.pGeometries[geoIdx];
+			const auto& rangeInfo = pRangeInfos[geoIdx];
+			needsConversion |= (isTopLevel
+								? rangeInfo.primitiveCount
+								: (hasTransform(geometry, rangeInfo) ||
+								   hasMisalignedVertices(geometry, mtlGeoDescs[geoIdx]) ||
+								   hasBoundingBoxes(geometry, rangeInfo)));
 		}
 
 		if (needsConversion && !mtlComputeEnc) {
@@ -142,7 +172,10 @@ void MVKCmdBuildAccelerationStructures::encodeInputConversions(MVKCommandEncoder
 		if (isTopLevel) {
 			encodeInstanceConversion(cmdEncoder, mtlComputeEnc, buildInfo, (MTLInstanceAccelerationStructureDescriptor*)mtlDescs[infoIdx]);
 		} else if (needsConversion) {
-			encodeTransformConversion(cmdEncoder, mtlComputeEnc, buildInfo, (MTLPrimitiveAccelerationStructureDescriptor*)mtlDescs[infoIdx]);
+			auto* mtlPrimDesc = (MTLPrimitiveAccelerationStructureDescriptor*)mtlDescs[infoIdx];
+			encodeTransformConversion(cmdEncoder, mtlComputeEnc, buildInfo, mtlPrimDesc);
+			encodeVertexAlignment(cmdEncoder, mtlComputeEnc, buildInfo, mtlPrimDesc);
+			encodeBoundingBoxConversion(cmdEncoder, mtlComputeEnc, buildInfo, mtlPrimDesc);
 		}
 	}
 }
@@ -200,6 +233,8 @@ void MVKCmdBuildAccelerationStructures::encodeTransformConversion(MVKCommandEnco
 	}
 
 	size_t xfmCnt = vkTransformAddrs.size();
+	if ( !xfmCnt ) { return; }
+
 	const MVKMTLBufferAllocation* mtlXfmAlloc = cmdEncoder->getTempMTLBuffer(xfmCnt * sizeof(MTLPackedFloat4x3), true);
 	for (size_t xfmIdx = 0; xfmIdx < xfmCnt; xfmIdx++) {
 		mtlTriDescs[xfmIdx].transformationMatrixBuffer = mtlXfmAlloc->_mtlBuffer;
@@ -212,6 +247,74 @@ void MVKCmdBuildAccelerationStructures::encodeTransformConversion(MVKCommandEnco
 	cmdEncoder->setComputeBytes(mtlComputeEnc, vkTransformAddrs.data(), xfmCnt * sizeof(uint64_t), 0);
 	mtlState.bindBuffer(mtlComputeEnc, mtlXfmAlloc->_mtlBuffer, mtlXfmAlloc->_offset, 1);
 	dispatchThreads(mtlComputeEnc, mtlPSO, xfmCnt);
+}
+
+// Copies the vertices of geometries whose vertex buffer offsets Metal does not support to temporary buffers,
+// and references those from the geometry descriptors instead.
+void MVKCmdBuildAccelerationStructures::encodeVertexAlignment(MVKCommandEncoder* cmdEncoder,
+															  id<MTLComputeCommandEncoder> mtlComputeEnc,
+															  const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+															  MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc) {
+	const auto* pRangeInfos = getRangeInfos(buildInfo);
+	for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
+		const auto& geometry = buildInfo.pGeometries[geoIdx];
+		auto* mtlTriDesc = (MTLAccelerationStructureTriangleGeometryDescriptor*)mtlPrimDesc.geometryDescriptors[geoIdx];
+		if ( !hasMisalignedVertices(geometry, mtlTriDesc) ) { continue; }
+
+		// Indexed triangles access the vertices from firstVertex to maxVertex.
+		const auto& triangles = geometry.geometry.triangles;
+		const auto& rangeInfo = pRangeInfos[geoIdx];
+		uint32_t vtxCnt = (triangles.indexType == VK_INDEX_TYPE_NONE_KHR
+						   ? rangeInfo.primitiveCount * 3
+						   : triangles.maxVertex + 1 - min(rangeInfo.firstVertex, triangles.maxVertex + 1));
+		MVKAccelerationStructureVertexParams params = {
+			.vertices = mtlTriDesc.vertexBuffer.gpuAddress + mtlTriDesc.vertexBufferOffset,
+			.stride = (uint32_t)triangles.vertexStride,
+			.vertexSize = cmdEncoder->getPixelFormats()->getBytesPerBlock(triangles.vertexFormat),
+		};
+		const MVKMTLBufferAllocation* mtlVtxAlloc = cmdEncoder->getTempMTLBuffer(max(vtxCnt, 1u) * triangles.vertexStride, true);
+		mtlTriDesc.vertexBuffer = mtlVtxAlloc->_mtlBuffer;
+		mtlTriDesc.vertexBufferOffset = mtlVtxAlloc->_offset;
+		if ( !vtxCnt ) { continue; }
+
+		id<MTLComputePipelineState> mtlPSO = cmdEncoder->getCommandEncodingPool()->getCmdCopyAccelerationStructureVerticesMTLComputePipelineState();
+		MVKMetalComputeCommandEncoderState& mtlState = cmdEncoder->getMtlCompute();
+		mtlState.bindPipeline(mtlComputeEnc, mtlPSO);
+		mtlState.bindStructBytes(mtlComputeEnc, &params, 0);
+		mtlState.bindBuffer(mtlComputeEnc, mtlVtxAlloc->_mtlBuffer, mtlVtxAlloc->_offset, 1);
+		dispatchThreads(mtlComputeEnc, mtlPSO, vtxCnt);
+	}
+}
+
+// Metal does not report the intersection of a ray that runs exactly along a face of a bounding box, while Vulkan expects
+// it. Bounding box intersections may be reported conservatively, so build from slightly enlarged copies of the boxes.
+void MVKCmdBuildAccelerationStructures::encodeBoundingBoxConversion(MVKCommandEncoder* cmdEncoder,
+																	id<MTLComputeCommandEncoder> mtlComputeEnc,
+																	const VkAccelerationStructureBuildGeometryInfoKHR& buildInfo,
+																	MTLPrimitiveAccelerationStructureDescriptor* mtlPrimDesc) {
+	const auto* pRangeInfos = getRangeInfos(buildInfo);
+	for (uint32_t geoIdx = 0; geoIdx < buildInfo.geometryCount; geoIdx++) {
+		const auto& geometry = buildInfo.pGeometries[geoIdx];
+		const auto& rangeInfo = pRangeInfos[geoIdx];
+		if ( !hasBoundingBoxes(geometry, rangeInfo) ) { continue; }
+
+		auto* mtlBoxDesc = (MTLAccelerationStructureBoundingBoxGeometryDescriptor*)mtlPrimDesc.geometryDescriptors[geoIdx];
+		MVKAccelerationStructureBoundingBoxParams params = {
+			.boundingBoxes = mtlBoxDesc.boundingBoxBuffer.gpuAddress + mtlBoxDesc.boundingBoxBufferOffset,
+			.stride = mtlBoxDesc.boundingBoxStride,
+		};
+		const MVKMTLBufferAllocation* mtlBoxAlloc = cmdEncoder->getTempMTLBuffer(rangeInfo.primitiveCount * sizeof(MTLAxisAlignedBoundingBox), true);
+		mtlBoxDesc.boundingBoxBuffer = mtlBoxAlloc->_mtlBuffer;
+		mtlBoxDesc.boundingBoxBufferOffset = mtlBoxAlloc->_offset;
+		mtlBoxDesc.boundingBoxStride = sizeof(MTLAxisAlignedBoundingBox);
+
+		id<MTLComputePipelineState> mtlPSO = cmdEncoder->getCommandEncodingPool()->getCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState();
+		MVKMetalComputeCommandEncoderState& mtlState = cmdEncoder->getMtlCompute();
+		mtlState.bindPipeline(mtlComputeEnc, mtlPSO);
+		mtlState.bindStructBytes(mtlComputeEnc, &params, 0);
+		mtlState.bindBuffer(mtlComputeEnc, mtlBoxAlloc->_mtlBuffer, mtlBoxAlloc->_offset, 1);
+		dispatchThreads(mtlComputeEnc, mtlPSO, rangeInfo.primitiveCount);
+	}
 }
 
 void MVKCmdBuildAccelerationStructures::encodeBuilds(MVKCommandEncoder* cmdEncoder, MTLAccelerationStructureDescriptor* const* mtlDescs) {

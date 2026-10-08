@@ -391,6 +391,12 @@ public:
 	/** Returns a new MTLComputePipelineState for converting Vulkan acceleration structure geometry transforms to Metal matrices. */
 	id<MTLComputePipelineState> newCmdConvertAccelerationStructureTransformsMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
 
+	/** Returns a new MTLComputePipelineState for copying acceleration structure vertices to a buffer that Metal can read them from. */
+	id<MTLComputePipelineState> newCmdCopyAccelerationStructureVerticesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
+	/** Returns a new MTLComputePipelineState for converting Vulkan acceleration structure bounding boxes for Metal. */
+	id<MTLComputePipelineState> newCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner);
+
 
 #pragma mark Construction
 

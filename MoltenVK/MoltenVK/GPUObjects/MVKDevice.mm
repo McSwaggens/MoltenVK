@@ -4405,8 +4405,9 @@ void MVKDevice::getAccelerationStructureBuildSizes(const VkAccelerationStructure
 		MTLAccelerationStructureDescriptor* mtlDesc = getMTLAccelerationStructureDescriptor(*pBuildInfo, rangeInfos, false);
 		MTLAccelerationStructureSizes mtlSizes = [_physicalDevice->getMTLDevice() accelerationStructureSizesWithDescriptor: mtlDesc];
 		pSizeInfo->accelerationStructureSize = mtlSizes.accelerationStructureSize;
-		pSizeInfo->buildScratchSize = mtlSizes.buildScratchBufferSize;
-		pSizeInfo->updateScratchSize = mtlSizes.refitScratchBufferSize;
+		// Metal may not need scratch memory, but Vulkan buffers cannot be empty.
+		pSizeInfo->buildScratchSize = max<VkDeviceSize>(mtlSizes.buildScratchBufferSize, 1);
+		pSizeInfo->updateScratchSize = max<VkDeviceSize>(mtlSizes.refitScratchBufferSize, 1);
 	}
 }
 
@@ -4461,6 +4462,14 @@ MTLAccelerationStructureDescriptor* MVKDevice::getMTLAccelerationStructureDescri
 			[mtlGeoDescs addObject: mtlGeoDesc];
 			primitiveCount += pRangeInfos[geoIdx].primitiveCount;
 		}
+		// Metal requires at least one geometry, so an empty acceleration structure gets a geometry without primitives.
+		if ( !buildInfo.geometryCount ) {
+			VkAccelerationStructureGeometryKHR emptyGeometry = {
+				.geometryType = VK_GEOMETRY_TYPE_TRIANGLES_KHR,
+				.geometry = { .triangles = { .vertexFormat = VK_FORMAT_R32G32B32_SFLOAT, .vertexStride = 3 * sizeof(float) } },
+			};
+			[mtlGeoDescs addObject: getMTLAccelerationStructureGeometryDescriptor(emptyGeometry, {}, resolveBuffers)];
+		}
 		auto* mtlPrimDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
 		mtlPrimDesc.geometryDescriptors = mtlGeoDescs;
 		mtlDesc = mtlPrimDesc;
@@ -4473,7 +4482,9 @@ MTLAccelerationStructureDescriptor* MVKDevice::getMTLAccelerationStructureDescri
 MTLAccelerationStructureGeometryDescriptor* MVKDevice::getMTLAccelerationStructureGeometryDescriptor(const VkAccelerationStructureGeometryKHR& geometry,
 																									 const VkAccelerationStructureBuildRangeInfoKHR& rangeInfo,
 																									 bool resolveBuffers) {
-	// Buffers are not needed, and their addresses may be null, if there are no primitives.
+	// Metal requires buffers even for geometries without primitives, whose buffer addresses may be null.
+	// Metal does not access their content, so use a dummy buffer.
+	id<MTLBuffer> emptyMTLBuffer = resolveBuffers && !rangeInfo.primitiveCount ? getDummyBlitMTLBuffer() : nil;
 	resolveBuffers = resolveBuffers && rangeInfo.primitiveCount;
 
 	MTLAccelerationStructureGeometryDescriptor* mtlGeoDesc = nil;
@@ -4485,6 +4496,7 @@ MTLAccelerationStructureGeometryDescriptor* MVKDevice::getMTLAccelerationStructu
 			mtlTriDesc.vertexFormat = (MTLAttributeFormat)_physicalDevice->_pixelFormats.getMTLVertexFormat(triangles.vertexFormat);
 			mtlTriDesc.vertexStride = triangles.vertexStride;
 			mtlTriDesc.indexType = triangles.indexType == VK_INDEX_TYPE_UINT16 ? MTLIndexTypeUInt16 : MTLIndexTypeUInt32;
+			mtlTriDesc.vertexBuffer = emptyMTLBuffer;
 			if (resolveBuffers) {
 				// Adding firstVertex to each index is equivalent to offsetting the vertex data.
 				VkDeviceAddress vtxAddr = triangles.vertexData.deviceAddress + rangeInfo.firstVertex * triangles.vertexStride;
@@ -4509,6 +4521,7 @@ MTLAccelerationStructureGeometryDescriptor* MVKDevice::getMTLAccelerationStructu
 			auto* mtlBoxDesc = [MTLAccelerationStructureBoundingBoxGeometryDescriptor descriptor];
 			mtlBoxDesc.boundingBoxCount = rangeInfo.primitiveCount;
 			mtlBoxDesc.boundingBoxStride = aabbs.stride;
+			mtlBoxDesc.boundingBoxBuffer = emptyMTLBuffer;
 			if (resolveBuffers) {
 				VkDeviceSize boxOffset = 0;
 				mtlBoxDesc.boundingBoxBuffer = getMTLBufferForDeviceAddress(aabbs.data.deviceAddress + rangeInfo.primitiveOffset, &boxOffset);

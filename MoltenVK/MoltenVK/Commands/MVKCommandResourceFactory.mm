@@ -641,6 +641,14 @@ id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdConvertAcceleration
 	return newMTLComputePipelineState("cmdConvertAccelerationStructureTransforms", owner, getAccelerationStructureMTLLibrary());
 }
 
+id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdCopyAccelerationStructureVerticesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
+	return newMTLComputePipelineState("cmdCopyAccelerationStructureVertices", owner, getAccelerationStructureMTLLibrary());
+}
+
+id<MTLComputePipelineState> MVKCommandResourceFactory::newCmdConvertAccelerationStructureBoundingBoxesMTLComputePipelineState(MVKVulkanAPIDeviceObject* owner) {
+	return newMTLComputePipelineState("cmdConvertAccelerationStructureBoundingBoxes", owner, getAccelerationStructureMTLLibrary());
+}
+
 
 #pragma mark Support methods
 

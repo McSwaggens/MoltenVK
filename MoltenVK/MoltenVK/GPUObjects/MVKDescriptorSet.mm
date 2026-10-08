@@ -1210,17 +1210,15 @@ static void writeDescriptorSetGPUBuffer(
 static void writeAccelerationStructureCPUDescriptor(const MVKDescriptorSetLayout* layout,
 													MVKCPUDescriptorOneID2Meta* desc,
 													MVKAccelerationStructure* mvkAccStruct) {
-	if ( !mvkAccStruct ) {
-		*desc = {};
-	} else if (layout->getDevice()->useAccelerationStructureHeaders()) {
+	*desc = {};
+	if ( !mvkAccStruct ) { return; }
+
+	if (layout->getDevice()->useAccelerationStructureHeaders()) {
 		desc->a = mvkAccStruct->getHeaderMTLBuffer();
 		desc->offset = mvkAccStruct->getHeaderOffset();
 		desc->meta.buffer = sizeof(MVKAccelerationStructureHeader);
 	} else if (layout->argBufMode() != MVKArgumentBufferMode::Off) {
-		*desc = {};
 		desc->a = mvkAccStruct->getMTLAccelerationStructure();
-	} else {
-		*desc = {};
 	}
 }
 
